@@ -44,7 +44,7 @@ class IntegrateKitsuReview(KitsuPublishInstancePlugin):
                 task=task_id,
                 comment=comment_id,
                 preview_file_path=review_path,
-                normalize_movie=True,
+                normalize_movie=False,
                 revision=instance.data["version"],
             )
             self.log.info("Review upload on comment")
