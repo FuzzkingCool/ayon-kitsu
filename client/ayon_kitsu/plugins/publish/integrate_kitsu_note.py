@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import re
+import traceback
 
 import gazu
 import pyblish.api
@@ -82,9 +83,9 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
 
             # Check if any status condition is not met
             allow_status_change = True
-            for status_cond in (
-                self.status_change_conditions["status_conditions"]
-            ):
+            for status_cond in self.status_change_conditions[
+                "status_conditions"
+            ]:
                 condition = status_cond["condition"] == "equal"
                 match = status_cond["short_name"].upper() == shortname
                 if match and not condition or condition and not match:
@@ -114,6 +115,7 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                         break
 
             # Set note status
+            kitsu_status = None
             if self.set_status_note and allow_status_change:
                 kitsu_status = gazu.task.get_task_status_by_short_name(
                     self.note_status_shortname
@@ -137,10 +139,29 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
             else:
                 self.log.debug(f"Comment is `{publish_comment}`")
 
-            # Add comment to kitsu task
-            self.log.debug(f'Add new note in tasks id {kitsu_task["id"]}')
-            kitsu_comment = gazu.task.add_comment(
-                kitsu_task, note_status, comment=publish_comment
-            )
+            # get the current user
+            current_user = gazu.client.get_current_user()
 
-            instance.data["kitsuComment"] = kitsu_comment
+            self.log.info(f"Using note_status ID for comment: {note_status}")
+            self.log.info(f"publish_comment: {publish_comment}")
+            self.log.info(f"kitsu_task: {kitsu_task}")
+            self.log.info(f"kitsu_status: {kitsu_status}")
+            self.log.info(f"current_user: {current_user}")
+            self.log.info(f"instance: {instance}")
+            self.log.info(f"context: {context}")
+
+            # Add comment to kitsu task
+            self.log.debug(f"Add new note in tasks id {kitsu_task['id']}")
+            try:
+                kitsu_comment = gazu.task.add_comment(
+                    kitsu_task,
+                    note_status,
+                    comment= publish_comment,
+                    person=current_user,
+                )
+
+                instance.data["kitsuComment"] = kitsu_comment
+            except Exception as e:
+                self.log.error(f"Error adding comment to kitsu task: {e}")
+                self.log.error(traceback.format_exc())
+
