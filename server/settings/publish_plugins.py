@@ -105,6 +105,15 @@ class IntegrateKitsuNotes(BaseSettingsModel):
     )
 
 
+class IntegrateKitsuTaskSettings(BaseSettingsModel):
+    set_status_task: bool = SettingsField(title="Set status on task")
+    task_status_shortname: str = SettingsField(title="Task shortname")
+    status_change_conditions: StatusChangeConditionsModel = SettingsField(
+        default_factory=StatusChangeConditionsModel,
+        title="Status change conditions"
+    )
+
+
 class PublishPlugins(BaseSettingsModel):
     CollectKitsuFamily: CollectKitsuFamilyPluginModel = SettingsField(
         default_factory=CollectKitsuFamilyPluginModel,
@@ -113,6 +122,10 @@ class PublishPlugins(BaseSettingsModel):
     IntegrateKitsuNote: IntegrateKitsuNotes = SettingsField(
         default_factory=IntegrateKitsuNotes,
         title="Integrate Kitsu Note"
+    )
+    IntegrateKitsuTask: IntegrateKitsuTaskSettings = SettingsField(
+        default_factory=IntegrateKitsuTaskSettings,
+        title="Integrate Kitsu Task"
     )
 
 
@@ -278,14 +291,19 @@ PUBLISH_DEFAULT_VALUES = {
         ]
     },
     "IntegrateKitsuNote": {
-        "set_status_note": False,
-        "note_status_shortname": "wfa",
+        "set_status_note": True,
+        "note_status_shortname": "Feedback",
         "status_change_conditions": {
             "status_conditions": [],
-            "family_requirements": [],
+            "family_requirements": [
+                {
+                    "condition": "equal",
+                    "product_type": "review"
+                }
+            ],
         },
         "custom_comment_template": {
-            "enabled": False,
+            "enabled": True,
             "comment_template": """{comment}
 
 |  |  |
@@ -293,6 +311,20 @@ PUBLISH_DEFAULT_VALUES = {
 | version | `{version}` |
 | family | `{family}` |
 | name | `{name}` |""",
+        },
+    }
+    ,
+    "IntegrateKitsuTask": {
+        "set_status_task": True,
+        "task_status_shortname": "Feedback",
+        "status_change_conditions": {
+            "status_conditions": [],
+            "family_requirements": [
+                {
+                    "condition": "equal",
+                    "product_type": "review"
+                }
+            ],
         },
     }
 }

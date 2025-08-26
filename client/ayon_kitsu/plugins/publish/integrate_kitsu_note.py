@@ -4,7 +4,6 @@ import traceback
 
 import gazu
 import pyblish.api
-
 from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 
 
@@ -93,26 +92,43 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     break
 
             if allow_status_change:
-                # Get families
-                families = {
-                    instance.data.get("family")
-                    for instance in context
-                    if instance.data.get("publish")
-                }
+                # Get families of published instances (normalized, include sub-families)
+                families = set()
+                for inst in context:
+                    if not inst.data.get("publish"):
+                        continue
+                    main_family = (inst.data.get("family") or "").lower()
+                    if main_family:
+                        families.add(main_family)
+                    for sub_family in inst.data.get("families", []) or []:
+                        sub_family_l = (sub_family or "").lower()
+                        if sub_family_l:
+                            families.add(sub_family_l)
 
-                # Check if any family requirement is met
+                # Approve if ANY requirement matches any published family.
+                if family_requirements:
+                    allow_status_change = False
+                    for family_requirement in family_requirements:
+                        condition_equal = (
+                            family_requirement["condition"] == "equal"
+                        )
 
-                for family_requirement in family_requirements:
-                    condition = family_requirement["condition"] == "equal"
+                        # Support both keys: prefer 'product_type' (current),
+                        # fallback to 'family' (legacy)
+                        requirement_value = (
+                            family_requirement.get("product_type")
+                            or family_requirement.get("family")
+                            or ""
+                        ).lower()
 
-                    for family in families:
-                        match = family_requirement["family"].lower() == family
-                        if match and not condition or condition and not match:
-                            allow_status_change = False
-                            break
-
-                    if allow_status_change:
-                        break
+                        if condition_equal:
+                            if requirement_value in families:
+                                allow_status_change = True
+                                break
+                        else:
+                            if requirement_value not in families:
+                                allow_status_change = True
+                                break
 
             # Set note status
             kitsu_status = None
