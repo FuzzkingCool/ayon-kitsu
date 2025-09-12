@@ -103,6 +103,12 @@ class KitsuAddon(AYONAddon, IPluginPaths, ITrayAction):
     def get_publish_plugin_paths(self, host_name=None):
         return [os.path.join(KITSU_ROOT, "plugins", "publish")]
 
+    def get_create_plugin_paths(self, host_name):
+        """Implementation of abstract method for `IPluginPaths`."""
+        if host_name == "traypublisher":
+            return [os.path.join(KITSU_ROOT, "plugins", "create")]
+        return []
+
 
 def is_kitsu_enabled_in_settings(project_settings):
     """Check if kitsu is enabled in kitsu project settings.
