@@ -217,7 +217,7 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                 f"from instances: {kitsu_instances}"
             )
         else:
-            self.log.warning(
+            self.log.info(
                 f"No Kitsu version found for task {task_key}. "
                 f"Instances checked: {[inst.data.get('productName', 'unknown') for inst in instances]}"
             )
@@ -278,21 +278,21 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                     if not folder_entity:
                         self.log.debug(f"Folder not found: {folder_path}")
                         continue
-                        
+
                     folder_id = folder_entity["id"]
-                    
+
                     # Now get the latest version using the folder ID
                     version = ayon_api.get_last_version_by_product_name(
                         project_name,
                         product_name,
                         folder_id
                     )
-                    
+
                     if version:
                         version_int = version.get("version", 0)
                         if version_int > max_version:
                             max_version = version_int
-                                
+
                 except Exception as e:
                     self.log.debug(
                         f"Failed to query versions for {product_name}: {e}"

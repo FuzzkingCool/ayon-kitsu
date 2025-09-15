@@ -118,7 +118,11 @@ class IntegrateKitsuTask(KitsuPublishContextPlugin):
                     continue
 
                 # Update task status in Kitsu
-                gazu.task.update_task(kitsu_task, task_status=status_entity)
+                # Create a copy of the task dict and update the task_status field
+                updated_task = kitsu_task.copy()
+                updated_task["task_status_id"] = status_entity["id"]
+
+                gazu.task.update_task(updated_task)
                 self.log.info(
                     f"Task '{kitsu_task['id']}' status set to '{desired_shortname}'."
                 )
