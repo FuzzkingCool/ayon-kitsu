@@ -2,6 +2,7 @@
 
 import pyblish.api
 from ayon_harmony.logger import log as log_harmony
+
 from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 
 
@@ -267,10 +268,14 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                 folder_path = instance.data.get("folderPath")
                 product_type = instance.data.get("productType")
 
-                self.log.debug(f"  Instance: {product_name} (type: {product_type}) in {folder_path}")
+                self.log.debug(
+                    f"  Instance: {product_name} (type: {product_type}) in {folder_path}"
+                )
 
                 if not all([product_name, folder_path]):
-                    self.log.debug(f"  Skipping instance with missing data: product={product_name}, folder={folder_path}")
+                    self.log.debug(
+                        f"  Skipping instance with missing data: product={product_name}, folder={folder_path}"
+                    )
                     continue
 
                 folder_paths.add(folder_path)
@@ -279,45 +284,63 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                 product_names_by_folder[folder_path].add(product_name)
 
             if not folder_paths:
-                self.log.debug("No valid folder paths found for AYON version query")
+                self.log.debug(
+                    "No valid folder paths found for AYON version query"
+                )
                 return 0
 
             # Get folder entities
             self.log.debug(f"Querying folders for paths: {list(folder_paths)}")
-            folder_entities = list(ayon_api.get_folders(
-                project_name,
-                folder_paths=list(folder_paths),
-                fields={"id", "path"}
-            ))
+            folder_entities = list(
+                ayon_api.get_folders(
+                    project_name,
+                    folder_paths=list(folder_paths),
+                    fields={"id", "path"},
+                )
+            )
 
             if not folder_entities:
-                self.log.debug("No folder entities found for AYON version query")
+                self.log.debug(
+                    "No folder entities found for AYON version query"
+                )
                 return 0
 
             folder_ids = [folder["id"] for folder in folder_entities]
             folder_paths_list = [folder["path"] for folder in folder_entities]
-            self.log.debug(f"Found {len(folder_ids)} folder entities: {folder_paths_list}")
+            self.log.debug(
+                f"Found {len(folder_ids)} folder entities: {folder_paths_list}"
+            )
 
             # Create a mapping from folder_id to folder_path for lookup
-            folder_id_to_path = {folder["id"]: folder["path"] for folder in folder_entities}
+            folder_id_to_path = {
+                folder["id"]: folder["path"] for folder in folder_entities
+            }
 
             # Use a simpler approach: get all products for these folders, then filter by name
-            all_products = list(ayon_api.get_products(
-                project_name,
-                folder_ids=folder_ids,
-                fields={"id", "name", "folderId"}
-            ))
+            all_products = list(
+                ayon_api.get_products(
+                    project_name,
+                    folder_ids=folder_ids,
+                    fields={"id", "name", "folderId"},
+                )
+            )
 
             if not all_products:
                 self.log.debug("No products found for AYON version query")
                 return 0
 
-            self.log.debug(f"Found {len(all_products)} total products in folders")
+            self.log.debug(
+                f"Found {len(all_products)} total products in folders"
+            )
 
             # Filter products by name and folder
             valid_products = []
-            self.log.debug(f"Looking for products in folders: {list(product_names_by_folder.keys())}")
-            self.log.debug(f"Looking for product names: {[list(names) for names in product_names_by_folder.values()]}")
+            self.log.debug(
+                f"Looking for products in folders: {list(product_names_by_folder.keys())}"
+            )
+            self.log.debug(
+                f"Looking for product names: {[list(names) for names in product_names_by_folder.values()]}"
+            )
 
             for product in all_products:
                 product_name = product["name"]
@@ -326,31 +349,45 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                 # Find which folder path this corresponds to using the mapping
                 folder_path = folder_id_to_path.get(folder_id)
 
-                self.log.debug(f"  Checking product: {product_name} in folder_id={folder_id} (path={folder_path})")
+                self.log.debug(
+                    f"  Checking product: {product_name} in folder_id={folder_id} (path={folder_path})"
+                )
 
                 if folder_path and folder_path in product_names_by_folder:
                     expected_names = product_names_by_folder[folder_path]
-                    self.log.debug(f"    Expected names for {folder_path}: {list(expected_names)}")
+                    self.log.debug(
+                        f"    Expected names for {folder_path}: {list(expected_names)}"
+                    )
                     if product_name in expected_names:
                         valid_products.append(product)
-                        self.log.debug(f"    ✅ Valid product: {product_name} in {folder_path}")
+                        self.log.debug(
+                            f"    ✅ Valid product: {product_name} in {folder_path}"
+                        )
                     else:
-                        self.log.debug(f"    ❌ Product name '{product_name}' not in expected names: {list(expected_names)}")
+                        self.log.debug(
+                            f"    ❌ Product name '{product_name}' not in expected names: {list(expected_names)}"
+                        )
                 else:
-                    self.log.debug(f"    ❌ Folder path {folder_path} not found in expected folders")
+                    self.log.debug(
+                        f"    ❌ Folder path {folder_path} not found in expected folders"
+                    )
 
             if not valid_products:
-                self.log.warning("No valid products found after filtering by name and folder")
+                self.log.info(
+                    "No valid products found after filtering by name and folder"
+                )
                 return 0
 
             valid_product_ids = [product["id"] for product in valid_products]
-            self.log.debug(f"Found {len(valid_product_ids)} valid products: {[p['name'] for p in valid_products]}")
+            self.log.debug(
+                f"Found {len(valid_product_ids)} valid products: {[p['name'] for p in valid_products]}"
+            )
 
             # Get latest versions for all products at once
             last_versions = ayon_api.get_last_versions(
                 project_name,
                 valid_product_ids,
-                fields={"version", "productId"}
+                fields={"version", "productId"},
             )
 
             # Find the maximum version
@@ -366,6 +403,7 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
         except Exception as e:
             self.log.warning(f"Failed to get AYON latest versions: {e}")
             import traceback
+
             self.log.debug(traceback.format_exc())
 
             # Fallback to checking instance data directly
