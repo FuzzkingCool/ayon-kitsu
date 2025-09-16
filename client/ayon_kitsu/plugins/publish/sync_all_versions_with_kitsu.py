@@ -1,8 +1,8 @@
 """Universal version synchronization with Kitsu for all product types and hosts."""
 
 import pyblish.api
-from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 from ayon_harmony.logger import log as log_harmony
+from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 
 
 class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
@@ -16,9 +16,6 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
 
     The highest value + 1 becomes the target version for ALL instances publishing
     to the same task, preventing clobbering of manually uploaded Kitsu versions.
-
-    This plugin runs AFTER CollectKitsuLatestReviewVersion (0.479) but BEFORE
-    CollectAnatomyInstanceData (0.49) to ensure proper version coordination.
     """
 
     label = "Sync All Versions with Kitsu"
@@ -232,7 +229,8 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
 
         self.log.info(
             f"Version sync for {task_key}: Kitsu={max_kitsu_version}, "
-            f"AYON={max_ayon_version}, Target={target_version}"
+            f"AYON={max_ayon_version}, Target={target_version} "
+            f"(using max of both + 1)"
         )
 
         # Apply the target version to all instances in this task group
@@ -257,53 +255,119 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             int: Highest existing version number
         """
         try:
-            # Use ayon_api to query latest versions from database
             import ayon_api
 
-            max_version = 0
+            # Collect all folder paths and product names from instances
+            folder_paths = set()
+            product_names_by_folder = {}
 
-            # Check each instance for its latest published version
+            self.log.debug("Collecting product names from instances:")
             for instance in instances:
                 product_name = instance.data.get("productName")
-                product_type = instance.data.get("productType")
                 folder_path = instance.data.get("folderPath")
+                product_type = instance.data.get("productType")
 
-                if not all([product_name, product_type, folder_path]):
+                self.log.debug(f"  Instance: {product_name} (type: {product_type}) in {folder_path}")
+
+                if not all([product_name, folder_path]):
+                    self.log.debug(f"  Skipping instance with missing data: product={product_name}, folder={folder_path}")
                     continue
 
-                try:
-                    # Get the latest version for this specific product
-                    # First get the folder ID from the folder path
-                    folder_entity = ayon_api.get_folder_by_path(project_name, folder_path)
-                    if not folder_entity:
-                        self.log.debug(f"Folder not found: {folder_path}")
-                        continue
+                folder_paths.add(folder_path)
+                if folder_path not in product_names_by_folder:
+                    product_names_by_folder[folder_path] = set()
+                product_names_by_folder[folder_path].add(product_name)
 
-                    folder_id = folder_entity["id"]
+            if not folder_paths:
+                self.log.debug("No valid folder paths found for AYON version query")
+                return 0
 
-                    # Now get the latest version using the folder ID
-                    version = ayon_api.get_last_version_by_product_name(
-                        project_name,
-                        product_name,
-                        folder_id
-                    )
+            # Get folder entities
+            self.log.debug(f"Querying folders for paths: {list(folder_paths)}")
+            folder_entities = list(ayon_api.get_folders(
+                project_name,
+                folder_paths=list(folder_paths),
+                fields={"id", "path"}
+            ))
 
-                    if version:
-                        version_int = version.get("version", 0)
-                        if version_int > max_version:
-                            max_version = version_int
+            if not folder_entities:
+                self.log.debug("No folder entities found for AYON version query")
+                return 0
 
-                except Exception as e:
-                    self.log.debug(
-                        f"Failed to query versions for {product_name}: {e}"
-                    )
-                    continue
+            folder_ids = [folder["id"] for folder in folder_entities]
+            folder_paths_list = [folder["path"] for folder in folder_entities]
+            self.log.debug(f"Found {len(folder_ids)} folder entities: {folder_paths_list}")
+
+            # Create a mapping from folder_id to folder_path for lookup
+            folder_id_to_path = {folder["id"]: folder["path"] for folder in folder_entities}
+
+            # Use a simpler approach: get all products for these folders, then filter by name
+            all_products = list(ayon_api.get_products(
+                project_name,
+                folder_ids=folder_ids,
+                fields={"id", "name", "folderId"}
+            ))
+
+            if not all_products:
+                self.log.debug("No products found for AYON version query")
+                return 0
+
+            self.log.debug(f"Found {len(all_products)} total products in folders")
+
+            # Filter products by name and folder
+            valid_products = []
+            self.log.debug(f"Looking for products in folders: {list(product_names_by_folder.keys())}")
+            self.log.debug(f"Looking for product names: {[list(names) for names in product_names_by_folder.values()]}")
+
+            for product in all_products:
+                product_name = product["name"]
+                folder_id = product["folderId"]
+
+                # Find which folder path this corresponds to using the mapping
+                folder_path = folder_id_to_path.get(folder_id)
+
+                self.log.debug(f"  Checking product: {product_name} in folder_id={folder_id} (path={folder_path})")
+
+                if folder_path and folder_path in product_names_by_folder:
+                    expected_names = product_names_by_folder[folder_path]
+                    self.log.debug(f"    Expected names for {folder_path}: {list(expected_names)}")
+                    if product_name in expected_names:
+                        valid_products.append(product)
+                        self.log.debug(f"    ✅ Valid product: {product_name} in {folder_path}")
+                    else:
+                        self.log.debug(f"    ❌ Product name '{product_name}' not in expected names: {list(expected_names)}")
+                else:
+                    self.log.debug(f"    ❌ Folder path {folder_path} not found in expected folders")
+
+            if not valid_products:
+                self.log.warning("No valid products found after filtering by name and folder")
+                return 0
+
+            valid_product_ids = [product["id"] for product in valid_products]
+            self.log.debug(f"Found {len(valid_product_ids)} valid products: {[p['name'] for p in valid_products]}")
+
+            # Get latest versions for all products at once
+            last_versions = ayon_api.get_last_versions(
+                project_name,
+                valid_product_ids,
+                fields={"version", "productId"}
+            )
+
+            # Find the maximum version
+            max_version = 0
+            for product_id, version_data in last_versions.items():
+                version_int = version_data.get("version", 0)
+                if version_int > max_version:
+                    max_version = version_int
 
             self.log.debug(f"Max AYON version found: {max_version}")
             return max_version
 
         except Exception as e:
             self.log.warning(f"Failed to get AYON latest versions: {e}")
+            import traceback
+            self.log.debug(traceback.format_exc())
+
             # Fallback to checking instance data directly
             max_version = 0
             for instance in instances:
