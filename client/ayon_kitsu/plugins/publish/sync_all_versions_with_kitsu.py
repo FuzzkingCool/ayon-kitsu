@@ -239,6 +239,9 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             original_version = instance.data.get("version")
             instance.data["version"] = target_version
             instance.data["versionSynced"] = True  # Mark as processed
+            instance.data["kitsuTargetVersion"] = (
+                target_version  # Store for PreserveSynchronizedVersions
+            )
 
             self.log.info(
                 f"Synced {instance.data.get('productName')}: "

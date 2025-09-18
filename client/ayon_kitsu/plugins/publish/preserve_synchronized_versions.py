@@ -6,8 +6,9 @@ core anatomy collection plugin.
 """
 
 import pyblish.api
-from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 from ayon_harmony.logger import log as log_harmony
+
+from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 
 
 class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
@@ -19,7 +20,9 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
     """
 
     label = "Preserve Synchronized Versions"
-    order = pyblish.api.CollectorOrder + 0.51  # Run after CollectAnatomyInstanceData (0.49)
+    order = (
+        pyblish.api.CollectorOrder + 0.51
+    )  # Run after CollectAnatomyInstanceData (0.49)
     # No hosts restriction - this works for ALL hosts
 
     log = log_harmony
@@ -39,24 +42,30 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
         instances_restored = 0
         total_instances = 0
         synced_instances = 0
-        
+
         for instance in context:
             total_instances += 1
             if instance.data.get("versionSynced"):
                 synced_instances += 1
-                self.log.debug(f"Found synced instance: {instance.data.get('productName')} (version={instance.data.get('version')})")
-            
+                self.log.debug(
+                    f"Found synced instance: {instance.data.get('productName')} (version={instance.data.get('version')})"
+                )
+
             if self._restore_synchronized_version(instance):
                 instances_restored += 1
 
-        self.log.info(f"PreserveSynchronizedVersions: {total_instances} total instances, {synced_instances} synced instances, {instances_restored} restored")
-        
+        self.log.info(
+            f"PreserveSynchronizedVersions: {total_instances} total instances, {synced_instances} synced instances, {instances_restored} restored"
+        )
+
         if instances_restored > 0:
             self.log.info(
                 f"Restored synchronized versions for {instances_restored} instances"
             )
         else:
-            self.log.debug("No instances needed synchronized version restoration")
+            self.log.debug(
+                "No instances needed synchronized version restoration"
+            )
 
     def _restore_synchronized_version(self, instance):
         """Restore synchronized version for an instance if needed.
@@ -67,11 +76,13 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
         Returns:
             bool: True if version was restored, False otherwise
         """
-        product_name = instance.data.get('productName', 'unknown')
-        
+        product_name = instance.data.get("productName", "unknown")
+
         # Only process instances that were synchronized
         if not instance.data.get("versionSynced"):
-            self.log.debug(f"Instance {product_name} not versionSynced, skipping")
+            self.log.debug(
+                f"Instance {product_name} not versionSynced, skipping"
+            )
             return False
 
         # Get the synchronized version that was set by SyncAllVersionsWithKitsu
@@ -89,8 +100,10 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
 
         # Check if the version was overridden by CollectAnatomyInstanceData
         current_version = instance.data.get("version")
-        
-        self.log.debug(f"Instance {product_name}: synchronized_version={synchronized_version}, current_version={current_version}")
+
+        self.log.debug(
+            f"Instance {product_name}: synchronized_version={synchronized_version}, current_version={current_version}"
+        )
 
         # If current version differs from synchronized version, restore it
         if current_version != synchronized_version:
@@ -106,5 +119,7 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
 
             return True
 
-        self.log.debug(f"Instance {product_name} version already correct, no restoration needed")
+        self.log.debug(
+            f"Instance {product_name} version already correct, no restoration needed"
+        )
         return False
