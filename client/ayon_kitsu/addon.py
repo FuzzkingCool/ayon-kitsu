@@ -51,18 +51,19 @@ class KitsuAddon(AYONAddon, IPluginPaths, ITrayAction):
         from .credentials import (
             load_credentials,
             validate_credentials,
-            set_credentials_envs,
         )
 
         login, password = load_credentials()
 
         if login is None or password is None:
-            # TODO raise correct type
-            raise
+            self.show_dialog()
+            return
 
         # Check credentials, ask them if needed
         if validate_credentials(login, password):
-            set_credentials_envs(login, password)
+            os.environ["KITSU_LOGIN"] = login
+            os.environ["KITSU_PWD"] = password
+            os.environ["KITSU_SERVER"] = self.server_url
         else:
             self.show_dialog()
 
@@ -72,20 +73,30 @@ class KitsuAddon(AYONAddon, IPluginPaths, ITrayAction):
 
     def _get_dialog(self):
         if self._dialog is None:
-            from .kitsu_widgets import KitsuPasswordDialog
+            try:
+                from .kitsu_widgets import KitsuPasswordDialog
 
-            self._dialog = KitsuPasswordDialog()
+                self._dialog = KitsuPasswordDialog()
+            except Exception as e:
+                print(f"Error creating Kitsu dialog: {e}")
+                raise
 
         return self._dialog
 
     def show_dialog(self):
         """Show dialog to log-in."""
+        try:
+            # Make sure dialog is created
+            dialog = self._get_dialog()
 
-        # Make sure dialog is created
-        dialog = self._get_dialog()
-
-        # Show dialog
-        dialog.open()
+            # Show dialog
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+        except Exception as e:
+            print(f"Error showing Kitsu dialog: {e}")
+            import traceback
+            traceback.print_exc()
 
     def on_action_trigger(self):
         """Implementation of abstract method for `ITrayAction`."""
