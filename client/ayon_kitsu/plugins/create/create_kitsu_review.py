@@ -6,6 +6,7 @@ to Kitsu. It follows the traypublisher creator pattern and integrates with exist
 Kitsu publishing workflow.
 """
 
+import traceback
 from pathlib import Path
 
 from ayon_core.lib.attribute_definitions import (
@@ -69,32 +70,25 @@ class KitsuReviewCreator(TrayPublishCreator):
 
     def _start_thumbnail_polling(self):
         """Start polling for thumbnail changes using a Qt timer."""
-        log.debug("KitsuReview: _start_thumbnail_polling called")
+        # log.debug("KitsuReview: _start_thumbnail_polling called")
 
         if self._polling_timer is not None:
-            log.debug("KitsuReview: Polling timer already started")
+            # log.debug("KitsuReview: Polling timer already started")
             return  # Already started
 
         # Initial check
         self._check_thumbnail_changes()
 
         try:
-            if not QtCore:
-                log.warning(
-                    "KitsuReview: QtCore not available, cannot start polling timer"
-                )
-                return
-
             # Create a timer that checks for thumbnail changes every 2 seconds
             self._polling_timer = QtCore.QTimer()
             self._polling_timer.timeout.connect(self._check_thumbnail_changes)
             self._polling_timer.start(2000)  # Check every 2 seconds
-            log.info(
-                "KitsuReview: Started thumbnail polling timer (2s interval)"
-            )
+            # log.info(
+            #     "KitsuReview: Started thumbnail polling timer (2s interval)"
+            # )
         except Exception as exc:
             log.error(f"KitsuReview: Failed to start thumbnail polling: {exc}")
-            import traceback
 
             log.debug(
                 f"KitsuReview: Polling error traceback: {traceback.format_exc()}"
@@ -132,9 +126,9 @@ class KitsuReviewCreator(TrayPublishCreator):
                 current_thumbnail
                 and current_thumbnail != self._last_thumbnail_path
             ):
-                log.info(
-                    f"KitsuReview: New thumbnail detected: {current_thumbnail}"
-                )
+                # log.info(
+                #     f"KitsuReview: New thumbnail detected: {current_thumbnail}"
+                # )
                 self._last_thumbnail_path = current_thumbnail
                 # Update the FileDef with the new thumbnail
                 self._update_filedef_with_thumbnail(current_thumbnail)
@@ -152,7 +146,7 @@ class KitsuReviewCreator(TrayPublishCreator):
 
     def register_callbacks(self):
         """Register callbacks for value changes and screenshot capture."""
-        log.debug("KitsuReview: register_callbacks called")
+        # log.debug("KitsuReview: register_callbacks called")
 
         # Start thumbnail polling - much simpler than event registration
         self._start_thumbnail_polling()
@@ -162,9 +156,9 @@ class KitsuReviewCreator(TrayPublishCreator):
                 self.create_context.add_value_changed_callback(
                     self.on_values_changed
                 )
-                log.info(
-                    "KitsuReview: Successfully registered value changed callback"
-                )
+                # log.info(
+                #     "KitsuReview: Successfully registered value changed callback"
+                # )
             else:
                 log.warning(
                     "KitsuReview: No add_value_changed_callback method found"
@@ -292,10 +286,6 @@ class KitsuReviewCreator(TrayPublishCreator):
 
             shutil.copy2(str(thumbnail_path), str(new_path))
 
-            log.info(
-                f"KitsuReview: Renamed screenshot: {thumbnail_path.name} -> {new_filename}"
-            )
-
             # Use the renamed file for the rest of the process
             thumbnail_path = new_path
             thumbnail_path_str = str(thumbnail_path)
@@ -340,12 +330,12 @@ class KitsuReviewCreator(TrayPublishCreator):
 
             if not thumbnail_already_added:
                 self._pending_thumbnails.append(filedef_value)
-                log.debug(
-                    f"KitsuReview: Added thumbnail to pending list: {filedef_value}"
-                )
-                log.debug(
-                    f"KitsuReview: Total pending thumbnails: {len(self._pending_thumbnails)}"
-                )
+                # log.debug(
+                #     f"KitsuReview: Added thumbnail to pending list: {filedef_value}"
+                # )
+                # log.debug(
+                #     f"KitsuReview: Total pending thumbnails: {len(self._pending_thumbnails)}"
+                # )
             else:
                 log.debug(
                     "KitsuReview: Thumbnail already in pending list, skipping duplicate"
@@ -379,22 +369,18 @@ class KitsuReviewCreator(TrayPublishCreator):
 
                                     # Set the updated list (this will accumulate)
                                     widget.set_value(current_files, False)
-                                    log.info(
-                                        f"KitsuReview: Added screenshot to FileDef: {new_filename}"
-                                    )
-                                    log.debug(
-                                        f"KitsuReview: Total files in FileDef: {len(current_files)}"
-                                    )
-                                else:
-                                    log.debug(
-                                        f"KitsuReview: Screenshot already in FileDef: {new_filename}"
-                                    )
+                                    # log.info(
+                                    #     f"KitsuReview: Added screenshot to FileDef: {new_filename}"
+                                    # )
+                                    # log.debug(
+                                    #     f"KitsuReview: Total files in FileDef: {len(current_files)}"
+                                    # )
+                                # else:
+                                #     log.debug(
+                                #         f"KitsuReview: Screenshot already in FileDef: {new_filename}"
+                                #     )
 
                                 return  # Success
-
-                log.debug(
-                    "KitsuReview: FileDef widget not found (normal if UI not ready)"
-                )
 
             except Exception as widget_exc:
                 log.error(f"KitsuReview: Widget update error: {widget_exc}")
@@ -403,11 +389,11 @@ class KitsuReviewCreator(TrayPublishCreator):
             self.create_context.create_plugin_pre_create_attr_defs_changed(
                 self.identifier
             )
-            log.debug("KitsuReview: Triggered pre-create attr defs refresh")
+            # log.debug("KitsuReview: Triggered pre-create attr defs refresh")
 
-            log.info(
-                f"KitsuReview: Thumbnail ready for create() method: {thumbnail_path.name}"
-            )
+            # log.info(
+            #     f"KitsuReview: Thumbnail ready for create() method: {thumbnail_path.name}"
+            # )
 
             log.info(
                 f"KitsuReview: Successfully added thumbnail to review_files: {thumbnail_path.name}"
@@ -456,18 +442,18 @@ Features:
             pre_create_data (dict): Data from pre-create attributes
         """
         log.info(f"KitsuReview: Creating instance '{product_name}'")
-        log.debug(
-            f"KitsuReview: pre_create_data keys: {list(pre_create_data.keys())}"
-        )
+        # log.debug(
+        #     f"KitsuReview: pre_create_data keys: {list(pre_create_data.keys())}"
+        # )
 
         # Get review files from pre-create data (following traypublisher pattern)
         review_files_data = pre_create_data.get("review_files")
         screenshot_path = pre_create_data.pop(PRE_CREATE_THUMBNAIL_KEY, None)
 
-        log.debug(f"KitsuReview: review_files_data: {review_files_data}")
-        log.debug(
-            f"KitsuReview: screenshot_path from PRE_CREATE_THUMBNAIL_KEY: {screenshot_path}"
-        )
+        # log.debug(f"KitsuReview: review_files_data: {review_files_data}")
+        # log.debug(
+        #     f"KitsuReview: screenshot_path from PRE_CREATE_THUMBNAIL_KEY: {screenshot_path}"
+        # )
 
         # Collect all files (from FileDef + screenshot)
         all_files = []
@@ -507,9 +493,7 @@ Features:
                 # Additional screenshots handled via polling system
 
         # Must have at least one file
-        print(
-            f"[KitsuReview] Final all_files list: {[str(f) for f in all_files]}"
-        )
+
         if not all_files:
             raise CreatorError(
                 "No files specified. Please drag and drop files or capture a screenshot."
@@ -588,7 +572,7 @@ Features:
 
     def get_pre_create_attr_defs(self):
         """Return attribute definitions for pre-create dialog."""
-        log.debug("KitsuReview: get_pre_create_attr_defs called")
+        # log.debug("KitsuReview: get_pre_create_attr_defs called")
 
         # Start thumbnail polling when UI is being built
         # This is much simpler and more reliable than event registration
@@ -599,9 +583,9 @@ Features:
         captured_screenshots = getattr(self, "_captured_screenshots", [])
         default_files = captured_screenshots if captured_screenshots else []
 
-        log.debug(
-            f"KitsuReview: Building FileDef with default_files: {default_files}"
-        )
+        # log.debug(
+        #     f"KitsuReview: Building FileDef with default_files: {default_files}"
+        # )
 
         # Debug: Check if the files actually exist
         for file_path in default_files:
@@ -621,7 +605,8 @@ Features:
                 f"KitsuReview: Passing {len(default_files)} items to FileDef default"
             )
         else:
-            log.debug("KitsuReview: No default files to pass to FileDef")
+            # log.debug("KitsuReview: No default files to pass to FileDef")
+            pass
 
         # Create the FileDef with proper logging
         file_def = FileDef(
@@ -634,10 +619,10 @@ Features:
             default=default_files,
         )
 
-        log.debug(
-            f"KitsuReview: Created FileDef with default: {file_def.default}"
-        )
-        log.debug(f"KitsuReview: FileDef single_item: {file_def.single_item}")
+        # log.debug(
+        #     f"KitsuReview: Created FileDef with default: {file_def.default}"
+        # )
+        # log.debug(f"KitsuReview: FileDef single_item: {file_def.single_item}")
 
         attr_defs = [
             file_def,
