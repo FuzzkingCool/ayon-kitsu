@@ -1,9 +1,9 @@
 """Kitsu credentials functions."""
 
 import os
-from typing import Tuple, Optional, Union
-import gazu
+from typing import Optional, Tuple, Union
 
+import gazu
 from ayon_core.lib import AYONSecureRegistry, emit_event
 
 
@@ -24,11 +24,9 @@ def validate_credentials(
     """
 
     if kitsu_url is None:
-        if os.environ.get("KITSU_SERVER") is None:
-            # TODO raise correct type
-            raise
-        else:
-            kitsu_url = str(os.environ.get("KITSU_SERVER"))
+        kitsu_url = os.environ.get("KITSU_SERVER")
+        if kitsu_url is None:
+            raise ValueError("KITSU_SERVER environment variable is not set")
 
     # Connect to server
     validate_host(kitsu_url)
@@ -109,14 +107,3 @@ def load_credentials() -> Tuple[Union[object, None], Union[object, None]]:
         user_registry.get_item("login", None),
         user_registry.get_item("password", None),
     )
-
-
-def set_credentials_envs(login: str, password: str):
-    """Set environment variables with Kitsu login and password.
-
-    Args:
-        login (str): Kitsu user login
-        password (str): Kitsu user password
-    """
-    os.environ["KITSU_LOGIN"] = login
-    os.environ["KITSU_PWD"] = password

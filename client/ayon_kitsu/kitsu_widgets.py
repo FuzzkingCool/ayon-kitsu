@@ -1,16 +1,15 @@
-from qtpy import QtWidgets, QtCore, QtGui
+import os
 
 import ayon_api
-
 from ayon_core import style
 from ayon_core.resources import get_resource
 from ayon_core.tools.utils import PressHoverButton
+from qtpy import QtCore, QtGui, QtWidgets
 
 from ayon_kitsu.credentials import (
     clear_credentials,
     load_credentials,
     save_credentials,
-    set_credentials_envs,
     validate_credentials,
 )
 
@@ -30,6 +29,9 @@ class KitsuPasswordDialog(QtWidgets.QDialog):
 
         addon_settings = ayon_api.get_addon_settings("kitsu", __version__)
         server_url = addon_settings["server"]
+
+        # Store server URL for later use
+        self._server_url = server_url
 
         user_login, user_pwd = load_credentials()
         remembered = bool(user_login or user_pwd)
@@ -160,7 +162,9 @@ class KitsuPasswordDialog(QtWidgets.QDialog):
 
         # Authenticate
         if validate_credentials(login_value, pwd_value):
-            set_credentials_envs(login_value, pwd_value)
+            os.environ["KITSU_LOGIN"] = login_value
+            os.environ["KITSU_PWD"] = pwd_value
+            os.environ["KITSU_SERVER"] = self._server_url
         else:
             self._message_label.setText("Authentication failed...")
             return
