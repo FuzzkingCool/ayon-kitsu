@@ -260,7 +260,6 @@ class KitsuReviewCreator(TrayPublishCreator):
             # The canonical AYON way: work with pre-create attribute definitions
             # Get current attribute definitions and find review_files
             attr_defs = self.get_pre_create_attr_defs()
-
             review_files_def = None
             for attr_def in attr_defs:
                 if hasattr(attr_def, "key") and attr_def.key == "review_files":
@@ -294,17 +293,7 @@ class KitsuReviewCreator(TrayPublishCreator):
             thumbnail_path = new_path
             thumbnail_path_str = str(thumbnail_path)
 
-            # Add to the existing captured screenshots list
-            if not hasattr(self, "_captured_screenshots"):
-                self._captured_screenshots = []
-            if thumbnail_path_str not in self._captured_screenshots:
-                self._captured_screenshots.append(thumbnail_path_str)
-                self.log.debug(
-                    f"KitsuReview: Added to captured screenshots: {thumbnail_path_str}"
-                )
-
             # Create FileDef value structure with the thumbnail
-            thumbnail_path = Path(thumbnail_path)
             from ayon_core.lib.attribute_definitions import FileDefItem
 
             # Create a FileDefItem and convert to proper dict format
@@ -347,7 +336,16 @@ class KitsuReviewCreator(TrayPublishCreator):
                     "KitsuReview: Thumbnail already in pending list, skipping duplicate"
                 )
 
-            # Find and update the FileDef widget directly (cleaner approach)
+            # Add to the existing captured screenshots list for create() method
+            if not hasattr(self, "_captured_screenshots"):
+                self._captured_screenshots = []
+            if thumbnail_path_str not in self._captured_screenshots:
+                self._captured_screenshots.append(thumbnail_path_str)
+                self.log.debug(
+                    f"KitsuReview: Added to captured screenshots: {thumbnail_path_str}"
+                )
+
+            # Update the FileDef widget to show the screenshot in the UI
             try:
                 app = QtWidgets.QApplication.instance()
                 if app:
@@ -375,16 +373,9 @@ class KitsuReviewCreator(TrayPublishCreator):
 
                                     # Set the updated list (this will accumulate)
                                     widget.set_value(current_files, False)
-                                    # self.log.info(
-                                    #     f"KitsuReview: Added screenshot to FileDef: {new_filename}"
-                                    # )
-                                    # self.log.debug(
-                                    #     f"KitsuReview: Total files in FileDef: {len(current_files)}"
-                                    # )
-                                # else:
-                                #     self.log.debug(
-                                #         f"KitsuReview: Screenshot already in FileDef: {new_filename}"
-                                #     )
+                                    self.log.debug(
+                                        f"KitsuReview: Added screenshot to FileDef UI: {thumbnail_path.name}"
+                                    )
 
                                 return  # Success
 
@@ -397,11 +388,6 @@ class KitsuReviewCreator(TrayPublishCreator):
             self.create_context.create_plugin_pre_create_attr_defs_changed(
                 self.identifier
             )
-            # self.log.debug("KitsuReview: Triggered pre-create attr defs refresh")
-
-            # self.log.info(
-            #     f"KitsuReview: Thumbnail ready for create() method: {thumbnail_path.name}"
-            # )
 
             self.log.info(
                 f"KitsuReview: Successfully added thumbnail to review_files: {thumbnail_path.name}"
@@ -450,6 +436,32 @@ Features:
             pre_create_data (dict): Data from pre-create attributes
         """
         self.log.info(f"KitsuReview: Creating instance '{product_name}'")
+
+        # Get task name from instance data (TrayPublisher pattern)
+        task_name = instance_data.get("task")
+        if not task_name or task_name == "None":
+            raise CreatorError(
+                "No task selected. Please select a task in TrayPublisher before creating a Kitsu review."
+            )
+
+        # Get folder entity to fetch task entity
+        folder_path = instance_data["folderPath"]
+        folder_entity = self.create_context.get_folder_entity(folder_path)
+
+        # Get task entity using ayon_api (following TrayPublisher pattern)
+        import ayon_api
+
+        task_entity = ayon_api.get_task_by_name(
+            self.project_name, folder_entity["id"], task_name
+        )
+
+        if not task_entity:
+            raise CreatorError(
+                f"Task '{task_name}' not found in folder '{folder_path}'"
+            )
+
+        self.log.info(f"KitsuReview: Creating review for task: {task_name} (ID: {task_entity['id']})")
+
         # self.log.debug(
         #     f"KitsuReview: pre_create_data keys: {list(pre_create_data.keys())}"
         # )
@@ -469,14 +481,38 @@ Features:
 
         # Add files from FileDef
         if review_files_data:
-            files = review_files_data.get("filenames", [])
-            directory = review_files_data.get("directory")
-            if files and directory:
-                main_directory = directory
-                for filename in files:
-                    file_path = Path(directory) / filename
-                    if file_path.exists():
-                        all_files.append(file_path)
+            # Handle both list of file paths and FileDef dictionary format
+            if isinstance(review_files_data, list):
+                # List can contain either strings or dictionaries (FileDef format)
+                for item in review_files_data:
+                    if isinstance(item, str):
+                        # Direct file path string
+                        file_path = Path(item)
+                        if file_path.exists():
+                            all_files.append(file_path)
+                            if not main_directory:
+                                main_directory = str(file_path.parent)
+                    elif isinstance(item, dict):
+                        # FileDef dictionary format
+                        files = item.get("filenames", [])
+                        directory = item.get("directory")
+                        if files and directory:
+                            if not main_directory:
+                                main_directory = directory
+                            for filename in files:
+                                file_path = Path(directory) / filename
+                                if file_path.exists():
+                                    all_files.append(file_path)
+            elif isinstance(review_files_data, dict):
+                # Single FileDef dictionary format
+                files = review_files_data.get("filenames", [])
+                directory = review_files_data.get("directory")
+                if files and directory:
+                    main_directory = directory
+                    for filename in files:
+                        file_path = Path(directory) / filename
+                        if file_path.exists():
+                            all_files.append(file_path)
 
         # Add screenshot if captured (from thumbnail system)
         if screenshot_path:
@@ -498,7 +534,18 @@ Features:
                 if not main_directory:
                     main_directory = str(screenshot_file.parent)
 
-                # Additional screenshots handled via polling system
+        # Add screenshots from pending thumbnails (FileDef format)
+        pending_thumbnails = getattr(self, "_pending_thumbnails", [])
+        for thumbnail_data in pending_thumbnails:
+            if isinstance(thumbnail_data, dict):
+                directory = thumbnail_data.get("directory", "")
+                filenames = thumbnail_data.get("filenames", [])
+                for filename in filenames:
+                    file_path = Path(directory) / filename
+                    if file_path.exists():
+                        all_files.append(file_path)
+                        if not main_directory:
+                            main_directory = str(file_path.parent)
 
         # Must have at least one file
 
@@ -523,6 +570,14 @@ Features:
         instance_data["kitsuOnlyReview"] = (
             True  # Flag for Kitsu-only processing
         )
+
+        # Ensure task name is properly set
+        if not instance_data.get("task"):
+            instance_data["task"] = task_name
+
+        # Store task entity for publish plugins
+        instance_data["taskEntity"] = task_entity
+        instance_data["folderEntity"] = folder_entity
 
         # Create representations for all files (including screenshots)
         representations = []
@@ -587,36 +642,28 @@ Features:
         self._start_thumbnail_polling()
 
         # Check if we have pending thumbnails to include
-        # Try passing simple file paths instead of dictionaries
-        captured_screenshots = getattr(self, "_captured_screenshots", [])
-        default_files = captured_screenshots if captured_screenshots else []
+        pending_thumbnails = getattr(self, "_pending_thumbnails", [])
 
-        # self.log.debug(
-        #     f"KitsuReview: Building FileDef with default_files: {default_files}"
-        # )
+        # For FileDef with single_item=False, use the pending thumbnails (FileDef format)
+        default_files = pending_thumbnails if pending_thumbnails else None
 
         # Debug: Check if the files actually exist
-        for file_path in default_files:
-            import os
+        for thumbnail_data in pending_thumbnails:
+            if isinstance(thumbnail_data, dict):
+                directory = thumbnail_data.get("directory", "")
+                filenames = thumbnail_data.get("filenames", [])
+                for filename in filenames:
+                    file_path = Path(directory) / filename
+                    import os
 
-            exists = os.path.exists(file_path)
-            self.log.debug(
-                f"KitsuReview: File exists check: {file_path} -> {exists}"
-            )
-            if not exists:
-                self.log.warning(
-                    f"KitsuReview: File does not exist: {file_path}"
-                )
-
-        # CRITICAL: For single_item=False, FileDef expects a list of dictionaries,
-        # but we need to make sure it's properly formatted
-        if default_files and len(default_files) > 0:
-            self.log.debug(
-                f"KitsuReview: Passing {len(default_files)} items to FileDef default"
-            )
-        else:
-            # log.debug("KitsuReview: No default files to pass to FileDef")
-            pass
+                    exists = os.path.exists(file_path)
+                    self.log.debug(
+                        f"KitsuReview: File exists check: {file_path} -> {exists}"
+                    )
+                    if not exists:
+                        self.log.warning(
+                            f"KitsuReview: File does not exist: {file_path}"
+                        )
 
         # Create the FileDef with proper logging
         file_def = FileDef(
