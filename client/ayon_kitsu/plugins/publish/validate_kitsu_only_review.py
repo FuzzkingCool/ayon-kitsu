@@ -12,6 +12,7 @@ from ayon_core.pipeline.publish import (
     PublishValidationError,
     ValidateContentsOrder,
 )
+
 from ayon_kitsu.pipeline import KitsuPublishInstancePlugin
 
 
@@ -65,9 +66,20 @@ class ValidateKitsuOnlyReview(
         # Validate Kitsu context
         kitsu_task = instance.data.get("kitsuTask")
         if not kitsu_task:
-            errors.append(
-                "No Kitsu task context found. Ensure you are working in a valid AYON project with Kitsu integration."
-            )
+            # Check if we have a task entity but no Kitsu task
+            task_entity = instance.data.get("taskEntity")
+            if not task_entity:
+                errors.append(
+                    "No task selected. Please select a task in TrayPublisher before creating a Kitsu review."
+                )
+            else:
+                errors.append(
+                    "No Kitsu task context found. This usually means:\n"
+                    "1. The selected task is not properly linked to Kitsu\n"
+                    "2. The Kitsu integration is not properly configured\n"
+                    "3. The task does not exist in Kitsu\n\n"
+                    "Please ensure you have selected a valid task and that Kitsu integration is working."
+                )
         else:
             # Validate task has required fields
             task_id = kitsu_task.get("id")
