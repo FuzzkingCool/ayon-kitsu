@@ -109,7 +109,7 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             # Harmony-specific
             "harmony.template",
             "harmony.layeredtemplate",
-            "harmony.layeredrender",
+            "renderlayer",
             "harmony.palette",
             "harmony.tbg",
             # Photoshop-specific
