@@ -29,6 +29,37 @@ class IntegrateKitsuOnlyReview(KitsuPublishInstancePlugin):
     def process(self, instance):
         """Process the review instance for Kitsu-only submission."""
 
+        # Skip if this instance is being processed by grouped review plugin
+        if instance.data.get("kitsuGroupedReviewProcessed"):
+            self.log.debug(
+                f"Instance {instance.data.get('productName')} "
+                "already processed by grouped review plugin, skipping"
+            )
+            return
+
+        # Also skip if this instance has the "review" family 
+        # (should be handled by grouped plugin)
+        families = instance.data.get("families", [])
+        if "review" in families and "kitsu" in families:
+            self.log.debug(
+                f"Instance {instance.data.get('productName')} "
+                "has review family, will be handled by grouped plugin, skipping"
+            )
+            return
+
+        # Skip if this is a render instance that has been converted to review
+        if (
+            "render" in families
+            and "review" in families
+            and "kitsu" in families
+        ):
+            self.log.debug(
+                f"Instance {instance.data.get('productName')}"
+                 "is a render converted to review, should be handled by "
+                 "grouped plugin, skipping"
+            )
+            return
+
         # Only process instances marked as Kitsu-only reviews
         if not instance.data.get("kitsuOnlyReview", False):
             self.log.debug("Not a Kitsu-only review, skipping")

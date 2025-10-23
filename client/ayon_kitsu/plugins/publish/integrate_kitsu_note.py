@@ -62,18 +62,24 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                 "family_requirements"
             ]
 
+        # Detect grouped vs single review per Kitsu task
+        # Group instances that are review+kitsu by task id
+        by_task = {}
         for instance in context:
-            # Check if instance is a review by checking its family
-            # Allow a match to primary family or any of families
-            families = set(
-                [instance.data["family"]] + instance.data.get("families", [])
-            )
+            families = set([instance.data["family"]] + instance.data.get("families", []))
             if "review" not in families or "kitsu" not in families:
                 continue
-
             kitsu_task = instance.data.get("kitsuTask")
             if not kitsu_task:
                 continue
+            task_id = kitsu_task["id"]
+            by_task.setdefault(task_id, []).append(instance)
+
+        for task_id, instances in by_task.items():
+            kitsu_task = instances[0].data.get("kitsuTask")
+            if not kitsu_task:
+                continue
+            is_grouped = len(instances) > 1
 
             # Get note status, by default uses the task status for the note
             # if it is not specified in the configuration
@@ -146,9 +152,22 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     )
 
             # Get comment text body
-            publish_comment = instance.data.get("comment")
-            if self.custom_comment_template["enabled"]:
-                publish_comment = self.format_publish_comment(instance)
+            if is_grouped:
+                # Build grouped comment using shared util to match template
+                from ayon_kitsu.utils import render_kitsu_comment
+
+                version = (
+                    instances[0].data.get("kitsuGroupedVersion")
+                    or instances[0].data.get("version", 1)
+                )
+                names = ", ".join(i.data.get("productName", "Untitled") for i in instances)
+                data_map = {"comment": f"Grouped Review: {names}", "version": version, "family": "render", "name": names}
+                publish_comment = render_kitsu_comment(self.custom_comment_template, data_map)
+            else:
+                instance = instances[0]
+                publish_comment = instance.data.get("comment")
+                if self.custom_comment_template["enabled"]:
+                    publish_comment = self.format_publish_comment(instance)
 
             if not publish_comment:
                 self.log.debug("Comment is not set.")
@@ -172,11 +191,16 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                 kitsu_comment = gazu.task.add_comment(
                     kitsu_task,
                     note_status,
-                    comment= publish_comment,
+                    comment=publish_comment,
                     person=current_user,
                 )
 
-                instance.data["kitsuComment"] = kitsu_comment
+                # Save the same comment on all instances for this task (grouped or single)
+                for inst in instances:
+                    inst.data["kitsuComment"] = kitsu_comment
+                    # Mark grouped processed to signal preview uploads go to this comment
+                    if is_grouped:
+                        inst.data["kitsuGroupedReviewProcessed"] = True
             except Exception as e:
                 self.log.error(f"Error adding comment to kitsu task: {e}")
                 self.log.error(traceback.format_exc())

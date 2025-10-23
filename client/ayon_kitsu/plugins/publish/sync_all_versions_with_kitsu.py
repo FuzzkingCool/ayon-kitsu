@@ -105,11 +105,11 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             # Core product types
             "workfile",
             "render",
+            "renderlayer",
             "review",
             # Harmony-specific
             "harmony.template",
             "harmony.layeredtemplate",
-            "renderlayer",
             "harmony.palette",
             "harmony.tbg",
             # Photoshop-specific
@@ -242,6 +242,10 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             instance.data["kitsuTargetVersion"] = (
                 target_version  # Store for PreserveSynchronizedVersions
             )
+
+            # For grouped reviews, ensure all instances in the same task use the same version
+            if "review" in instance.data.get("families", []):
+                instance.data["kitsuGroupedVersion"] = target_version
 
             self.log.info(
                 f"Synced {instance.data.get('productName')}: "
