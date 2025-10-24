@@ -1,5 +1,5 @@
 import re
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import gazu
 
@@ -36,7 +36,7 @@ def render_kitsu_comment(template_cfg: Dict[str, Any], data: Dict[str, Any]) -> 
     return f"version\t{version}\nfamily\t{family}\nname\t{name}"
 
 
-def resolve_feedback_status(kitsu_task: Dict[str, Any]) -> Dict[str, Any] | None:
+def resolve_feedback_status(kitsu_task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Resolve the desired Kitsu task status for feedback comments.
 
     Preference order:

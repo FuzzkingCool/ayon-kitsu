@@ -161,7 +161,9 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     or instances[0].data.get("version", 1)
                 )
                 names = ", ".join(i.data.get("productName", "Untitled") for i in instances)
-                data_map = {"comment": f"Grouped Review: {names}", "version": version, "family": "render", "name": names}
+                # Use the actual user's comment from the first instance
+                user_comment = instances[0].data.get("comment", "")
+                data_map = {"comment": user_comment, "version": version, "family": "render", "name": names}
                 publish_comment = render_kitsu_comment(self.custom_comment_template, data_map)
             else:
                 instance = instances[0]

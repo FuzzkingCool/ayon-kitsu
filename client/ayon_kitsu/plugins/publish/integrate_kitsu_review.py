@@ -37,6 +37,17 @@ class IntegrateKitsuReview(KitsuPublishInstancePlugin):
             self.log.debug("No kitsu task found, skipping review upload.")
             return
 
+        # De-dup protection: only upload previews once per task and product
+        # We track uploads in context to avoid double uploads by multiple plugins
+        context = instance.context
+        uploaded_key = (kitsu_task["id"], instance.data.get("productName"))
+        context_uploaded = context.data.setdefault("kitsu_uploaded_previews", set())
+        if uploaded_key in context_uploaded:
+            self.log.debug(
+                f"Previews for {product_name} already uploaded for this task, skipping"
+            )
+            return
+
         # Add review representations as preview of comment
         task_id = kitsu_task["id"]
         for representation in instance.data.get("representations", []):
@@ -85,3 +96,6 @@ class IntegrateKitsuReview(KitsuPublishInstancePlugin):
                 except Exception as e:
                     self.log.error(f"Failed to upload review: {e}")
                     raise Exception(f"Failed to upload review: {e}")
+
+        # Mark uploaded for this task/product to avoid duplicates
+        context_uploaded.add(uploaded_key)

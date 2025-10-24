@@ -55,16 +55,19 @@ class Kitsu:
                         headers={"Authorization": f"Bearer {self.token}"},
                     )
                     response.raise_for_status()
-            except httpx.HTTPError as e:
-                status_code = response.status_code
+            except httpx.HTTPStatusError as e:
+                status_code = e.response.status_code if e.response is not None else None
                 if status_code == 401:
                     raise KitsuLoginException(
                         "Could not login to Kitsu (invalid token)"
                     ) from e
-                else:
-                    raise KitsuLoginException(
-                        "Could not login to Kitsu (server error)"
-                    ) from e
+                raise KitsuLoginException(
+                    "Could not login to Kitsu (server error)"
+                ) from e
+            except httpx.HTTPError as e:
+                raise KitsuLoginException(
+                    "Could not login to Kitsu (server error)"
+                ) from e
 
             else:
                 return
