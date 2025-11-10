@@ -24,7 +24,7 @@ class CollectKitsuLatestReviewVersion(KitsuPublishContextPlugin):
     order = pyblish.api.CollectorOrder + 0.479
     # Remove families restriction - process ALL instances
     log = log_harmony
-    log.info("CollectKitsuLatestReviewVersion plugin loaded")
+    log.debug("CollectKitsuLatestReviewVersion plugin loaded")
 
     def process(self, context):
         self.log.info(

@@ -26,7 +26,7 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
     # No hosts restriction - this works for ALL hosts
 
     log = log_harmony
-    log.info("SyncAllVersionsWithKitsu plugin loaded")
+    log.debug("SyncAllVersionsWithKitsu plugin loaded")
 
     def process(self, context):
         """Process all instances and sync their versions with Kitsu data."""

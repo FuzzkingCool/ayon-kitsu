@@ -26,7 +26,7 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
     # No hosts restriction - this works for ALL hosts
 
     log = log_harmony
-    log.info("PreserveSynchronizedVersions plugin loaded")
+    log.debug("PreserveSynchronizedVersions plugin loaded")
 
     def process(self, context):
         """Process all instances and restore synchronized versions if needed."""
