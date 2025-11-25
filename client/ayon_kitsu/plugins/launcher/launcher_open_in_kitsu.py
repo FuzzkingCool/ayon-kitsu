@@ -1,3 +1,4 @@
+import os
 import webbrowser
 import ayon_api
 
@@ -5,12 +6,20 @@ from ayon_core.pipeline import LauncherAction
 from ayon_core.addon import AddonsManager
 
 
-class ShowInKitsu(LauncherAction):
+class LauncherOpenInKitsu(LauncherAction):
     name = "showinkitsu"
     label = "Show in Kitsu"
-    icon = "external-link-square"
+    icon = None  # Set dynamically in __init__
     color = "#e0e1e1"
     order = 10
+
+    def __init__(self, *args, **kwargs):
+        super(LauncherOpenInKitsu, self).__init__(*args, **kwargs)
+        # Set icon path to Kitsu logo
+        kitsu_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        self.icon = os.path.join(kitsu_root, "vendor", "kitsu-logo.png")
 
     @staticmethod
     def get_kitsu_addon():
@@ -26,8 +35,8 @@ class ShowInKitsu(LauncherAction):
         if not project:
             raise RuntimeError(f"Project {project_name} not found.")
 
-        project_zou_id = project["data"].get("zou_id")
-        if not project_zou_id:
+        project_kitsu_id = project["data"].get("kitsuProjectId")
+        if not project_kitsu_id:
             raise RuntimeError(
                 f"Project {project_name} has no connected kitsu id."
             )
@@ -46,7 +55,7 @@ class ShowInKitsu(LauncherAction):
 
         # Define URL
         url = self.get_url(
-            project_zou_id,
+            project_kitsu_id,
             folder_kitsu_id,
             folder_type,
             task_kitsu_id,
@@ -86,5 +95,9 @@ class ShowInKitsu(LauncherAction):
             # /productions/{project-id}/assets/{entity_id}
             # /productions/{project-id}/shots/{entity_id}
             sub_url += f"/{kitsu_type}/{folder_kitsu_id}"
+
+        else:
+            # Default to assets page when only project is selected
+            sub_url += "/assets"
 
         return f"{kitsu_url}{sub_url}"
