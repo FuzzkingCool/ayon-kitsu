@@ -38,15 +38,27 @@ class InventoryOpenInKitsu(InventoryAction):
             bool: True if container has representation that can be mapped to Kitsu
         """
         try:
+            # Check if gazu is available
+            if gazu is None:
+                return False
+
             # Check if Kitsu addon is available
             kitsu_addon = AddonsManager().get("kitsu")
             if not kitsu_addon:
                 return False
 
+            # Check if Kitsu credentials are available
+            server = os.environ.get("KITSU_SERVER")
+            login = os.environ.get("KITSU_LOGIN")
+            password = os.environ.get("KITSU_PWD")
+            if not all([server, login, password]):
+                return False
+
             # Check if container has representation ID
             return bool(container.get("representation"))
-        except Exception:
-            # Silently fail to prevent breaking Scene Inventory context menu
+        except Exception as e:
+            # Log but don't break Scene Inventory
+            self.log.debug(f"Kitsu action compatibility check failed: {e}")
             return False
 
     def process(self, containers):
@@ -58,71 +70,85 @@ class InventoryOpenInKitsu(InventoryAction):
         Returns:
             bool: True if successful
         """
+        try:
+            kitsu_addon = AddonsManager().get("kitsu")
+            if not kitsu_addon:
+                self.log.error("Kitsu addon not available")
+                return False
 
-        kitsu_addon = AddonsManager().get("kitsu")
-        if not kitsu_addon:
-            self.log.warning("Kitsu addon not available")
-            return False
+            project_name = get_current_project_name()
+            if not project_name:
+                self.log.error("No project selected")
+                return False
 
-        project_name = get_current_project_name()
-        if not project_name:
-            self.log.warning("No project selected")
-            return False
+            # Get project entity with Kitsu ID
+            project_entity = ayon_api.get_project(project_name)
+            if not project_entity:
+                self.log.error(f"Project {project_name} not found")
+                return False
 
-        # Get project entity with Kitsu ID
-        project_entity = ayon_api.get_project(project_name)
-        if not project_entity:
-            self.log.warning(f"Project {project_name} not found")
-            return False
-
-        kitsu_project_id = project_entity["data"].get("kitsuProjectId")
-        if not kitsu_project_id:
-            self.log.warning(f"Project {project_name} has no Kitsu project ID")
-            return False
-
-        # Login to Kitsu
-        if not self._ensure_kitsu_logged_in():
-            self.log.warning("Failed to login to Kitsu")
-            return False
-
-        # Process each container
-        opened_count = 0
-        for container in containers:
-            if not self.is_compatible(container):
-                continue
-
-            repre_id = container.get("representation")
-            if not repre_id:
-                continue
-
-            # Get representation entity
-            repre_entity = ayon_api.get_representation_by_id(
-                project_name, repre_id
-            )
-            if not repre_entity:
-                self.log.warning(f"Representation {repre_id} not found")
-                continue
-
-            # Get version ID
-            version_id = repre_entity.get("versionId")
-            if not version_id:
-                self.log.warning(
-                    f"Representation {repre_id} has no version ID"
+            kitsu_project_id = project_entity["data"].get("kitsuProjectId")
+            if not kitsu_project_id:
+                self.log.error(
+                    f"Project {project_name} has no Kitsu project ID. "
+                    "Please sync with Kitsu first."
                 )
-                continue
+                return False
 
-            # Jump to Kitsu task
-            if self._jump_to_kitsu_for_version(
-                project_name, version_id, kitsu_project_id
-            ):
-                opened_count += 1
+            # Login to Kitsu
+            if not self._ensure_kitsu_logged_in():
+                self.log.error(
+                    "Failed to login to Kitsu. Please check your credentials."
+                )
+                return False
 
-        if opened_count > 0:
-            self.log.info(f"Opened {opened_count} Kitsu task(s)")
-            return True
+            # Process each container
+            opened_count = 0
+            for container in containers:
+                if not self.is_compatible(container):
+                    self.log.debug(f"Container not compatible: {container.get('objectName')}")
+                    continue
 
-        self.log.warning("No Kitsu tasks opened")
-        return False
+                repre_id = container.get("representation")
+                if not repre_id:
+                    self.log.debug(f"No representation ID in container: {container.get('objectName')}")
+                    continue
+
+                # Get representation entity
+                repre_entity = ayon_api.get_representation_by_id(
+                    project_name, repre_id
+                )
+                if not repre_entity:
+                    self.log.warning(f"Representation {repre_id} not found")
+                    continue
+
+                # Get version ID
+                version_id = repre_entity.get("versionId")
+                if not version_id:
+                    self.log.warning(
+                        f"Representation {repre_id} has no version ID"
+                    )
+                    continue
+
+                # Jump to Kitsu task
+                if self._jump_to_kitsu_for_version(
+                    project_name, version_id, kitsu_project_id
+                ):
+                    opened_count += 1
+
+            if opened_count > 0:
+                self.log.info(f"Opened {opened_count} Kitsu task(s) in browser")
+                return True
+
+            self.log.error(
+                "Could not open any Kitsu tasks. "
+                "The selected containers may not have Kitsu IDs."
+            )
+            return False
+
+        except Exception as e:
+            self.log.error(f"Failed to open Kitsu task: {e}", exc_info=True)
+            return False
 
     def _ensure_kitsu_logged_in(self):
         """Ensure we're logged into Kitsu using environment credentials."""
