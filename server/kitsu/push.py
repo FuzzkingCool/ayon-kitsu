@@ -238,15 +238,26 @@ async def sync_person(
     )
     last_name = entity_dict.get("last_name", '')
 
-    # == check should Person entity be synced ==
-    # do not sync Kitsu API bots
-    if entity_dict.get("is_bot"):
-        logging.info(
-            f"skipping sync_person for Kitsu Bot: {first_name} {last_name}"
+    # Skip if this person has already been processed in this batch
+    # This prevents infinite loops if sync_person is called multiple times
+    if entity_id in existing_users:
+        logging.debug(
+            f"sync_person: Skipping {first_name} {last_name} (id={entity_id}) - already processed"
         )
         return
 
-    logging.info(f"sync_person: {first_name} {last_name}")
+    # Mark as processing immediately to prevent concurrent processing
+    # We'll set the actual username value at the end
+    existing_users[entity_id] = None
+
+    # == check should Person entity be synced ==
+    # do not sync Kitsu API bots
+    if entity_dict.get("is_bot"):
+        # Remove from processing map if we're skipping
+        existing_users.pop(entity_id, None)
+        return
+
+    logging.debug(f"sync_person: {first_name} {last_name} (id={entity_id})")
     username = to_username(first_name, last_name)
 
     payload = {
@@ -273,6 +284,38 @@ async def sync_person(
         target_user = ayon_user
 
     if target_user:  # Update user
+        # Check if user data actually changed to avoid unnecessary updates
+        user_changed = False
+
+        # Check if name changed
+        if target_user.name != username:
+            user_changed = True
+
+        # Check if email changed
+        current_email = getattr(target_user.attrib, "email", "")
+        new_email = payload.get("attrib", {}).get("email", "")
+        if current_email != new_email:
+            user_changed = True
+
+        # Check if fullName changed
+        current_full_name = getattr(target_user.attrib, "fullName", "")
+        new_full_name = payload.get("attrib", {}).get("fullName", "")
+        if current_full_name != new_full_name:
+            user_changed = True
+
+        # Check if kitsuId changed or is missing
+        current_kitsu_id = target_user.data.get("kitsuId") if target_user.data else None
+        if current_kitsu_id != entity_id:
+            user_changed = True
+
+        # Only update if something actually changed
+        if not user_changed:
+            logging.debug(
+                f"sync_person: User {target_user.name} (id={entity_id}) unchanged, skipping update"
+            )
+            existing_users[entity_id] = target_user.name
+            return
+
         try:
             session = await Session.create(user)
             headers = {"Authorization": f"Bearer {session.token}"}
@@ -283,26 +326,93 @@ async def sync_person(
                     json=payload,
                     headers=headers,
                 )
-            # Rename the user
+            # Rename the user only if the username has changed
             # TODO: We should discourage renaming users.
             # Maybe just change the fullName in the case there's a typo,
             # but changing username may have weird side effects.
-            payload = {"newName": username}
-            async with httpx.AsyncClient() as client:
-                await client.patch(
-                    f"{ayon_server_url}/api/users/{target_user.name}/rename",
-                    json=payload,
-                    headers=headers,
-                )
+            if target_user.name != username:
+                payload = {"newName": username}
+                async with httpx.AsyncClient() as client:
+                    await client.patch(
+                        f"{ayon_server_url}/api/users/{target_user.name}/rename",
+                        json=payload,
+                        headers=headers,
+                    )
         except Exception as e:
-            print(e)
+            logging.error(f"Error updating user {target_user.name}: {e}")
+            # Remove from processing map to allow retry on next batch
+            existing_users.pop(entity_id, None)
+            return
     else:  # Create user
-        user = UserEntity(payload)
-        settings = await addon.get_studio_settings()
-        user.set_password(settings.sync_settings.sync_users.default_password)
-        await user.save()
+        # Double-check that user doesn't already exist before creating
+        if ayon_user is None:
+            try:
+                ayon_user = await UserEntity.load(username)
+            except Exception:
+                pass
 
-    # update the id map
+        if ayon_user:
+            # User exists but wasn't found by kitsuId - use existing user
+            target_user = ayon_user
+
+            # Check if user data actually changed to avoid unnecessary updates
+            user_changed = False
+
+            # Check if email changed
+            current_email = getattr(target_user.attrib, "email", "")
+            new_email = payload.get("attrib", {}).get("email", "")
+            if current_email != new_email:
+                user_changed = True
+
+            # Check if fullName changed
+            current_full_name = getattr(target_user.attrib, "fullName", "")
+            new_full_name = payload.get("attrib", {}).get("fullName", "")
+            if current_full_name != new_full_name:
+                user_changed = True
+
+            # Check if kitsuId changed or is missing
+            current_kitsu_id = target_user.data.get("kitsuId") if target_user.data else None
+            if current_kitsu_id != entity_id:
+                user_changed = True
+
+            # Only update if something actually changed
+            if not user_changed:
+                logging.debug(
+                    f"sync_person: User {target_user.name} (id={entity_id}) unchanged, skipping update"
+                )
+                existing_users[entity_id] = target_user.name
+                return
+
+            try:
+                session = await Session.create(user)
+                headers = {"Authorization": f"Bearer {session.token}"}
+                ayon_server_url = entity_dict["ayon_server_url"]
+                async with httpx.AsyncClient() as client:
+                    await client.patch(
+                        f"{ayon_server_url}/api/users/{target_user.name}",
+                        json=payload,
+                        headers=headers,
+                    )
+            except Exception as e:
+                logging.error(f"Error updating existing user {target_user.name}: {e}")
+                # Remove from processing map to allow retry on next batch
+                existing_users.pop(entity_id, None)
+                return
+        else:
+            # User doesn't exist - create new user
+            try:
+                new_user = UserEntity(payload)
+                settings = await addon.get_studio_settings()
+                new_user.set_password(settings.sync_settings.sync_users.default_password)
+                await new_user.save()
+            except Exception as e:
+                logging.error(f"Error creating new user {username}: {e}")
+                # Remove from processing map to allow retry on next batch
+                existing_users.pop(entity_id, None)
+                return
+
+    # Update the id map with the actual username
+    # (we set it to None earlier to mark as processing)
     existing_users[entity_id] = username
 
 
@@ -626,6 +736,10 @@ async def push_entities(
             )
         elif entity_dict["type"] == "Person":
             if settings.sync_settings.sync_users.enabled:
+                # Skip if this person has already been processed in this batch
+                person_id = entity_dict.get("id")
+                if person_id and person_id in users:
+                    continue
                 await create_access_group(
                     addon,
                     user,
@@ -646,6 +760,10 @@ async def push_entities(
                 entity_dict,
             )
         else:
+            logging.debug(
+                f"push_entities: Syncing Task '{entity_dict.get('name')}' "
+                f"with status '{entity_dict.get('task_status_name')}'"
+            )
             await sync_task(
                 addon,
                 user,
