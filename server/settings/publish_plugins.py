@@ -92,6 +92,29 @@ class CustomCommentTemplateModel(BaseSettingsModel):
     )
 
 
+class UniqueSpritesBubbleUpModel(BaseSettingsModel):
+    """Settings for unique sprites bubble-up feature.
+    
+    When enabled, this feature will update the parent Kitsu Asset's uniqueSprites
+    field when a version's status changes to one of the configured statuses.
+    """
+    enabled: bool = SettingsField(
+        False,
+        title="Enabled",
+        description="Enable unique sprites bubble-up to parent asset"
+    )
+    task_types: list[str] = SettingsField(
+        default_factory=list,
+        title="Task types",
+        description="List of task types that should trigger unique sprites bubble-up (e.g., 'Animation', 'Cleanup')"
+    )
+    statuses: list[str] = SettingsField(
+        default_factory=list,
+        title="Status shortnames",
+        description="List of status shortnames that trigger bubble-up (e.g., 'Approved', 'Final')"
+    )
+
+
 class IntegrateKitsuNotes(BaseSettingsModel):
     set_status_note: bool = SettingsField(title="Set status on note")
     note_status_shortname: str = SettingsField(title="Note shortname")
@@ -102,6 +125,11 @@ class IntegrateKitsuNotes(BaseSettingsModel):
     custom_comment_template: CustomCommentTemplateModel = SettingsField(
         default_factory=CustomCommentTemplateModel,
         title="Custom Comment Template",
+    )
+    unique_sprites_bubble_up: UniqueSpritesBubbleUpModel = SettingsField(
+        default_factory=UniqueSpritesBubbleUpModel,
+        title="Unique Sprites Bubble-Up",
+        description="Configure unique sprites tracking and bubble-up to parent asset"
     )
 
 
@@ -310,7 +338,13 @@ PUBLISH_DEFAULT_VALUES = {
 |--|--|
 | version | `{version}` |
 | family | `{family}` |
-| name | `{name}` |""",
+| name | `{name}` |
+| uniqueSprites | `{uniqueSprites}` |""",
+        },
+        "unique_sprites_bubble_up": {
+            "enabled": False,
+            "task_types": [],
+            "statuses": [],
         },
     }
     ,

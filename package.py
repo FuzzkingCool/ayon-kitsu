@@ -1,6 +1,6 @@
 name = "kitsu"
 title = "Kitsu"
-version = "1.2.6-prod.0.2.10"
+version = "1.2.6-dev.4"
 client_dir = "ayon_kitsu"
 
 services = {

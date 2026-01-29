@@ -5,6 +5,7 @@ from nxtools import logging
 from ayon_server.addons import BaseServerAddon
 from ayon_server.api.dependencies import CurrentUser
 from ayon_server.api.responses import EmptyResponse
+from ayon_server.events import EventModel
 from ayon_server.exceptions import ForbiddenException, InvalidSettingsException
 from ayon_server.secrets import Secrets
 
@@ -50,9 +51,13 @@ class KitsuAddon(BaseServerAddon):
         self.add_endpoint("/sync/{project_name}", self.sync, method="POST")
         self.add_endpoint("/push", self.push, method="POST")
         self.add_endpoint("/remove", self.remove, method="POST")
+        self.add_endpoint("/processor/status", self.processor_status, method="GET")
+        self.add_endpoint("/event-handler/status", self.event_handler_status, method="GET")
 
     async def setup(self):
-        pass
+        """Called during addon initialization."""
+        addon_version = getattr(self, 'version', 'unknown')
+        logging.info(f"[ayon-kitsu][server] Kitsu addon v{addon_version} initialized")
 
     #
     # Endpoints
@@ -64,6 +69,91 @@ class KitsuAddon(BaseServerAddon):
         project_name: str
     ) -> EmptyResponse:
         await sync_request(project_name, user)
+        return EmptyResponse()
+
+    async def processor_status(self) -> dict:
+        """Check processor service status by looking for recent heartbeat events.
+        
+        This endpoint helps diagnose if the processor service is running and
+        processing events.
+        """
+        from ayon_server.lib.postgres import Postgres
+
+        # Check for recent processor events (heartbeats, job completions, etc.)
+        query = """
+            SELECT 
+                topic,
+                description,
+                created_at,
+                updated_at,
+                status,
+                summary
+            FROM events
+            WHERE topic LIKE 'addon.kitsu.processor.%'
+            ORDER BY created_at DESC
+            LIMIT 10
+        """
+
+        recent_events = []
+        async for row in Postgres.iterate(query):
+            recent_events.append({
+                "topic": row["topic"],
+                "description": row["description"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+                "status": row["status"],
+                "summary": row["summary"],
+            })
+
+        # Check for pending jobs
+        pending_sync_query = """
+            SELECT COUNT(*) as count
+            FROM events
+            WHERE topic = 'kitsu.sync_request'
+            AND status IN ('pending', 'in_progress')
+        """
+
+        pending_comment_query = """
+            SELECT COUNT(*) as count
+            FROM events
+            WHERE topic = 'kitsu.comment_update_request'
+            AND status IN ('pending', 'in_progress')
+        """
+
+        pending_sync = 0
+        async for row in Postgres.iterate(pending_sync_query):
+            pending_sync = row["count"]
+
+        pending_comment = 0
+        async for row in Postgres.iterate(pending_comment_query):
+            pending_comment = row["count"]
+
+        # Find most recent heartbeat
+        heartbeat_query = """
+            SELECT 
+                created_at,
+                summary
+            FROM events
+            WHERE topic = 'addon.kitsu.processor.heartbeat'
+            ORDER BY created_at DESC
+            LIMIT 1
+        """
+
+        last_heartbeat = None
+        async for row in Postgres.iterate(heartbeat_query):
+            last_heartbeat = {
+                "timestamp": row["created_at"].isoformat() if row["created_at"] else None,
+                "summary": row["summary"],
+            }
+
+        return {
+            "processor_running": last_heartbeat is not None,
+            "last_heartbeat": last_heartbeat,
+            "pending_sync_jobs": pending_sync,
+            "pending_comment_jobs": pending_comment,
+            "recent_events": recent_events,
+            "addon_version": getattr(self, 'version', 'unknown'),
+        }
 
     async def push(
         self,
@@ -134,3 +224,27 @@ class KitsuAddon(BaseServerAddon):
             raise InvalidSettingsException("Kitsu password secret is not set")
 
         self.kitsu = Kitsu(settings.server, actual_email, actual_password)
+
+    #
+    # Event handlers (canonical AYON pattern)
+    #
+
+    async def on_task_status_changed(self, event: EventModel):
+        """Handle task status changes to bubble up uniqueSprites to Kitsu comments.
+        
+        This is the canonical AYON pattern from ayon-example-addon.
+        Hook methods on the addon class are automatically called by AYON when events occur.
+        """
+        from .kitsu.version_status_handler import handle_task_status_change
+        await handle_task_status_change(self, event)
+
+    async def event_handler_status(self) -> dict:
+        """Check if event handler is registered and working."""
+        return {
+            "event_handler": "on_task_status_changed (canonical AYON hook method)",
+            "handler_module": "server.kitsu.version_status_handler",
+            "handled_topics": [
+                "entity.task.status_changed"
+            ],
+            "note": "Using canonical AYON hook method pattern from ayon-example-addon"
+        }

@@ -308,7 +308,7 @@ class KitsuReviewCreator(TrayPublishCreator):
             # Store this as the default value for new instances
             review_files_def.default = filedef_value
 
-            # CRITICAL: Add to pending thumbnails list for FileDef default
+            # Add to pending thumbnails list for FileDef default
             if not hasattr(self, "_pending_thumbnails"):
                 self._pending_thumbnails = []
 

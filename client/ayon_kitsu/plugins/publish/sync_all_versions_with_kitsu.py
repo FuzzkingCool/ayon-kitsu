@@ -399,10 +399,13 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
 
             # Find the maximum version
             max_version = 0
-            for product_id, version_data in last_versions.items():
-                version_int = version_data.get("version", 0)
-                if version_int > max_version:
-                    max_version = version_int
+            if last_versions:
+                for product_id, version_data in last_versions.items():
+                    if version_data is None:
+                        continue
+                    version_int = version_data.get("version", 0)
+                    if version_int is not None and version_int > max_version:
+                        max_version = version_int
 
             self.log.debug(f"Max AYON version found: {max_version}")
             return max_version

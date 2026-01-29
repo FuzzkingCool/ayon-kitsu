@@ -33,7 +33,12 @@ def render_kitsu_comment(template_cfg: Dict[str, Any], data: Dict[str, Any]) -> 
     version = data.get("version", "")
     family = data.get("family", "")
     name = data.get("name", "")
-    return f"version\t{version}\nfamily\t{family}\nname\t{name}"
+    unique_sprites = data.get("uniqueSprites", "")
+
+    result = f"version\t{version}\nfamily\t{family}\nname\t{name}"
+    if unique_sprites:
+        result += f"\nuniqueSprites\t{unique_sprites}"
+    return result
 
 
 def resolve_feedback_status(kitsu_task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
