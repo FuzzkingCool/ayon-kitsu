@@ -2,8 +2,11 @@
 FROM python:3.11-alpine3.18
 ENV PYTHONUNBUFFERED=1
 
+# Build arguments
+ARG AYON_STUDIO_NAME=studio-name
+
 # OCI labels for GitHub Container Registry
-LABEL org.opencontainers.image.source=https://github.com/studio-name/kitsu-processor-docker
+LABEL org.opencontainers.image.source=https://github.com/${AYON_STUDIO_NAME}/kitsu-processor-docker
 LABEL org.opencontainers.image.description="Kitsu Integration Processor Service for AYON"
 LABEL org.opencontainers.image.licenses=MIT
 
