@@ -223,6 +223,14 @@ async def update_task(
 
     payload = {**kwargs, **create_name_and_label(name)}
 
+    # Capture old status BEFORE modifying the task
+    old_status = task.status if "status" in payload else None
+    status_will_change = (
+        old_status is not None
+        and payload.get("status") is not None
+        and old_status != payload["status"]
+    )
+
     # keys that can be updated
     for key in ["name", "label", "status", "task_type", "assignees"]:
         if key in payload and getattr(task, key) != payload[key]:
@@ -237,13 +245,53 @@ async def update_task(
                 changed = True
     if changed:
         await task.save()
-        event = {
-            "topic": "entity.task.updated",
-            "description": f"Task {task.name} updated",
-            "summary": {"entityId": task.id, "parentId": task.parent_id},
-            "project": project_name,
-        }
-        await dispatch_event(**event)
+        
+        if status_will_change:
+            # Dispatch status_changed event when status actually changes
+            # This should trigger on_task_status_changed hook
+            new_status = payload.get("status")
+            logging.info(
+                f"[ayon-kitsu][utils] Task {task.name} ({task.id}) status changed: "
+                f"{old_status} -> {new_status} in project {project_name}"
+            )
+            event = {
+                "topic": "entity.task.status_changed",
+                "description": f"Task {task.name} status changed from {old_status} to {new_status}",
+                "summary": {
+                    "entityId": task.id,
+                    "parentId": task.parent_id,
+                },
+                "payload": {
+                    "oldValue": old_status,
+                    "newValue": new_status,
+                },
+                "project": project_name,
+            }
+            await dispatch_event(**event)
+            logging.info(
+                f"[ayon-kitsu][utils] Dispatched entity.task.status_changed event for task {task.id}"
+            )
+        else:
+            # Dispatch updated event for other changes
+            updated_fields = [
+                key for key in payload.keys()
+                if key in ["name", "label", "status", "task_type", "assignees", "attrib"]
+            ]
+            logging.debug(
+                f"[ayon-kitsu][utils] Task {task.name} ({task.id}) updated (no status change): "
+                f"fields={updated_fields} in project {project_name}"
+            )
+            event = {
+                "topic": "entity.task.updated",
+                "description": f"Task {task.name} updated",
+                "summary": {
+                    "entityId": task.id,
+                    "parentId": task.parent_id,
+                    "updatedFields": updated_fields,
+                },
+                "project": project_name,
+            }
+            await dispatch_event(**event)
     return changed
 
 
