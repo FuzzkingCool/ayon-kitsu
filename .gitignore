@@ -1,7 +1,7 @@
 __pycache__
 .venv
 .env
-.vscode
+
 poetry.lock
 package/
 
@@ -20,3 +20,8 @@ dist/
 
 # Pyenv
 .python-version
+
+# vs code
+.vscode/
+.history/
+ 
