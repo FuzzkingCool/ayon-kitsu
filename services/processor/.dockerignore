@@ -1,0 +1,49 @@
+# Git
+.git
+.gitignore
+.github
+
+# Documentation
+README.md
+*.md
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+dist
+build
+.venv
+venv
+ENV
+env
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Environment
+.env
+.envrc
+example_env
+
+# Tests
+tests
+.pytest_cache
+.coverage
+htmlcov
+
+# Build artifacts
+*.log
+.DS_Store
+
+# Makefile and scripts (not needed in image)
+Makefile
+manage.ps1
+*.ps1

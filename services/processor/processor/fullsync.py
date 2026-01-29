@@ -215,26 +215,80 @@ def project_full_sync(
     )
     logging.info(f"[fullsync] Total entities to sync: {len(entities)}")
 
+    # Add AYON server URL to each entity
     for entity in entities:
         entity["ayon_server_url"] = ayon_api.get_base_url()
 
-    try:
-        logging.info(
-            f"[fullsync] Sending {len(entities)} entities to Ayon server..."
-        )
-        response = ayon_api.post(
-            f"{parent.entrypoint}/push",
-            project_name=project_name,
-            entities=entities,
-        )
-        response.raise_for_status()
+    # Chunk the entities into smaller batches (e.g., 100 entities per batch)
+    batch_size = 100
+    total_batches = (len(entities) + batch_size - 1) // batch_size
+    logging.info(f"[fullsync] Processing {total_batches} batches of {batch_size} entities each")
+
+    # Track progress and failures
+    processed_count = 0
+    failed_batches = []
+
+    for batch_num in range(total_batches):
+        start_idx = batch_num * batch_size
+        end_idx = min((batch_num + 1) * batch_size, len(entities))
+        batch = entities[start_idx:end_idx]
+        
+        logging.info(f"[fullsync] Sending batch {batch_num + 1}/{total_batches} ({len(batch)} entities)")
+
+        try:
+            response = ayon_api.post(
+                f"{parent.entrypoint}/push",
+                project_name=project_name,
+                entities=batch,
+            )
+            response.raise_for_status()
+            processed_count += len(batch)
+            logging.info(f"[fullsync] Batch {batch_num + 1} processed successfully")
+        except Exception as e:
+            logging.error(
+                f"[fullsync] Failed to push batch {batch_num + 1} for project {project_name}: {e}"
+            )
+            log_traceback(f"Error pushing batch {batch_num + 1} for {project_name}")
+            failed_batches.append((batch, e))
+
+    # Log summary
+    logging.info(
+        f"[fullsync] Processed {processed_count}/{len(entities)} entities successfully"
+    )
+    if failed_batches:
+        logging.warning(f"[fullsync] {len(failed_batches)} batches failed. Retrying...")
+        # Retry failed batches
+        for batch, error in failed_batches:
+            max_retries = 3
+            retry_delay = 5  # seconds
+            
+            for retry in range(max_retries):
+                try:
+                    logging.info(f"[fullsync] Retrying batch (attempt {retry + 1}/{max_retries})")
+                    response = ayon_api.post(
+                        f"{parent.entrypoint}/push",
+                        project_name=project_name,
+                        entities=batch,
+                    )
+                    response.raise_for_status()
+                    processed_count += len(batch)
+                    logging.info(f"[fullsync] Batch retried successfully on attempt {retry + 1}")
+                    break
+                except Exception as e:
+                    logging.error(
+                        f"[fullsync] Retry {retry + 1} failed for batch: {e}"
+                    )
+                    time.sleep(retry_delay)
+            else:
+                logging.error(f"[fullsync] Batch failed after {max_retries} retries")
+
+    # Final summary
+    if processed_count == len(entities):
         logging.info(
             f"[fullsync] Full Sync for project {project_name} "
             f"completed successfully in {time.time() - start_time:.2f}s"
         )
-    except Exception as e:
-        logging.error(
-            f"[fullsync] Failed to push entities to Ayon server for project {project_name}: {e}"
+    else:
+        logging.warning(
+            f"[fullsync] Sync for project {project_name} completed with {len(entities) - processed_count} entities failed"
         )
-        log_traceback(f"Error pushing entities to Ayon for {project_name}")
-        raise

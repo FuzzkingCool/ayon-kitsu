@@ -2,6 +2,11 @@
 FROM python:3.11-alpine3.18
 ENV PYTHONUNBUFFERED=1
 
+# OCI labels for GitHub Container Registry
+LABEL org.opencontainers.image.source=https://github.com/studio-name/kitsu-processor-docker
+LABEL org.opencontainers.image.description="Kitsu Integration Processor Service for AYON"
+LABEL org.opencontainers.image.licenses=MIT
+
 # Create Working directory `/service` and copy `processor`
 RUN mkdir /service
 COPY pyproject.toml /service/pyproject.toml
@@ -25,4 +30,4 @@ COPY processor /service/processor
 # Tell docker that all future commands should run as the appuser user
 USER ayonuser
 
-CMD ["python", "-m", "processor"]
+CMD ["python", "-m", "processor.processor"]

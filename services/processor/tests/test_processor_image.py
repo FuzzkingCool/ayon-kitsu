@@ -17,7 +17,7 @@ from pathlib import Path
 def get_version():
     """Get the addon version from package.py."""
     script_dir = Path(__file__).parent
-    package_py = script_dir.parent.parent / "package.py"
+    package_py = script_dir.parent.parent.parent / "package.py"
 
     if not package_py.exists():
         raise FileNotFoundError(f"package.py not found at {package_py}")
@@ -53,18 +53,23 @@ def build_image(image_name, dockerfile_dir):
     print(f"Building Docker image: {image_name}")
     print(f"Using Dockerfile from: {dockerfile_dir}")
 
-    # Build context is the processor directory (where Dockerfile is)
-    # This matches the Makefile which uses '.' as build context
+    # Build context should be the parent directory (services) since Dockerfile expects to be built from there
+    build_context = dockerfile_dir.parent
+    print(f"Build context: {build_context}")
+
+    # Use the Dockerfile from the parent directory (processor), not from tests
+    dockerfile_path = build_context / "Dockerfile"
+    print(f"Using Dockerfile: {dockerfile_path}")
+
     cmd = [
         "docker",
         "build",
         "-t", image_name,
-        "-f", str(dockerfile_dir / "Dockerfile"),
-        str(dockerfile_dir),  # Build context is the processor directory
+        "-f", str(dockerfile_path),
+        str(build_context),  # Build context is the parent directory (services)
     ]
 
     print(f"Running: {' '.join(cmd)}")
-    print(f"Build context: {dockerfile_dir}")
     result = subprocess.run(cmd)
 
     if result.returncode != 0:

@@ -4,7 +4,11 @@ AYON_ADDON_VERSION=$(shell python -c "import os;import sys;content={};f=open('$(
 AYON_ADDON_NAME=kitsu
 SERVICE_NAME=processor
 BASE_NAME := ayon-$(AYON_ADDON_NAME)-$(SERVICE_NAME)
-IMAGE := ynput/$(BASE_NAME):$(AYON_ADDON_VERSION)
+REGISTRY ?= ghcr.io
+NAMESPACE ?= studio-name
+IMAGE_NAME := $(NAMESPACE)/kitsu-processor-docker
+IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(AYON_ADDON_VERSION)
+IMAGE_LATEST := $(REGISTRY)/$(IMAGE_NAME):latest
 default:
 	@echo * *************************
 	@echo * AYON Kitsu $(AYON_ADDON_VERSION) $(SERVICE_NAME) Service Builder
@@ -29,7 +33,7 @@ run:
 	poetry run python -m processor
 
 build:
-	docker build -t $(IMAGE) -f Dockerfile .
+	docker build -t $(IMAGE) -t $(IMAGE_LATEST) -f Dockerfile .
 
 clean:
 	docker rmi $(IMAGE)
@@ -39,6 +43,13 @@ clean-build: clean
 
 dist: build
 	docker push $(IMAGE)
+	docker push $(IMAGE_LATEST)
+
+dist-ghcr: build
+	@echo "Pushing to GitHub Container Registry..."
+	@echo "Make sure you're authenticated: docker login ghcr.io -u USERNAME --password-stdin"
+	docker push $(IMAGE)
+	docker push $(IMAGE_LATEST)
 
 dev: build
 	docker run --rm -u ayonuser -ti \

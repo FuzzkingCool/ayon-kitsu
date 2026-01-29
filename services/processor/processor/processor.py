@@ -51,17 +51,58 @@ class KitsuProcessor:
         #
         # Connect to Ayon
         #
+        # Log environment for debugging
+        server_url = os.environ.get("AYON_SERVER_URL")
+        api_key = os.environ.get("AYON_API_KEY")
+        service_name = os.environ.get("AYON_SERVICE_NAME")
+        addon_name = os.environ.get("AYON_ADDON_NAME")
+        addon_version = os.environ.get("AYON_ADDON_VERSION")
+        
+        logging.info(
+            f"[ayon-kitsu][processor] Initializing service connection..."
+        )
+        logging.info(
+            f"[ayon-kitsu][processor] Environment: "
+            f"AYON_SERVER_URL={'SET' if server_url else 'MISSING'}, "
+            f"AYON_API_KEY={'SET' if api_key else 'MISSING'}, "
+            f"AYON_SERVICE_NAME={service_name}, "
+            f"AYON_ADDON_NAME={addon_name}, "
+            f"AYON_ADDON_VERSION={addon_version}"
+        )
+        
         try:
             ayon_api.init_service()
             connected = True
-        except Exception:
+            logging.info(
+                f"[ayon-kitsu][processor] Successfully connected to AYON server"
+            )
+        except Exception as e:
             log_traceback()
+            logging.error(
+                f"[ayon-kitsu][processor] Failed to connect to AYON: {e}"
+            )
             connected = False
 
         if not connected:
+            logging.error(
+                f"[ayon-kitsu][processor] Connection failed. "
+                f"Check AYON_SERVER_URL and AYON_API_KEY environment variables. "
+                f"Retrying in 10 seconds..."
+            )
             time.sleep(10)
-            print("KitsuProcessor failed to connect to Ayon")
-            sys.exit(1)
+            # Try one more time
+            try:
+                ayon_api.init_service()
+                connected = True
+                logging.info(
+                    f"[ayon-kitsu][processor] Successfully connected on retry"
+                )
+            except Exception as retry_e:
+                logging.error(
+                    f"[ayon-kitsu][processor] Retry also failed: {retry_e}"
+                )
+                print("KitsuProcessor failed to connect to Ayon")
+                sys.exit(1)
 
         #
         # Load settings and stuff...
@@ -394,15 +435,29 @@ class KitsuProcessor:
         """maintain a list of pairings so that we can check
         the kitsu change is in a paired project and get the ayon project name
         """
-        logging.info("get_pairing_list")
-        res = ayon_api.get(f"{self.entrypoint}/pairing")
+        logging.info(f"get_pairing_list - calling {self.entrypoint}/pairing")
+        try:
+            res = ayon_api.get(f"{self.entrypoint}/pairing")
+            logging.info(
+                f"get_pairing_list - response status: {res.status_code}, "
+                f"data: {res.data if hasattr(res, 'data') else 'N/A'}"
+            )
+            
+            if res.status_code != 200:
+                error_msg = (
+                    f"{self.entrypoint}/pairing failed. "
+                    f"Status code '{res.status_code}': {getattr(res, 'detail', 'No detail')}"
+                )
+                logging.error(f"[ayon-kitsu][processor] {error_msg}")
+                raise RuntimeError(error_msg)
 
-        assert res.status_code == 200, (
-            f"{self.entrypoint}/pairing failed. "
-            f" Status code '{res.status_code}': {res.detail}"
-        )
-
-        return res.data
+            return res.data
+        except Exception as e:
+            logging.error(
+                f"[ayon-kitsu][processor] Failed to get pairing list: {e}"
+            )
+            log_traceback("get_pairing_list error")
+            raise
 
     def get_paired_ayon_project(self, kitsu_project_id: str) -> str | None:
         """returns the ayon project if paired else None"""
@@ -610,7 +665,7 @@ class KitsuProcessor:
 
                     # Dispatch heartbeat event for monitoring
                     try:
-                        ayon_api.dispatch(
+                        ayon_api.dispatch_event(
                             "addon.kitsu.processor.heartbeat",
                             sender=SENDER,
                             description=f"Processor heartbeat #{self._heartbeat_count}",
