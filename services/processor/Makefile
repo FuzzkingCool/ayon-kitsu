@@ -59,4 +59,5 @@ dev: build
 		--env AYON_SERVER_URL=${AYON_SERVER_URL} \
 		--env AYON_ADDON_NAME=${AYON_ADDON_NAME} \
 		--env AYON_ADDON_VERSION=$(AYON_ADDON_VERSION) \
+		--env AYON_STUDIO_NAME=${AYON_STUDIO_NAME} \
 		$(IMAGE) python -m processor

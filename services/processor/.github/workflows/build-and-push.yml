@@ -48,16 +48,25 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=sha,prefix={{branch}}-
+            type=sha,format=short,prefix=sha-
             type=raw,value=latest,enable={{is_default_branch}}
 
+      - name: Sanitize Docker tags
+        id: tags
+        shell: bash
+        run: |
+          # docker/build-push-action expects a newline-separated list of full image refs.
+          # Filter out any tag that starts with a hyphen after the colon (invalid Docker tag).
+          echo "tags<<'EOF'" >> "$GITHUB_OUTPUT"
+          echo "${{ steps.meta.outputs.tags }}" | awk 'NF' | grep -vE ':[-]' >> "$GITHUB_OUTPUT" || true
+          echo "EOF" >> "$GITHUB_OUTPUT"
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: ${{ steps.tags.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
