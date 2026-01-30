@@ -5,18 +5,18 @@ AYON_ADDON_NAME=kitsu
 SERVICE_NAME=processor
 BASE_NAME := ayon-$(AYON_ADDON_NAME)-$(SERVICE_NAME)
 REGISTRY ?= ghcr.io
-NAMESPACE ?= ${AYON_STUDIO_NAME}
-IMAGE_NAME := $(NAMESPACE)/ayon-kitsu-processor
+IMAGE_NAME := ${AYON_STUDIO_NAME}/ayon-kitsu-processor
 IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(AYON_ADDON_VERSION)
 IMAGE_LATEST := $(REGISTRY)/$(IMAGE_NAME):latest
+
 default:
 	@echo * *************************
 	@echo * AYON Kitsu $(AYON_ADDON_VERSION) $(SERVICE_NAME) Service Builder
 	@echo * Docker image name: $(IMAGE)
 	@echo * *************************
-	@echo * 
+	@echo *
 	@echo * Usage: make [target]
-	@echo *  
+	@echo *
 	@echo * Targets:
 	@echo *   run          Run service without building.
 	@echo *   build        Build docker image.
@@ -34,7 +34,7 @@ run:
 	poetry run python -m processor
 
 build:
-	docker build -t $(IMAGE) -t $(IMAGE_LATEST) -f Dockerfile .
+	docker build --build-arg AYON_STUDIO_NAME=${AYON_STUDIO_NAME} -t $(IMAGE) -t $(IMAGE_LATEST) -f Dockerfile .
 
 clean:
 	docker rmi $(IMAGE)

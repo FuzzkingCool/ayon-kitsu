@@ -50,6 +50,7 @@ docker run --rm \
   -e AYON_SERVER_URL=http://your-server:5000 \
   -e AYON_ADDON_NAME=kitsu \
   -e AYON_ADDON_VERSION=1.2.6 \
+  -e AYON_STUDIO_NAME=studio-name \
   ghcr.io/${AYON_STUDIO_NAME}/ayon-kitsu-processor:latest
 ```
 
