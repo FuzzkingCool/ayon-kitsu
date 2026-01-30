@@ -35,7 +35,7 @@ def get_addon_version() -> str:
     package_py = script_dir.parent.parent / "package.py"
     
     if not package_py.exists():
-        return "1.2.6-dev.6"  # fallback
+        return "1.2.6-dev.7"  # fallback
     
     with open(package_py, "r") as f:
         content = f.read()
@@ -47,7 +47,7 @@ def get_addon_version() -> str:
                     return version
                 except:
                     pass
-    return "1.2.6-dev.6"
+    return "1.2.6-dev.7"
 
 
 def test_endpoint(
