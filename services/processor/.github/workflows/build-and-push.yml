@@ -57,9 +57,9 @@ jobs:
         run: |
           # docker/build-push-action expects a newline-separated list of full image refs.
           # Filter out any tag that starts with a hyphen after the colon (invalid Docker tag).
-          echo "tags<<'EOF'" >> "$GITHUB_OUTPUT"
+          echo "tags<<EOF" >> "$GITHUB_OUTPUT"
           echo "${{ steps.meta.outputs.tags }}" | awk 'NF' | grep -vE ':[-]' >> "$GITHUB_OUTPUT" || true
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo EOF >> "$GITHUB_OUTPUT"
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:

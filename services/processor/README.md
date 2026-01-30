@@ -106,4 +106,5 @@ See `example_env` for required environment variables:
 - `AYON_API_KEY` - AYON API key
 - `AYON_ADDON_NAME` - Addon name (default: kitsu)
 - `AYON_ADDON_VERSION` - Addon version
+- `AYON_STUDIO_NAME` - the github ghcr.io user
  

@@ -57,7 +57,7 @@ class KitsuProcessor:
         service_name = os.environ.get("AYON_SERVICE_NAME")
         addon_name = os.environ.get("AYON_ADDON_NAME")
         addon_version = os.environ.get("AYON_ADDON_VERSION")
-        
+        studio_name = os.environ.get("AYON_STUDIO_NAME")
         logging.info(
             f"[ayon-kitsu][processor] Initializing service connection..."
         )
@@ -68,7 +68,7 @@ class KitsuProcessor:
             f"AYON_SERVICE_NAME={service_name}, "
             f"AYON_ADDON_NAME={addon_name}, "
             f"AYON_ADDON_VERSION={addon_version}"
-            f"AYON_STUDIO_NAME={os.environ.get('AYON_STUDIO_NAME')}"
+            f"AYON_STUDIO_NAME={studio_name}"
         )
         
         try:

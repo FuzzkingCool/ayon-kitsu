@@ -3,6 +3,7 @@ include .env
 AYON_ADDON_VERSION=$(shell python -c "import os;import sys;content={};f=open('$(CURDIR)/../../package.py');exec(f.read(),content);f.close();print(content['version'])")
 AYON_ADDON_NAME=kitsu
 SERVICE_NAME=processor
+AYON_STUDIO_NAME=$(shell python -c "import os; print(os.getenv('AYON_STUDIO_NAME'))")
 BASE_NAME := ayon-$(AYON_ADDON_NAME)-$(SERVICE_NAME)
 REGISTRY ?= ghcr.io
 IMAGE_NAME := ${AYON_STUDIO_NAME}/ayon-kitsu-processor

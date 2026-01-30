@@ -163,11 +163,10 @@ def main():
     env_vars["AYON_ADDON_VERSION"] = version
 
     # Get studio name
-    studio_name = os.getenv("AYON_STUDIO_NAME")
+    studio_name = env_vars.get("AYON_STUDIO_NAME") or os.getenv("AYON_STUDIO_NAME") or "studio-name"
     if not studio_name:
         print("WARNING: AYON_STUDIO_NAME not set; using placeholder 'teststudio'")
         studio_name = "teststudio"
-
     # Build image
     image_name = f"ghcr.io/{(studio_name or 'default').lower()}/ayon-kitsu-processor:{version}"
     build_image(image_name, script_dir)
