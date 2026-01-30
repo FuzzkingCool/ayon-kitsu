@@ -68,6 +68,7 @@ class KitsuProcessor:
             f"AYON_SERVICE_NAME={service_name}, "
             f"AYON_ADDON_NAME={addon_name}, "
             f"AYON_ADDON_VERSION={addon_version}"
+            f"AYON_STUDIO_NAME={os.environ.get('AYON_STUDIO_NAME')}"
         )
         
         try:

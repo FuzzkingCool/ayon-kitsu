@@ -124,7 +124,8 @@ def main():
     server_url = env_vars.get("AYON_SERVER_URL") or os.environ.get("AYON_SERVER_URL")
     api_key = env_vars.get("AYON_API_KEY") or os.environ.get("AYON_API_KEY")
     addon_version = get_addon_version()
-    
+    studio_name = env_vars.get("AYON_STUDIO_NAME", None)
+
     if not server_url:
         print("\nERROR: AYON_SERVER_URL not found in .env or environment")
         sys.exit(1)

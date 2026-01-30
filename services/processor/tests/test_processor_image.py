@@ -144,7 +144,7 @@ def main():
         print("You may need to set AYON_API_KEY and AYON_SERVER_URL manually")
 
     # Check for required environment variables
-    required = ["AYON_API_KEY", "AYON_SERVER_URL"]
+    required = ["AYON_API_KEY", "AYON_SERVER_URL", "AYON_STUDIO_NAME"]
     missing = [var for var in required if var not in env_vars and var not in os.environ]
     if missing:
         print(f"\nWARNING: Missing required environment variables: {', '.join(missing)}")
@@ -162,8 +162,14 @@ def main():
     # Set version in env vars
     env_vars["AYON_ADDON_VERSION"] = version
 
+    # Get studio name
+    studio_name = os.getenv("AYON_STUDIO_NAME")
+    if not studio_name:
+        print("WARNING: AYON_STUDIO_NAME not set; using placeholder 'teststudio'")
+        studio_name = "teststudio"
+
     # Build image
-    image_name = f"ynput/ayon-kitsu-processor:{version}"
+    image_name = f"ghcr.io/{(studio_name or 'default').lower()}/ayon-kitsu-processor:{version}"
     build_image(image_name, script_dir)
 
     # Run container

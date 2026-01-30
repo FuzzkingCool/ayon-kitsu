@@ -28,6 +28,7 @@ export AYON_ADDON_VERSION
 export AYON_ADDON_NAME
 export AYON_API_KEY
 export AYON_SERVER_URL
+export AYON_STUDIO_NAME
 
 run:
 	poetry run python -m processor
