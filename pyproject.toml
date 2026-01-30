@@ -5,7 +5,7 @@
 
 [tool.poetry]
 name = "ayon-kitsu"
-version = "1.2.6-dev.9"
+version = "1.2.6-dev.13"
 description = ""
 authors = ["Ynput Team <team@ynput.io>"]
 

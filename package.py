@@ -2,7 +2,7 @@ import os
 
 name = "kitsu"
 title = "Kitsu"
-version = "1.2.6-dev.9"
+version = "1.2.6-dev.13"
 client_dir = "ayon_kitsu"
 studio_name = os.getenv("AYON_STUDIO_NAME")
 
