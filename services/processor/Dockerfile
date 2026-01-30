@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1
 ARG AYON_STUDIO_NAME=studio-name
 
 # OCI labels for GitHub Container Registry
-LABEL org.opencontainers.image.source=https://github.com/${AYON_STUDIO_NAME}/kitsu-processor-docker
+LABEL org.opencontainers.image.source=https://github.com/${AYON_STUDIO_NAME}/ayon-kitsu-processor
 LABEL org.opencontainers.image.description="Kitsu Integration Processor Service for AYON"
 LABEL org.opencontainers.image.licenses=MIT
 

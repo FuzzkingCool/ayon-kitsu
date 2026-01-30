@@ -1,4 +1,4 @@
-# kitsu-processor-docker
+# ayon-kitsu-processor
 
 A Dockerized processor service for MDHR's Kitsu integration pipeline.
 
@@ -11,8 +11,8 @@ This image is published to GitHub Container Registry (ghcr.io) as a private pack
 
 ### Image Location
 ```
-ghcr.io/${AYON_STUDIO_NAME}/kitsu-processor-docker:latest
-ghcr.io/${AYON_STUDIO_NAME}/kitsu-processor-docker:<version>
+ghcr.io/${AYON_STUDIO_NAME}/ayon-kitsu-processor:latest
+ghcr.io/${AYON_STUDIO_NAME}/ayon-kitsu-processor:<version>
 ```
 
 Replace `${AYON_STUDIO_NAME}` with your studio's GitHub organization name.
@@ -36,10 +36,10 @@ Replace `USERNAME` with your GitHub username and set `CR_PAT` to your classic PA
 
 ```bash
 # Pull latest
-docker pull ghcr.io/${AYON_STUDIO_NAME}/kitsu-processor-docker:latest
+docker pull ghcr.io/${AYON_STUDIO_NAME}/ayon-kitsu-processor:latest
 
 # Pull specific version
-docker pull ghcr.io/${AYON_STUDIO_NAME}/kitsu-processor-docker:v1.2.6
+docker pull ghcr.io/${AYON_STUDIO_NAME}/ayon-kitsu-processor:v1.2.6
 ```
 
 ### Running the Container
@@ -50,7 +50,7 @@ docker run --rm \
   -e AYON_SERVER_URL=http://your-server:5000 \
   -e AYON_ADDON_NAME=kitsu \
   -e AYON_ADDON_VERSION=1.2.6 \
-  ghcr.io/${AYON_STUDIO_NAME}/kitsu-processor-docker:latest
+  ghcr.io/${AYON_STUDIO_NAME}/ayon-kitsu-processor:latest
 ```
 
 ## Development
