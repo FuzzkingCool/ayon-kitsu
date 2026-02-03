@@ -12,6 +12,7 @@ jobs:
     uses: ynput/ops-repo-automation/.github/workflows/deploy_mkdocs.yml@develop
     with:
       repo: ${{ github.repository }}
+      token: ${{ secrets.YNPUT_BOT_TOKEN }}
     secrets:
       YNPUT_BOT_TOKEN: ${{ secrets.YNPUT_BOT_TOKEN }}
       CI_USER: ${{ secrets.CI_USER }}
