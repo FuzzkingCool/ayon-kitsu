@@ -1,13 +1,11 @@
-import os
 
 name = "kitsu"
 title = "Kitsu"
-version = "1.2.6-dev.13"
+version = "1.2.6-dev.15"
 client_dir = "ayon_kitsu"
-studio_name = os.getenv("AYON_STUDIO_NAME")
 
 services = {
-    "processor": {"image": f"{studio_name}/ayon-kitsu-processor:{version}"},
+    "processor": {"image": f"studioname/ayon-kitsu-processor:{version}"},
 }
 
 ayon_required_addons = {
