@@ -184,7 +184,8 @@ class KitsuAddon(BaseServerAddon):
     async def list_pairings(
         self, mock: bool = False
     ) -> list[PairingItemModel]:
-        await self.ensure_kitsu(mock)
+        if not await self.ensure_kitsu_or_none(mock):
+            return []
         return await get_pairing_list(self)
 
     async def init_pairing(
@@ -201,28 +202,38 @@ class KitsuAddon(BaseServerAddon):
     #
     # Helpers
     #
-    async def ensure_kitsu(self, mock: bool = False):
+    async def ensure_kitsu_or_none(self, mock: bool = False) -> bool:
+        """Ensure Kitsu client is initialized. Return False if settings are not configured (caller may return [])."""
         if self.kitsu is not None:
-            return
+            return True
 
         if mock is True:
             self.kitsu = KitsuMock()
-            return
+            return True
 
         settings = await self.get_studio_settings()
         if not settings.server:
-            raise InvalidSettingsException("Kitsu server is not set")
+            return False
 
         actual_email = await Secrets.get(settings.login_email)
         actual_password = await Secrets.get(settings.login_password)
 
-        if not actual_email:
-            raise InvalidSettingsException("Kitsu email secret is not set")
-
-        if not actual_password:
-            raise InvalidSettingsException("Kitsu password secret is not set")
+        if not actual_email or not actual_password:
+            return False
 
         self.kitsu = Kitsu(settings.server, actual_email, actual_password)
+        return True
+
+    async def ensure_kitsu(self, mock: bool = False):
+        """Ensure Kitsu client is initialized; raise if settings are not configured."""
+        if await self.ensure_kitsu_or_none(mock):
+            return
+        settings = await self.get_studio_settings()
+        if not settings.server:
+            raise InvalidSettingsException("Kitsu server is not set")
+        raise InvalidSettingsException(
+            "Kitsu email or password secret is not set"
+        )
 
     #
     # Event handlers (canonical AYON pattern)

@@ -3,10 +3,10 @@ include .env
 AYON_ADDON_VERSION=$(shell python -c "import os;import sys;content={};f=open('$(CURDIR)/../../package.py');exec(f.read(),content);f.close();print(content['version'])")
 AYON_ADDON_NAME=kitsu
 SERVICE_NAME=processor
-AYON_STUDIO_NAME=$(shell python -c "import os; print(os.getenv('AYON_STUDIO_NAME'))")
+
 BASE_NAME := ayon-$(AYON_ADDON_NAME)-$(SERVICE_NAME)
 REGISTRY ?= ghcr.io
-IMAGE_NAME := ${AYON_STUDIO_NAME}/ayon-kitsu-processor
+IMAGE_NAME := studioname/ayon-kitsu-processor
 IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(AYON_ADDON_VERSION)
 IMAGE_LATEST := $(REGISTRY)/$(IMAGE_NAME):latest
 
@@ -29,13 +29,13 @@ export AYON_ADDON_VERSION
 export AYON_ADDON_NAME
 export AYON_API_KEY
 export AYON_SERVER_URL
-export AYON_STUDIO_NAME
+
 
 run:
 	poetry run python -m processor
 
 build:
-	docker build --build-arg AYON_STUDIO_NAME=${AYON_STUDIO_NAME} -t $(IMAGE) -t $(IMAGE_LATEST) -f Dockerfile .
+	docker build --build-arg -t $(IMAGE) -t $(IMAGE_LATEST) -f Dockerfile .
 
 clean:
 	docker rmi $(IMAGE)
@@ -60,5 +60,4 @@ dev: build
 		--env AYON_SERVER_URL=${AYON_SERVER_URL} \
 		--env AYON_ADDON_NAME=${AYON_ADDON_NAME} \
 		--env AYON_ADDON_VERSION=$(AYON_ADDON_VERSION) \
-		--env AYON_STUDIO_NAME=${AYON_STUDIO_NAME} \
 		$(IMAGE) python -m processor

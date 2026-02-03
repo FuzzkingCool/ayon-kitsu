@@ -49,9 +49,16 @@ docker run --rm \
   -e AYON_API_KEY=your_api_key \
   -e AYON_SERVER_URL=http://your-server:5000 \
   -e AYON_ADDON_NAME=kitsu \
+  -e AYON_SERVICE_NAME=processor \
   -e AYON_ADDON_VERSION=1.2.6 \
   ghcr.io/studioname/ayon-kitsu-processor:latest
 ```
+
+**Required env:** `AYON_SERVER_URL`, `AYON_API_KEY`. `AYON_API_KEY` must be a **service** API key (created in AYON for the kitsu addon service), not a user token; otherwise you get 403 "Only services can enroll for jobs". For job enrollment also set `AYON_ADDON_NAME=kitsu`, `AYON_SERVICE_NAME=processor`, `AYON_ADDON_VERSION=<addon version>` in the container env.
+
+**Cloud / ynput-cloud-worker:** The entrypoint writes bootstrap and errors to stderr so container logs should show `kitsu-processor: starting` and any failure message. If you see no logs, check that the worker captures stderr and that the container is actually starting (image pull, env, command).
+
+**Alignment with original:** Single AYON connection attempt (no retry). Original used `ayon-python-api = "1.0.0rc3"`; current uses `^1.0.1`. If the server expects the older API, pin the dependency in `processor/pyproject.toml` accordingly.
 
 ## Development
 

@@ -9,7 +9,6 @@ import gazu
 from nxtools import log_traceback, logging
 
 from .fullsync import project_full_sync
-from .log_handler import ServerLogHandler
 from .update_from_kitsu import (
     create_or_update_asset,
     create_or_update_concept,
@@ -49,61 +48,38 @@ class KitsuSettingsError(Exception):
 class KitsuProcessor:
     def __init__(self):
         #
-        # Connect to Ayon
+        # Connect to Ayon (single attempt, match original working behavior)
         #
-        # Log environment for debugging
-        server_url = os.environ.get("AYON_SERVER_URL")
-        api_key = os.environ.get("AYON_API_KEY")
-        service_name = os.environ.get("AYON_SERVICE_NAME")
-        addon_name = os.environ.get("AYON_ADDON_NAME")
-        addon_version = os.environ.get("AYON_ADDON_VERSION")
-        studio_name = os.environ.get("AYON_STUDIO_NAME")
-        logging.info(
-            f"[ayon-kitsu][processor] Initializing service connection..."
+        sys.stderr.write(
+            "[ayon-kitsu][processor] Connecting to AYON...\n"
         )
-        logging.info(
-            f"[ayon-kitsu][processor] Environment: "
-            f"AYON_SERVER_URL={'SET' if server_url else 'MISSING'}, "
-            f"AYON_API_KEY={'SET' if api_key else 'MISSING'}, "
-            f"AYON_SERVICE_NAME={service_name}, "
-            f"AYON_ADDON_NAME={addon_name}, "
-            f"AYON_ADDON_VERSION={addon_version}"
-            f"AYON_STUDIO_NAME={studio_name}"
-        )
-        
+        sys.stderr.flush()
         try:
             ayon_api.init_service()
-            connected = True
-            logging.info(
-                f"[ayon-kitsu][processor] Successfully connected to AYON server"
+            sys.stderr.write(
+                "[ayon-kitsu][processor] Connected to AYON server\n"
             )
+            sys.stderr.flush()
         except Exception as e:
             log_traceback()
             logging.error(
                 f"[ayon-kitsu][processor] Failed to connect to AYON: {e}"
             )
-            connected = False
+            sys.stderr.write("kitsu-processor: failed to connect to AYON\n")
+            sys.stderr.flush()
+            sys.exit(1)
 
-        if not connected:
-            logging.error(
-                f"[ayon-kitsu][processor] Connection failed. "
-                f"Check AYON_SERVER_URL and AYON_API_KEY environment variables. "
-                f"Retrying in 10 seconds..."
+        con = ayon_api.get_server_api_connection()
+        if not con.is_service_user():
+            msg = (
+                "[ayon-kitsu][processor] AYON_API_KEY must be a service API key, not a user token. "
+                "Create a service API key in AYON (Settings → API keys) for the kitsu addon service; "
+                "set that key as AYON_API_KEY in the container env. Without it you get 403 'Only services can enroll for jobs'."
             )
-            time.sleep(10)
-            # Try one more time
-            try:
-                ayon_api.init_service()
-                connected = True
-                logging.info(
-                    f"[ayon-kitsu][processor] Successfully connected on retry"
-                )
-            except Exception as retry_e:
-                logging.error(
-                    f"[ayon-kitsu][processor] Retry also failed: {retry_e}"
-                )
-                print("KitsuProcessor failed to connect to Ayon")
-                sys.exit(1)
+            logging.error(msg)
+            sys.stderr.write("kitsu-processor: init error: API key is not a service key (403 on enroll)\n")
+            sys.stderr.flush()
+            sys.exit(1)
 
         #
         # Load settings and stuff...
@@ -114,65 +90,32 @@ class KitsuProcessor:
         self.settings = ayon_api.get_service_addon_settings()
         self.entrypoint = f"/addons/{self.addon_name}/{self.addon_version}"
 
-        #
-        # Setup server log forwarding (after service is fully initialized)
-        #
-        self.server_log_handler = None
-        try:
-            # nxtools.logging might use a custom logger, try both approaches
-            import logging as std_logging
-
-            self.server_log_handler = ServerLogHandler(
-                sender=SENDER,
-                level=std_logging.DEBUG,  # Forward all log levels
-                batch_size=10,  # Batch 10 logs before sending
-                flush_interval=5.0,  # Flush every 5 seconds
+        if not self.addon_name or not self.addon_version:
+            logging.warning(
+                "[ayon-kitsu][processor] Service identity missing (addon_name=%s, addon_version=%s). "
+                "Set AYON_ADDON_NAME, AYON_SERVICE_NAME, AYON_ADDON_VERSION in the container env or job enrollment will return 403.",
+                self.addon_name,
+                self.addon_version,
             )
-            # Add to standard Python root logger
-            std_logging.getLogger().addHandler(self.server_log_handler)
-            # Also try to add to nxtools logger if it's different
-            try:
-                if hasattr(logging, "getLogger"):
-                    nxtools_logger = logging.getLogger()
-                    if nxtools_logger != std_logging.getLogger():
-                        nxtools_logger.addHandler(self.server_log_handler)
-            except Exception:
-                pass
-
-            # Test the log handler immediately
-            logging.info(
-                "[ayon-kitsu][processor] Server log forwarding enabled"
-            )
-            logging.info(
-                "[ayon-kitsu][processor] TEST: This log should appear on server if forwarding works"
-            )
-
-            # Force immediate flush of test logs
-            if self.server_log_handler:
-                try:
-                    self.server_log_handler.flush()
-                except Exception:
-                    pass
-        except Exception as e:
-            # Don't fail initialization if log forwarding setup fails
-            logging.error(
-                f"[ayon-kitsu][processor] Failed to setup server log forwarding: {e}"
-            )
-            log_traceback("Server log forwarding setup failed")
 
         #
         # Get list of projects that have been paired
         #
         self.pairing_list = self.get_pairing_list()
 
+        kitsu_server = (self.settings.get("server") or "").strip()
+        if not kitsu_server:
+            logging.info(
+                "[ayon-kitsu][processor] Kitsu server not configured; running with empty pairing list (no gazu events)"
+            )
+            self.event_client = None
+            return
+
         #
         # Get Kitsu server credentials from settings
         #
-
         try:
-            self.kitsu_server_url = (
-                self.settings.get("server").rstrip("/") + "/api"
-            )
+            self.kitsu_server_url = kitsu_server.rstrip("/") + "/api"
 
             email_secret = self.settings.get("login_email")
             password_secret = self.settings.get("login_password")
@@ -439,26 +382,81 @@ class KitsuProcessor:
         logging.info(f"get_pairing_list - calling {self.entrypoint}/pairing")
         try:
             res = ayon_api.get(f"{self.entrypoint}/pairing")
+            data = res.data if hasattr(res, "data") else getattr(res, "data", None)
+            detail = (data.get("detail") if isinstance(data, dict) else None) or getattr(
+                res, "detail", None
+            )
             logging.info(
                 f"get_pairing_list - response status: {res.status_code}, "
-                f"data: {res.data if hasattr(res, 'data') else 'N/A'}"
+                f"data: {data if data is not None else 'N/A'}"
             )
-            
-            if res.status_code != 200:
-                error_msg = (
-                    f"{self.entrypoint}/pairing failed. "
-                    f"Status code '{res.status_code}': {getattr(res, 'detail', 'No detail')}"
-                )
-                logging.error(f"[ayon-kitsu][processor] {error_msg}")
-                raise RuntimeError(error_msg)
 
-            return res.data
+            if res.status_code == 200:
+                raw = data if isinstance(data, list) else []
+                # Only include pairs that have an AYON project (skip unpaired Kitsu projects)
+                pairs = []
+                for p in raw:
+                    if not isinstance(p, dict):
+                        continue
+                    kid = p.get("kitsu_project_id") or p.get("kitsuProjectId")
+                    ayon = p.get("ayon_project_name") or p.get("ayonProjectName")
+                    if kid and ayon:
+                        pairs.append({
+                            "kitsuProjectId": kid,
+                            "ayonProjectName": ayon,
+                        })
+                if len(pairs) < len(raw):
+                    logging.info(
+                        f"[ayon-kitsu][processor] Skipped {len(raw) - len(pairs)} unpaired project(s); syncing {len(pairs)} paired"
+                    )
+                return pairs
+
+            if res.status_code == 500 and detail and (
+                "Kitsu server is not set" in str(detail)
+                or "secret is not set" in str(detail).lower()
+            ):
+                logging.info(
+                    "[ayon-kitsu][processor] Kitsu addon not configured on server; using empty pairing list"
+                )
+                return []
+
+            error_msg = (
+                f"{self.entrypoint}/pairing failed. "
+                f"Status code '{res.status_code}': {detail or 'No detail'}"
+            )
+            logging.error(f"[ayon-kitsu][processor] {error_msg}")
+            raise RuntimeError(error_msg)
+        except RuntimeError:
+            raise
         except Exception as e:
             logging.error(
                 f"[ayon-kitsu][processor] Failed to get pairing list: {e}"
             )
             log_traceback("get_pairing_list error")
             raise
+
+    def _enroll_event_job(
+        self,
+        source_topic: str,
+        target_topic: str,
+        description: str,
+        max_retries: int = 3,
+    ) -> tuple[dict | None, bool]:
+        """Call events enroll endpoint; return (job_or_none, is_403). Avoids ayon_api logging 403 and returning None with no way to detect."""
+        con = ayon_api.get_server_api_connection()
+        resp = con.events.post(
+            "enroll",
+            sourceTopic=source_topic,
+            targetTopic=target_topic,
+            sender=SENDER,
+            description=description,
+            maxRetries=max_retries,
+        )
+        if resp.status_code == 403:
+            return None, True
+        if resp.status_code in (204, 503) or resp.status_code >= 400:
+            return None, False
+        return resp.data, False
 
     def get_paired_ayon_project(self, kitsu_project_id: str) -> str | None:
         """returns the ayon project if paired else None"""
@@ -482,21 +480,21 @@ class KitsuProcessor:
 
     def start_processing(self):
         logging.info(
-            f"[ayon-kitsu][processor] ========== PROCESSOR STARTED =========="
+            "[ayon-kitsu][processor] ========== PROCESSOR STARTED =========="
         )
         logging.info(f"[ayon-kitsu][processor] Version: v{self.addon_version}")
         logging.info(
             f"[ayon-kitsu][processor] Paired projects: {len(self.pairing_list)}"
         )
         logging.info(
-            f"[ayon-kitsu][processor] Listening for events: kitsu.sync_request, kitsu.comment_update_request"
+            "[ayon-kitsu][processor] Listening for events: kitsu.sync_request, kitsu.comment_update_request"
         )
         logging.info(f"[ayon-kitsu][processor] Sender ID: {SENDER}")
         logging.info(
             f"[ayon-kitsu][processor] Server entrypoint: {self.entrypoint}"
         )
         logging.info(
-            f"[ayon-kitsu][processor] ========================================"
+            "[ayon-kitsu][processor] ========================================"
         )
 
         # Send a startup event to verify processor is running
@@ -552,20 +550,21 @@ class KitsuProcessor:
                 startup = False
                 logging.info("[ayon-kitsu][processor] Initial sync complete")
 
-            # Check for a new sync job
-            try:
-                job = ayon_api.enroll_event_job(
-                    source_topic="kitsu.sync_request",
-                    target_topic="kitsu.sync",
-                    sender=SENDER,
-                    description="Syncing Kitsu to Ayon",
-                    max_retries=3,
-                )
-            except Exception as e:
-                logging.debug(
-                    f"[ayon-kitsu][processor] No sync job available: {e}"
-                )
-                job = None
+            # Check for a new sync job (use _enroll_event_job to detect 403; ayon_api does not raise)
+            job, enroll_403 = self._enroll_event_job(
+                source_topic="kitsu.sync_request",
+                target_topic="kitsu.sync",
+                description="Syncing Kitsu to Ayon",
+            )
+            if enroll_403:
+                if not getattr(self, "_logged_service_403", False):
+                    self._logged_service_403 = True
+                    logging.warning(
+                        "[ayon-kitsu][processor] Server returned 403 'Only services can enroll for jobs'. "
+                        "Ensure the container has AYON_ADDON_NAME=kitsu, AYON_SERVICE_NAME=processor, "
+                        "AYON_ADDON_VERSION=<version> in its environment (e.g. addon service env in cloud worker)."
+                    )
+                time.sleep(60)
 
             if job:
                 processed_job = True
@@ -629,11 +628,17 @@ class KitsuProcessor:
                         f"[ayon-kitsu][processor] Enrolled for comment update job: {comment_job.get('id')}"
                     )
             except Exception as e:
-                # Only log at debug level if no job available (normal case)
-                if (
-                    "No job available" in str(e)
-                    or "not found" in str(e).lower()
-                ):
+                err_str = str(e)
+                if "403" in err_str or "Only services can enroll" in err_str:
+                    if not getattr(self, "_logged_service_403", False):
+                        self._logged_service_403 = True
+                        logging.warning(
+                            "[ayon-kitsu][processor] Server returned 403 'Only services can enroll for jobs'. "
+                            "Ensure the container has AYON_ADDON_NAME=kitsu, AYON_SERVICE_NAME=processor, "
+                            "AYON_ADDON_VERSION=<version> in its environment (e.g. addon service env in cloud worker)."
+                        )
+                    time.sleep(60)
+                elif "No job available" in err_str or "not found" in err_str.lower():
                     logging.debug(
                         f"[ayon-kitsu][processor] No comment update job available: {e}"
                     )
@@ -736,7 +741,7 @@ class KitsuProcessor:
 
             if not comment_payload.get("kitsu_task_id"):
                 logging.warning(
-                    f"[ayon-kitsu][processor] Missing kitsu_task_id in event summary"
+                    "[ayon-kitsu][processor] Missing kitsu_task_id in event summary"
                 )
                 ayon_api.update_event(
                     job["id"],

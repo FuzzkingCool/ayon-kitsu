@@ -2,9 +2,7 @@
 FROM python:3.11-alpine3.18
 ENV PYTHONUNBUFFERED=1
 
-# OCI labels for GitHub Container Registry
-ENV AYON_STUDIO_NAME=${AYON_STUDIO_NAME:-studio-name}
-LABEL org.opencontainers.image.source="https://github.com/${AYON_STUDIO_NAME}/ayon-kitsu-processor"
+LABEL org.opencontainers.image.source="https://github.com/studioname/ayon-kitsu-processor"
 LABEL org.opencontainers.image.description="Kitsu Integration Processor Service for AYON"
 LABEL org.opencontainers.image.licenses=MIT
 
@@ -31,4 +29,5 @@ COPY processor /service/processor
 # Tell docker that all future commands should run as the appuser user
 USER ayonuser
 
-CMD ["python", "-m", "processor.processor"]
+# Run the processor package __main__ (processor/__main__.py), not processor.processor (which has no main block)
+CMD ["python", "-m", "processor"]
