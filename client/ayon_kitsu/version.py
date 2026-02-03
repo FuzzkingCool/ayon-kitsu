@@ -1,3 +1,3 @@
 # -*- coding: utf-8 -*-
 """Package declaring kitsu addon version."""
-__version__ = "1.2.6-dev.17"
+__version__ = "1.2.6-dev.18"
