@@ -1,11 +1,11 @@
 
 name = "kitsu"
 title = "Kitsu"
-version = "1.2.6-dev.16"
+version = "1.2.6-dev.17"
 client_dir = "ayon_kitsu"
 
 services = {
-    "processor": {"image": f"studioname/ayon-kitsu-processor:{version}"},
+    "processor": {"image": f"studiomdhr/ayon-kitsu-processor:{version}"},
 }
 
 ayon_required_addons = {

@@ -11,11 +11,11 @@ This image is published to GitHub Container Registry (ghcr.io) as a private pack
 
 ### Image Location
 ```
-ghcr.io/studioname/ayon-kitsu-processor:latest
-ghcr.io/studioname/ayon-kitsu-processor:<version> 
+ghcr.io/studiomdhr/ayon-kitsu-processor:latest
+ghcr.io/studiomdhr/ayon-kitsu-processor:<version> 
 ```
 
-Replace `studioname` with your studio's GitHub organization name.
+Replace `studiomdhr` with your studio's GitHub organization name.
 
 ### Authentication
 
@@ -36,10 +36,10 @@ Replace `USERNAME` with your GitHub username and set `CR_PAT` to your classic PA
 
 ```bash
 # Pull latest
-docker pull ghcr.io/studioname/ayon-kitsu-processor:latest
+docker pull ghcr.io/studiomdhr/ayon-kitsu-processor:latest
 
 # Pull specific version
-docker pull ghcr.io/studioname/ayon-kitsu-processor:v1.2.6
+docker pull ghcr.io/studiomdhr/ayon-kitsu-processor:v1.2.6
 ```
 
 ### Running the Container
@@ -51,7 +51,7 @@ docker run --rm \
   -e AYON_ADDON_NAME=kitsu \
   -e AYON_SERVICE_NAME=processor \
   -e AYON_ADDON_VERSION=1.2.6 \
-  ghcr.io/studioname/ayon-kitsu-processor:latest
+  ghcr.io/studiomdhr/ayon-kitsu-processor:latest
 ```
 
 **Required env:** `AYON_SERVER_URL`, `AYON_API_KEY`. `AYON_API_KEY` must be a **service** API key (created in AYON for the kitsu addon service), not a user token; otherwise you get 403 "Only services can enroll for jobs". For job enrollment also set `AYON_ADDON_NAME=kitsu`, `AYON_SERVICE_NAME=processor`, `AYON_ADDON_VERSION=<addon version>` in the container env.
