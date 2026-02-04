@@ -12,7 +12,7 @@ $AYON_ADDON_VERSION = Invoke-Expression -Command "python -c ""import os;import s
 $AYON_ADDON_NAME = "kitsu"
 $SERVICE_NAME = "processor"
 $BASE_NAME = "ayon-$AYON_ADDON_NAME-$SERVICE_NAME"
-$IMAGE = "ynput/$($BASE_NAME):$($AYON_ADDON_VERSION)"
+$IMAGE = "fuzzkingcool/$($BASE_NAME):$($AYON_ADDON_VERSION)"
 
 $BASH_CONTAINER_NAME = "$BASE_NAME-bash-$AYON_ADDON_VERSION"
 

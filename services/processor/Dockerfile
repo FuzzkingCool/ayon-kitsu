@@ -2,7 +2,7 @@
 FROM python:3.11-alpine3.18
 ENV PYTHONUNBUFFERED=1
 
-LABEL org.opencontainers.image.source="https://github.com/fuzzkingcool/ayon-kitsu-processor"
+LABEL org.opencontainers.image.source="https://github.com/fuzzkingcool/ayon-kitsu"
 LABEL org.opencontainers.image.description="Kitsu Integration Processor Service for AYON"
 LABEL org.opencontainers.image.licenses=MIT
 
