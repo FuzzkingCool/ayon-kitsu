@@ -94,8 +94,17 @@ class KitsuProcessor:
 
         self.addon_name = ayon_api.get_service_addon_name()
         self.addon_version = ayon_api.get_service_addon_version()
-        self.settings = ayon_api.get_service_addon_settings()
         self.entrypoint = f"/addons/{self.addon_name}/{self.addon_version}"
+        
+        # Get settings from the correct addon version endpoint
+        settings_endpoint = f"{self.entrypoint}/settings"
+        logging.info(f"Fetching settings from: {settings_endpoint}")
+        settings_res = ayon_api.get(settings_endpoint)
+        assert settings_res.status_code == 200, (
+            f"Failed to fetch settings from {settings_endpoint}. "
+            f"Status code {settings_res.status_code}: {settings_res.detail}"
+        )
+        self.settings = settings_res.data
 
         #
         # Get list of projects that have been paired
