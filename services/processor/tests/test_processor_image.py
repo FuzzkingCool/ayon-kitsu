@@ -161,9 +161,9 @@ def main():
 
     # Set version in env vars
     env_vars["AYON_ADDON_VERSION"] = version
- 
+
     # Build image
-    image_name = f"ghcr.io/studioname/ayon-kitsu-processor:{version}"
+    image_name = f"ghcr.io/fuzzkingcool/ayon-kitsu-processor:{version}"
     build_image(image_name, script_dir)
 
     # Run container

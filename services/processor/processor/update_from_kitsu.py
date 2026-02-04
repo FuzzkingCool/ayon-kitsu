@@ -16,7 +16,7 @@ def update_project(parent: "KitsuProcessor", data: dict[str, str]):
     if not project_name:
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping")
         return
-
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.project.get_project(data["project_id"])
         entity["ayon_server_url"] = ayon_api.get_base_url()
@@ -61,7 +61,7 @@ def create_or_update_asset(parent: "KitsuProcessor", data: dict[str, str]):
     if not project_name:
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping asset {data.get('asset_id')}")
         return
-
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.asset.get_asset(data["asset_id"])
         entity = utils.preprocess_asset(entity["project_id"], entity)
@@ -110,7 +110,7 @@ def create_or_update_episode(parent: "KitsuProcessor", data: dict[str, str]):
     if not project_name:
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping episode {data.get('episode_id')}")
         return
-
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.shot.get_episode(data["episode_id"])
         entity["ayon_server_url"] = ayon_api.get_base_url()
@@ -158,7 +158,7 @@ def create_or_update_sequence(parent: "KitsuProcessor", data: dict[str, str]):
     if not project_name:
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping sequence {data.get('sequence_id')}")
         return
-
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.shot.get_sequence(data["sequence_id"])
         entity["ayon_server_url"] = ayon_api.get_base_url()
@@ -206,7 +206,7 @@ def create_or_update_shot(parent: "KitsuProcessor", data: dict[str, str]):
     if not project_name:
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping shot {data.get('shot_id')}")
         return
-
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.shot.get_shot(data["shot_id"])
         entity["ayon_server_url"] = ayon_api.get_base_url()
@@ -254,7 +254,7 @@ def create_or_update_task(parent: "KitsuProcessor", data: dict[str, str]):
     if not project_name:
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping task {data.get('task_id')}")
         return
-
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.task.get_task(data["task_id"])
         entity = utils.preprocess_task(entity["project_id"], entity)
@@ -303,7 +303,7 @@ def create_or_update_edit(parent: "KitsuProcessor", data: dict[str, str]):
     if not project_name:
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping edit {data.get('edit_id')}")
         return
-
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.edit.get_edit(data["edit_id"])
         entity["ayon_server_url"] = ayon_api.get_base_url()
@@ -351,7 +351,7 @@ def create_or_update_concept(parent: "KitsuProcessor", data: dict[str, str]):
     if not project_name:
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping concept {data.get('concept_id')}")
         return
-
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.concept.get_concept(data["concept_id"])
         entity["ayon_server_url"] = ayon_api.get_base_url()
@@ -395,6 +395,7 @@ def delete_concept(parent: "KitsuProcessor", data: dict[str, str]):
 
 def create_or_update_person(parent: "KitsuProcessor", data: dict[str, str]):
     logging.info(f"[update_from_kitsu] create_or_update_person: {data}")
+    utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         entity = gazu.person.get_person(data["person_id"])
         entity["ayon_server_url"] = ayon_api.get_base_url()

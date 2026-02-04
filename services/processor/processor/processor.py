@@ -8,6 +8,7 @@ import ayon_api
 import gazu
 from nxtools import log_traceback, logging
 
+from . import utils as processor_utils
 from .fullsync import project_full_sync
 from .update_from_kitsu import (
     create_or_update_asset,
@@ -29,7 +30,6 @@ from .update_from_kitsu import (
     delete_task,
     update_project,
 )
-from .utils import resolve_feedback_status
 
 if service_name := os.environ.get("AYON_SERVICE_NAME"):
     logging.user = service_name
@@ -45,40 +45,47 @@ class KitsuSettingsError(Exception):
     pass
 
 
+# Placeholder / invalid server values that must not be used (e.g. from UI defaults)
+_INVALID_SERVER_PLACEHOLDERS = ("change.serverhost", "gazu.change.serverhost")
+
+
+def _is_valid_server_url(server: str | None) -> bool:
+    """Return False if server is missing or a known placeholder."""
+    if not server or not (server := server.strip()):
+        return False
+    lower = server.lower()
+    return not any(p in lower for p in _INVALID_SERVER_PLACEHOLDERS)
+
+
+def _server_to_api_url(server: str | None) -> str:
+    """Build Kitsu API URL from server setting; raises if invalid."""
+    if not _is_valid_server_url(server):
+        raise KitsuSettingsError(
+            "Kitsu addon 'server' is not set or is a placeholder. "
+            "Set a real Kitsu server URL in AYON addon settings (Studio)."
+        )
+    return server.rstrip("/") + "/api"
+
+
 class KitsuProcessor:
     def __init__(self):
         #
-        # Connect to Ayon (single attempt, match original working behavior)
+        # Connect to Ayon
         #
-        sys.stderr.write(
-            "[ayon-kitsu][processor] Connecting to AYON...\n"
-        )
-        sys.stderr.flush()
+        logging.info("="*60)
+        logging.info("KitsuProcessor v1.2.6-dev.24+ initializing (with lazy init fix)")
+        logging.info("="*60)
+        
         try:
             ayon_api.init_service()
-            sys.stderr.write(
-                "[ayon-kitsu][processor] Connected to AYON server\n"
-            )
-            sys.stderr.flush()
-        except Exception as e:
+            connected = True
+        except Exception:
             log_traceback()
-            logging.error(
-                f"[ayon-kitsu][processor] Failed to connect to AYON: {e}"
-            )
-            sys.stderr.write("kitsu-processor: failed to connect to AYON\n")
-            sys.stderr.flush()
-            sys.exit(1)
+            connected = False
 
-        con = ayon_api.get_server_api_connection()
-        if not con.is_service_user():
-            msg = (
-                "[ayon-kitsu][processor] AYON_API_KEY must be a service API key, not a user token. "
-                "Create a service API key in AYON (Settings → API keys) for the kitsu addon service; "
-                "set that key as AYON_API_KEY in the container env. Without it you get 403 'Only services can enroll for jobs'."
-            )
-            logging.error(msg)
-            sys.stderr.write("kitsu-processor: init error: API key is not a service key (403 on enroll)\n")
-            sys.stderr.flush()
+        if not connected:
+            time.sleep(10)
+            print("KitsuProcessor failed to connect to Ayon")
             sys.exit(1)
 
         #
@@ -90,32 +97,19 @@ class KitsuProcessor:
         self.settings = ayon_api.get_service_addon_settings()
         self.entrypoint = f"/addons/{self.addon_name}/{self.addon_version}"
 
-        if not self.addon_name or not self.addon_version:
-            logging.warning(
-                "[ayon-kitsu][processor] Service identity missing (addon_name=%s, addon_version=%s). "
-                "Set AYON_ADDON_NAME, AYON_SERVICE_NAME, AYON_ADDON_VERSION in the container env or job enrollment will return 403.",
-                self.addon_name,
-                self.addon_version,
-            )
-
         #
         # Get list of projects that have been paired
         #
         self.pairing_list = self.get_pairing_list()
-
-        kitsu_server = (self.settings.get("server") or "").strip()
-        if not kitsu_server:
-            logging.info(
-                "[ayon-kitsu][processor] Kitsu server not configured; running with empty pairing list (no gazu events)"
-            )
-            self.event_client = None
-            return
+        logging.debug(f"Pairing list after assignment: {self.pairing_list!r}")
 
         #
         # Get Kitsu server credentials from settings
         #
         try:
-            self.kitsu_server_url = kitsu_server.rstrip("/") + "/api"
+            self.kitsu_server_url = _server_to_api_url(
+                self.settings.get("server")
+            )
 
             email_secret = self.settings.get("login_email")
             password_secret = self.settings.get("login_password")
@@ -129,12 +123,12 @@ class KitsuProcessor:
                 )
 
             try:
-                self.kitsu_login_email = ayon_api.get_secret(email_secret)[
-                    "value"
-                ]
-                self.kitsu_login_password = ayon_api.get_secret(
-                    password_secret
-                )["value"]
+                self.kitsu_login_email = (
+                    ayon_api.get_secret(email_secret)["value"]
+                )
+                self.kitsu_login_password = (
+                    ayon_api.get_secret(password_secret)["value"]
+                )
             except KeyError as e:
                 raise KitsuSettingsError(f"Secret `{e}` not found") from e
 
@@ -167,184 +161,128 @@ class KitsuProcessor:
         gazu.set_event_host(self.kitsu_events_url)
         self.event_client = gazu.events.init()
 
+        # Store host in thread-local storage for main thread
+        processor_utils.set_kitsu_host(self.kitsu_server_url)
+
         # ============= Add Kitsu Event Listeners ==============
         gazu_listener_thread = threading.Thread(target=self.run_gazu_listeners)
         gazu_listener_thread.start()
 
     def run_gazu_listeners(self):
-        def safe_handler(handler_func, event_type: str):
-            """Wrap handler to catch and log errors without crashing the listener thread."""
-
-            def wrapper(data):
-                try:
-                    handler_func(data)
-                except Exception as e:
-                    logging.error(
-                        f"[gazu_listener] Error handling {event_type} event: {e}"
-                    )
-                    log_traceback(f"Error in {event_type} handler")
-
-            return wrapper
-
         gazu.events.add_listener(
             self.event_client,
             "project:update",
-            safe_handler(
-                lambda data: update_project(self, data), "project:update"
-            ),
+            lambda data: update_project(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "project:delete",
-            safe_handler(
-                lambda data: delete_project(self, data), "project:delete"
-            ),
+            lambda data: delete_project(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "asset:new",
-            safe_handler(
-                lambda data: create_or_update_asset(self, data), "asset:new"
-            ),
+            lambda data: create_or_update_asset(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "asset:update",
-            safe_handler(
-                lambda data: create_or_update_asset(self, data), "asset:update"
-            ),
+            lambda data: create_or_update_asset(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "asset:delete",
-            safe_handler(
-                lambda data: delete_asset(self, data), "asset:delete"
-            ),
+            lambda data: delete_asset(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "episode:new",
-            safe_handler(
-                lambda data: create_or_update_episode(self, data),
-                "episode:new",
-            ),
+            lambda data: create_or_update_episode(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "episode:update",
-            safe_handler(
-                lambda data: create_or_update_episode(self, data),
-                "episode:update",
-            ),
+            lambda data: create_or_update_episode(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "episode:delete",
-            safe_handler(
-                lambda data: delete_episode(self, data), "episode:delete"
-            ),
+            lambda data: delete_episode(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "sequence:new",
-            safe_handler(
-                lambda data: create_or_update_sequence(self, data),
-                "sequence:new",
-            ),
+            lambda data: create_or_update_sequence(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "sequence:update",
-            safe_handler(
-                lambda data: create_or_update_sequence(self, data),
-                "sequence:update",
-            ),
+            lambda data: create_or_update_sequence(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "sequence:delete",
-            safe_handler(
-                lambda data: delete_sequence(self, data), "sequence:delete"
-            ),
+            lambda data: delete_sequence(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "shot:new",
-            safe_handler(
-                lambda data: create_or_update_shot(self, data), "shot:new"
-            ),
+            lambda data: create_or_update_shot(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "shot:update",
-            safe_handler(
-                lambda data: create_or_update_shot(self, data), "shot:update"
-            ),
+            lambda data: create_or_update_shot(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "shot:delete",
-            safe_handler(lambda data: delete_shot(self, data), "shot:delete"),
+            lambda data: delete_shot(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "task:new",
-            safe_handler(
-                lambda data: create_or_update_task(self, data), "task:new"
-            ),
+            lambda data: create_or_update_task(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "task:update",
-            safe_handler(
-                lambda data: create_or_update_task(self, data), "task:update"
-            ),
+            lambda data: create_or_update_task(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "task:delete",
-            safe_handler(lambda data: delete_task(self, data), "task:delete"),
+            lambda data: delete_task(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "edit:new",
-            safe_handler(
-                lambda data: create_or_update_edit(self, data), "edit:new"
-            ),
+            lambda data: create_or_update_edit(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "edit:update",
-            safe_handler(
-                lambda data: create_or_update_edit(self, data), "edit:update"
-            ),
+            lambda data: create_or_update_edit(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "edit:delete",
-            safe_handler(lambda data: delete_edit(self, data), "edit:delete"),
+            lambda data: delete_edit(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "person:new",
-            safe_handler(
-                lambda data: create_or_update_person(self, data), "person:new"
-            ),
+            lambda data: create_or_update_person(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "person:update",
-            safe_handler(
-                lambda data: create_or_update_person(self, data),
-                "person:update",
-            ),
+            lambda data: create_or_update_person(self, data),
         )
         gazu.events.add_listener(
             self.event_client,
             "person:delete",
-            safe_handler(
-                lambda data: delete_person(self, data), "person:delete"
-            ),
+            lambda data: delete_person(self, data),
         )
         # Concept events were fixed in Zou 0.19.0, so listen only if
         # the user is running Zou euqual or above 0.19.0
@@ -352,111 +290,64 @@ class KitsuProcessor:
             gazu.events.add_listener(
                 self.event_client,
                 "concept:new",
-                safe_handler(
-                    lambda data: create_or_update_concept(self, data),
-                    "concept:new",
-                ),
+                lambda data: create_or_update_concept(self, data),
             )
             gazu.events.add_listener(
                 self.event_client,
                 "concept:update",
-                safe_handler(
-                    lambda data: create_or_update_concept(self, data),
-                    "concept:update",
-                ),
+                lambda data: create_or_update_concept(self, data),
             )
             gazu.events.add_listener(
                 self.event_client,
                 "concept:delete",
-                safe_handler(
-                    lambda data: delete_concept(self, data), "concept:delete"
-                ),
+                lambda data: delete_concept(self, data),
             )
         logging.info("Gazu event listeners added")
         gazu.events.run_client(self.event_client)
+
+    def _resolve_kitsu_server_url(self) -> str:
+        """Return the Kitsu API URL resolved at init from addon settings."""
+        return self.kitsu_server_url
+
+    def _ensure_gazu_host(self, url: str) -> None:
+        """Set gazu client host to the given Kitsu API URL and verify it stuck.
+
+        Gazu's default_client is created with host 'http://gazu.change.serverhost/api';
+        if set_host is not applied before a request, that default is used.
+        """
+        if "change.serverhost" in url.lower():
+            raise KitsuSettingsError(
+                "Refusing to set gazu host to placeholder. "
+                "Set a real Kitsu server URL in AYON addon settings (Studio)."
+            )
+        gazu.set_host(url)
+        actual = gazu.get_host()
+        if actual != url:
+            raise KitsuSettingsError(
+                f"Gazu host did not stick: set {url!r}, got {actual!r}. "
+                "Check for code that resets gazu.client."
+            )
 
     def get_pairing_list(self):
         """maintain a list of pairings so that we can check
         the kitsu change is in a paired project and get the ayon project name
         """
-        logging.info(f"get_pairing_list - calling {self.entrypoint}/pairing")
-        try:
-            res = ayon_api.get(f"{self.entrypoint}/pairing")
-            data = res.data if hasattr(res, "data") else getattr(res, "data", None)
-            detail = (data.get("detail") if isinstance(data, dict) else None) or getattr(
-                res, "detail", None
-            )
-            logging.info(
-                f"get_pairing_list - response status: {res.status_code}, "
-                f"data: {data if data is not None else 'N/A'}"
-            )
+        logging.info(f"get_pairing_list from endpoint: {self.entrypoint}/pairing")
+        logging.info(f"Using addon version: {self.addon_name}/{self.addon_version}")
+        res = ayon_api.get(f"{self.entrypoint}/pairing")
 
-            if res.status_code == 200:
-                raw = data if isinstance(data, list) else []
-                # Only include pairs that have an AYON project (skip unpaired Kitsu projects)
-                pairs = []
-                for p in raw:
-                    if not isinstance(p, dict):
-                        continue
-                    kid = p.get("kitsu_project_id") or p.get("kitsuProjectId")
-                    ayon = p.get("ayon_project_name") or p.get("ayonProjectName")
-                    if kid and ayon:
-                        pairs.append({
-                            "kitsuProjectId": kid,
-                            "ayonProjectName": ayon,
-                        })
-                if len(pairs) < len(raw):
-                    logging.info(
-                        f"[ayon-kitsu][processor] Skipped {len(raw) - len(pairs)} unpaired project(s); syncing {len(pairs)} paired"
-                    )
-                return pairs
-
-            if res.status_code == 500 and detail and (
-                "Kitsu server is not set" in str(detail)
-                or "secret is not set" in str(detail).lower()
-            ):
-                logging.info(
-                    "[ayon-kitsu][processor] Kitsu addon not configured on server; using empty pairing list"
-                )
-                return []
-
-            error_msg = (
-                f"{self.entrypoint}/pairing failed. "
-                f"Status code '{res.status_code}': {detail or 'No detail'}"
-            )
-            logging.error(f"[ayon-kitsu][processor] {error_msg}")
-            raise RuntimeError(error_msg)
-        except RuntimeError:
-            raise
-        except Exception as e:
-            logging.error(
-                f"[ayon-kitsu][processor] Failed to get pairing list: {e}"
-            )
-            log_traceback("get_pairing_list error")
-            raise
-
-    def _enroll_event_job(
-        self,
-        source_topic: str,
-        target_topic: str,
-        description: str,
-        max_retries: int = 3,
-    ) -> tuple[dict | None, bool]:
-        """Call events enroll endpoint; return (job_or_none, is_403). Avoids ayon_api logging 403 and returning None with no way to detect."""
-        con = ayon_api.get_server_api_connection()
-        resp = con.events.post(
-            "enroll",
-            sourceTopic=source_topic,
-            targetTopic=target_topic,
-            sender=SENDER,
-            description=description,
-            maxRetries=max_retries,
+        assert res.status_code == 200, (
+            f"{self.entrypoint}/pairing failed. "
+            f" Status code '{res.status_code}': {res.detail}"
         )
-        if resp.status_code == 403:
-            return None, True
-        if resp.status_code in (204, 503) or resp.status_code >= 400:
-            return None, False
-        return resp.data, False
+
+        logging.debug(f"Pairing list response data: {res.data!r}")
+        if not res.data:
+            logging.warning(
+                f"Pairing endpoint returned empty. Ensure addon version {self.addon_version} "
+                "is deployed on the server and has paired projects configured."
+            )
+        return res.data
 
     def get_paired_ayon_project(self, kitsu_project_id: str) -> str | None:
         """returns the ayon project if paired else None"""
@@ -474,441 +365,82 @@ class KitsuProcessor:
         self.pairing_list.append(
             {
                 "kitsuProjectId": kitsu_project_id,
-                "ayonProjectName": ayon_project_name,
+                "ayonProjectName": ayon_project_name
             }
         )
 
     def start_processing(self):
-        logging.info(
-            "[ayon-kitsu][processor] ========== PROCESSOR STARTED =========="
-        )
-        logging.info(f"[ayon-kitsu][processor] Version: v{self.addon_version}")
-        logging.info(
-            f"[ayon-kitsu][processor] Paired projects: {len(self.pairing_list)}"
-        )
-        logging.info(
-            "[ayon-kitsu][processor] Listening for events: kitsu.sync_request, kitsu.comment_update_request"
-        )
-        logging.info(f"[ayon-kitsu][processor] Sender ID: {SENDER}")
-        logging.info(
-            f"[ayon-kitsu][processor] Server entrypoint: {self.entrypoint}"
-        )
-        logging.info(
-            "[ayon-kitsu][processor] ========================================"
-        )
-
-        # Send a startup event to verify processor is running
-        try:
-            ayon_api.dispatch_event(
-                topic="addon.kitsu.processor.started",
-                sender=SENDER,
-                description=f"Kitsu processor v{self.addon_version} started",
-                summary={
-                    "version": self.addon_version,
-                    "paired_projects": len(self.pairing_list),
-                    "sender": SENDER,
-                },
-                finished=True,
-                store=True,
-            )
-            logging.info(
-                "[ayon-kitsu][processor] Startup event dispatched to server"
-            )
-        except Exception as e:
-            logging.warning(
-                f"[ayon-kitsu][processor] Failed to dispatch startup event: {e}"
-            )
-
+        logging.info("KitsuProcessor started")
         startup = True
 
         while True:
-            processed_job = False
-
-            # Sync all paired projects on startup
+            # Sync all paired projects
             if startup:
-                logging.info(
-                    f"[ayon-kitsu][processor] Running initial sync for {len(self.pairing_list)} projects"
-                )
+                logging.info("Running sync for all paired projects")
                 for pair in self.pairing_list:
                     project_id = pair.get("kitsuProjectId")
                     project_name = pair.get("ayonProjectName")
                     if project_id and project_name:
-                        try:
-                            project_full_sync(self, project_id, project_name)
-                            logging.info(
-                                f"[ayon-kitsu][processor] Synced {project_name}"
-                            )
-                        except Exception as e:
-                            logging.error(
-                                f"[ayon-kitsu][processor] Sync failed for {project_name}: {e}"
-                            )
-                            log_traceback(f"Sync failed for {project_name}")
-                    else:
-                        logging.warning(
-                            f"[ayon-kitsu][processor] Incomplete pair: {pair}"
+                        project_full_sync(
+                            self,
+                            project_id,
+                            project_name,
                         )
                 startup = False
-                logging.info("[ayon-kitsu][processor] Initial sync complete")
 
-            # Check for a new sync job (use _enroll_event_job to detect 403; ayon_api does not raise)
-            job, enroll_403 = self._enroll_event_job(
+            # Check for a new sync job
+            job = ayon_api.enroll_event_job(
                 source_topic="kitsu.sync_request",
                 target_topic="kitsu.sync",
+                sender=SENDER,
                 description="Syncing Kitsu to Ayon",
+                max_retries=3,
             )
-            if enroll_403:
-                if not getattr(self, "_logged_service_403", False):
-                    self._logged_service_403 = True
-                    logging.warning(
-                        "[ayon-kitsu][processor] Server returned 403 'Only services can enroll for jobs'. "
-                        "Ensure the container has AYON_ADDON_NAME=kitsu, AYON_SERVICE_NAME=processor, "
-                        "AYON_ADDON_VERSION=<version> in its environment (e.g. addon service env in cloud worker)."
-                    )
-                time.sleep(60)
 
-            if job:
-                processed_job = True
-                src_job = ayon_api.get_event(job["dependsOn"])
-
-                kitsu_project_id = src_job["summary"]["kitsuProjectId"]
-                ayon_project_name = src_job["project"]
-
-                logging.info(
-                    f"[ayon-kitsu][processor] Syncing {ayon_project_name}"
-                )
-
-                ayon_api.update_event(
-                    job["id"],
-                    sender=SENDER,
-                    status="in_progress",
-                    project_name=ayon_project_name,
-                    description=f"Syncing Kitsu project {ayon_project_name}",
-                )
-
-                try:
-                    project_full_sync(
-                        self, kitsu_project_id, ayon_project_name
-                    )
-                    self.set_paired_ayon_project(
-                        kitsu_project_id, ayon_project_name
-                    )
-                except Exception as sync_error:
-                    log_traceback(
-                        f"Unable to sync kitsu project {ayon_project_name}"
-                    )
-                    ayon_api.update_event(
-                        job["id"],
-                        sender=SENDER,
-                        status="failed",
-                        project_name=ayon_project_name,
-                        description=f"Sync failed: {str(sync_error)}",
-                    )
-                else:
-                    ayon_api.update_event(
-                        job["id"],
-                        sender=SENDER,
-                        status="finished",
-                        project_name=ayon_project_name,
-                        description=f"Kitsu sync finished for {ayon_project_name}",
-                    )
-
-            # Enroll for comment update requests from server (for uniqueSprites bubble-up)
-            # Server handler gathers all data and dispatches kitsu.comment_update_request
-            comment_job = None
-            try:
-                comment_job = ayon_api.enroll_event_job(
-                    source_topic="kitsu.comment_update_request",
-                    target_topic="kitsu.comment_update",
-                    sender=SENDER,
-                    description="Update Kitsu comment with uniqueSprites",
-                    max_retries=3,
-                )
-                if comment_job:
-                    logging.info(
-                        f"[ayon-kitsu][processor] Enrolled for comment update job: {comment_job.get('id')}"
-                    )
-            except Exception as e:
-                err_str = str(e)
-                if "403" in err_str or "Only services can enroll" in err_str:
-                    if not getattr(self, "_logged_service_403", False):
-                        self._logged_service_403 = True
-                        logging.warning(
-                            "[ayon-kitsu][processor] Server returned 403 'Only services can enroll for jobs'. "
-                            "Ensure the container has AYON_ADDON_NAME=kitsu, AYON_SERVICE_NAME=processor, "
-                            "AYON_ADDON_VERSION=<version> in its environment (e.g. addon service env in cloud worker)."
-                        )
-                    time.sleep(60)
-                elif "No job available" in err_str or "not found" in err_str.lower():
-                    logging.debug(
-                        f"[ayon-kitsu][processor] No comment update job available: {e}"
-                    )
-                else:
-                    logging.warning(
-                        f"[ayon-kitsu][processor] Error enrolling for comment update job: {e}"
-                    )
-                comment_job = None
-
-            if comment_job:
-                processed_job = True
-                logging.info(
-                    f"[ayon-kitsu][processor] Processing comment update job: {comment_job.get('id')}"
-                )
-                self._handle_comment_update_job(comment_job)
-
-            if not processed_job:
-                # Heartbeat every 5 minutes when idle
-                current_time = time.time()
-                if not hasattr(self, "_last_heartbeat"):
-                    self._last_heartbeat = current_time
-                    self._heartbeat_count = 0
-
-                if current_time - self._last_heartbeat > 300:  # 5 minutes
-                    self._heartbeat_count += 1
-                    logging.debug(
-                        f"[ayon-kitsu][processor] Heartbeat #{self._heartbeat_count} - waiting for jobs"
-                    )
-                    self._last_heartbeat = current_time
-
-                    # Dispatch heartbeat event for monitoring
-                    try:
-                        ayon_api.dispatch_event(
-                            "addon.kitsu.processor.heartbeat",
-                            sender=SENDER,
-                            description=f"Processor heartbeat #{self._heartbeat_count}",
-                            summary={
-                                "status": "alive",
-                                "heartbeat_count": self._heartbeat_count,
-                                "addon_version": self.addon_version,
-                                "paired_projects": len(self.pairing_list),
-                            },
-                        )
-                    except Exception as e:
-                        logging.debug(
-                            f"[ayon-kitsu][processor] Heartbeat dispatch failed: {e}"
-                        )
-
+            if not job:
                 time.sleep(5)
+                continue
 
-        logging.info("[ayon-kitsu][processor] Processor finished - exiting")
-        gazu.log_out()
+            src_job = ayon_api.get_event(job["dependsOn"])
 
-    def _handle_comment_update_job(self, job: dict):
-        """Handle a comment update request from server for uniqueSprites bubble-up.
-
-        Server handler has already gathered all data and validated settings.
-        This handler only needs to perform Kitsu operations using gazu.
-        """
-        try:
-            logging.info(
-                f"[ayon-kitsu][processor] Handling comment update job {job.get('id')}"
-            )
-            src_event = ayon_api.get_event(job["dependsOn"])
-            project_name = src_event.get("project")
-            summary = src_event.get("summary", {})
-            payload = src_event.get("payload", {})
-
-            logging.info(
-                f"[ayon-kitsu][processor] Comment update event data - "
-                f"project: {project_name}, task_id: {summary.get('task_id')}, "
-                f"unique_sprites: {summary.get('unique_sprites')}"
-            )
-
-            logging.info(
-                f"[ayon-kitsu][processor] Processing comment update request for "
-                f"task {summary.get('task_id')} (project: {project_name})"
-            )
+            kitsu_project_id = src_job["summary"]["kitsuProjectId"]
+            ayon_project_name = src_job["project"]
 
             ayon_api.update_event(
                 job["id"],
                 sender=SENDER,
                 status="in_progress",
-                project_name=project_name,
-                description="Updating Kitsu comment with uniqueSprites",
+                project_name=ayon_project_name,
+                description="Syncing Kitsu project...",
             )
 
-            # All data is provided by server handler in event summary/payload
-            comment_payload = {
-                "task_id": summary.get("task_id"),
-                "kitsu_task_id": summary.get("kitsu_task_id"),
-                "product_name": summary.get("product_name"),
-                "task_name": summary.get("task_name"),
-                "unique_sprites": summary.get("unique_sprites"),
-                "new_status": summary.get("new_status"),
-                "old_status": summary.get("old_status"),
-                "version": summary.get("version", 1),
-                "template_cfg": payload.get("template_cfg", {}),
-            }
-
-            if not comment_payload.get("kitsu_task_id"):
-                logging.warning(
-                    "[ayon-kitsu][processor] Missing kitsu_task_id in event summary"
-                )
-                ayon_api.update_event(
-                    job["id"],
-                    sender=SENDER,
-                    status="finished",
-                    description="Missing kitsu_task_id",
-                )
-                return
-
-            # Process the comment update
             try:
-                self.update_kitsu_comment(comment_payload, project_name)
-                ayon_api.update_event(
-                    job["id"],
-                    sender=SENDER,
-                    status="finished",
-                    description=f"Updated Kitsu with uniqueSprites={comment_payload.get('unique_sprites')}",
-                )
-                logging.info(
-                    f"[ayon-kitsu][processor] Successfully updated Kitsu for task "
-                    f"{comment_payload.get('task_id')}"
-                )
-            except Exception as e:
-                logging.error(
-                    f"[ayon-kitsu][processor] Comment update failed: {e}"
-                )
-                log_traceback("Comment update failed")
-                ayon_api.update_event(
-                    job["id"],
-                    sender=SENDER,
-                    status="failed",
-                    description=f"Failed: {str(e)}",
-                )
+                project_full_sync(self, kitsu_project_id, ayon_project_name)
 
-        except Exception as e:
-            logging.error(
-                f"[ayon-kitsu][processor] Comment update handling failed: {e}"
-            )
-            log_traceback("Comment update handling failed")
-            try:
-                ayon_api.update_event(
-                    job["id"],
-                    sender=SENDER,
-                    status="failed",
-                    description=f"Error: {str(e)}",
+                # if successful add the pair to the list
+                self.set_paired_ayon_project(
+                    kitsu_project_id, ayon_project_name
                 )
             except Exception:
-                pass
-
-    def update_kitsu_comment(self, payload: dict, project_name: str | None):
-        """Update Kitsu task comment using payload from comment update event.
-
-        All data is provided by server handler - no AYON API calls needed.
-        """
-        if not project_name:
-            raise RuntimeError("Missing project name for Kitsu comment update")
-
-        kitsu_task_id = payload.get("kitsu_task_id")
-        product_name = payload.get("product_name")
-        task_name = payload.get("task_name")
-        unique_sprites = payload.get("unique_sprites")
-        template_cfg = payload.get("template_cfg", {})
-
-        if not kitsu_task_id:
-            raise RuntimeError(
-                "Missing kitsu_task_id in Kitsu comment payload"
-            )
-
-        kitsu_task = gazu.task.get_task(kitsu_task_id)
-        if not kitsu_task:
-            raise RuntimeError(f"Kitsu task {kitsu_task_id} not found")
-
-        if unique_sprites is not None:
-            logging.info(
-                f"[ayon-kitsu][processor] Bubbling up uniqueSprites={unique_sprites} "
-                f"to parent Asset for task '{task_name}' (Kitsu task ID: {kitsu_task_id})"
-            )
-            try:
-                self._bubble_up_unique_sprites_to_parent(
-                    kitsu_task, unique_sprites
+                log_traceback(
+                    f"Unable to sync kitsu project {ayon_project_name}"
                 )
-                logging.info(
-                    f"[ayon-kitsu][processor] Successfully bubbled up uniqueSprites={unique_sprites}"
+
+                ayon_api.update_event(
+                    job["id"],
+                    sender=SENDER,
+                    status="failed",
+                    project_name=ayon_project_name,
+                    description="Sync failed",
                 )
-            except Exception as e:
-                logging.error(
-                    f"[ayon-kitsu][processor] Failed to bubble up uniqueSprites: {e}"
-                )
-                log_traceback("Bubble-up failed")
-                raise
-        else:
-            logging.debug(
-                "[ayon-kitsu][processor] No uniqueSprites to bubble up"
-            )
-
-        # Use template config from event payload (provided by server)
-        from .utils import render_kitsu_comment
-
-        data_map = {
-            "comment": f"Bubble-up: Status changed to {payload.get('new_status', 'unknown')}",
-            "version": payload.get("version", 1),
-            "family": "review",
-            "name": product_name or task_name or "Review",
-        }
-        if unique_sprites is not None:
-            data_map["uniqueSprites"] = str(unique_sprites)
-
-        comment = render_kitsu_comment(template_cfg, data_map)
-        if not comment:
-            if unique_sprites is not None:
-                comment = f"uniqueSprites: {unique_sprites}"
             else:
-                raise RuntimeError(
-                    "Generated empty Kitsu comment and no uniqueSprites to report"
+                ayon_api.update_event(
+                    job["id"],
+                    sender=SENDER,
+                    status="finished",
+                    project_name=ayon_project_name,
+                    description="Kitsu sync finished",
                 )
 
-        current_user = gazu.client.get_current_user()
-        note_status = resolve_feedback_status(kitsu_task)
-
-        logging.debug(
-            f"[ayon-kitsu][processor] Adding comment to Kitsu task {kitsu_task_id}"
-        )
-
-        kitsu_comment = gazu.task.add_comment(
-            kitsu_task,
-            note_status,
-            comment=comment,
-            person=current_user,
-        )
-
-        comment_id = kitsu_comment.get("id") if kitsu_comment else "No ID"
-        logging.info(
-            f"[ayon-kitsu][processor] Added Kitsu comment: {comment_id}"
-        )
-
-    def _bubble_up_unique_sprites_to_parent(
-        self, kitsu_task: dict, unique_sprites: int | str
-    ) -> None:
-        """Update parent Kitsu Asset with uniqueSprites in extra data."""
-        entity_id = kitsu_task.get("entity_id")
-        if not entity_id:
-            raise RuntimeError(
-                f"Kitsu task {kitsu_task.get('id')} has no entity_id"
-            )
-
-        entity = gazu.entity.get_entity(entity_id)
-        if not entity:
-            raise RuntimeError(f"Kitsu entity {entity_id} not found")
-
-        entity_type = entity.get("type")
-        entity_name = entity.get("name", "Unknown")
-
-        if entity_type != "Asset":
-            logging.debug(
-                f"[ayon-kitsu][processor] Skipping bubble-up for non-Asset: {entity_type}"
-            )
-            return
-
-        logging.debug(
-            f"[ayon-kitsu][processor] Updating Asset {entity_name} with uniqueSprites={unique_sprites}"
-        )
-
-        updated_asset = gazu.asset.update_asset_data(
-            entity, data={"uniqueSprites": unique_sprites}
-        )
-
-        result_sprites = updated_asset.get("data", {}).get("uniqueSprites")
-        logging.info(
-            f"[ayon-kitsu][processor] Updated Kitsu Asset '{entity_name}': uniqueSprites={result_sprites}"
-        )
+        logging.info("KitsuProcessor finished processing")
+        gazu.log_out()

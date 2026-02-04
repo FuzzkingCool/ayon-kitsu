@@ -71,14 +71,14 @@ class KitsuAddon(BaseServerAddon):
         return EmptyResponse()
 
     async def processor_status(self) -> dict:
-        """Check processor service status by looking for recent heartbeat events.
+        """Check processor service status by looking for recent events.
 
         This endpoint helps diagnose if the processor service is running and
         processing events.
         """
         from ayon_server.lib.postgres import Postgres
 
-        # Check for recent processor events (heartbeats, job completions, etc.)
+        # Check for recent processor events (job completions, etc.)
         query = """
             SELECT
                 topic,
@@ -127,27 +127,7 @@ class KitsuAddon(BaseServerAddon):
         async for row in Postgres.iterate(pending_comment_query):
             pending_comment = row["count"]
 
-        # Find most recent heartbeat
-        heartbeat_query = """
-            SELECT
-                created_at,
-                summary
-            FROM events
-            WHERE topic = 'addon.kitsu.processor.heartbeat'
-            ORDER BY created_at DESC
-            LIMIT 1
-        """
-
-        last_heartbeat = None
-        async for row in Postgres.iterate(heartbeat_query):
-            last_heartbeat = {
-                "timestamp": row["created_at"].isoformat() if row["created_at"] else None,
-                "summary": row["summary"],
-            }
-
         return {
-            "processor_running": last_heartbeat is not None,
-            "last_heartbeat": last_heartbeat,
             "pending_sync_jobs": pending_sync,
             "pending_comment_jobs": pending_comment,
             "recent_events": recent_events,

@@ -6,7 +6,7 @@ SERVICE_NAME=processor
 
 BASE_NAME := ayon-$(AYON_ADDON_NAME)-$(SERVICE_NAME)
 REGISTRY ?= ghcr.io
-IMAGE_NAME := studioname/ayon-kitsu-processor
+IMAGE_NAME := fuzzkingcool/ayon-kitsu-processor
 IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(AYON_ADDON_VERSION)
 IMAGE_LATEST := $(REGISTRY)/$(IMAGE_NAME):latest
 

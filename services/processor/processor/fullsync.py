@@ -14,6 +14,7 @@ from .utils import (
     get_task_types,
     preprocess_asset,
     preprocess_task,
+    set_kitsu_host,
 )
 
 
@@ -103,6 +104,27 @@ def project_full_sync(
     logging.info(
         f"[fullsync] Starting sync: Kitsu project {kitsu_project_id} -> Ayon project {project_name}"
     )
+
+    logging.debug(f"[fullsync] parent.kitsu_server_url = {parent.kitsu_server_url!r}")
+    
+    if parent.kitsu_server_url is None:
+        raise RuntimeError(
+            "Cannot perform fullsync: Kitsu server URL is not initialized. "
+            "This usually means Kitsu settings are not configured."
+        )
+    
+    try:
+        logging.debug(f"[fullsync] gazu.get_host() before set = {gazu.get_host()!r}")
+        
+        # Set thread-local so utils._ensure_gazu_host() uses correct URL before every gazu call
+        set_kitsu_host(parent.kitsu_server_url)
+        parent._ensure_gazu_host(parent.kitsu_server_url)
+        
+        logging.debug(f"[fullsync] gazu.get_host() after set = {gazu.get_host()!r}")
+        logging.info(f"[fullsync] Using Kitsu server: {parent.kitsu_server_url!r}")
+    except Exception as e:
+        logging.error(f"[fullsync] Failed to set Kitsu server URL: {e}")
+        raise
 
     try:
         asset_types = get_asset_types(kitsu_project_id)
