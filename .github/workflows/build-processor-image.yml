@@ -13,7 +13,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/ayon-kitsu-processor
+  IMAGE_NAME: fuzzkingcool/ayon-kitsu-processor
 
 jobs:
   build-and-push:
