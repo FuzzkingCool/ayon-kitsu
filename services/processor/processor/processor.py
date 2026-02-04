@@ -72,9 +72,7 @@ class KitsuProcessor:
         #
         # Connect to Ayon
         #
-        logging.info("="*60)
-        logging.info("KitsuProcessor v1.2.6-dev.24+ initializing (with lazy init fix)")
-        logging.info("="*60)
+ 
         
         try:
             ayon_api.init_service()
@@ -94,6 +92,13 @@ class KitsuProcessor:
 
         self.addon_name = ayon_api.get_service_addon_name()
         self.addon_version = ayon_api.get_service_addon_version()
+        
+        if not self.addon_name or not self.addon_version:
+            raise KitsuSettingsError(
+                "AYON_ADDON_NAME or AYON_ADDON_VERSION not set. "
+                "Ensure the processor service is properly configured in AYON."
+            )
+        
         self.entrypoint = f"/addons/{self.addon_name}/{self.addon_version}"
         
         # Get settings from the correct addon version endpoint
@@ -345,17 +350,93 @@ class KitsuProcessor:
         logging.info(f"Using addon version: {self.addon_name}/{self.addon_version}")
         res = ayon_api.get(f"{self.entrypoint}/pairing")
 
-        assert res.status_code == 200, (
-            f"{self.entrypoint}/pairing failed. "
-            f" Status code '{res.status_code}': {res.detail}"
-        )
+        if res.status_code != 200:
+            logging.error(
+                f"Failed to fetch pairing list from {self.entrypoint}/pairing. "
+                f"Status: {res.status_code}, Detail: {res.detail}"
+            )
+            logging.error(
+                f"This likely means addon version {self.addon_version} is not deployed "
+                "in the current bundle. Check AYON_ADDON_NAME and AYON_ADDON_VERSION "
+                "environment variables match the deployed addon version."
+            )
+            # Try to get available addon versions for diagnostics
+            try:
+                addons_res = ayon_api.get("/api/addons")
+                if addons_res.status_code == 200:
+                    available = [
+                        f"{name}/{ver}" 
+                        for name, versions in addons_res.data.get("addons", {}).items()
+                        for ver in versions.keys()
+                        if name == self.addon_name
+                    ]
+                    logging.error(f"Available {self.addon_name} versions: {available}")
+            except Exception as e:
+                logging.error(f"Could not fetch available addon versions: {e}")
+            
+            raise KitsuSettingsError(
+                f"Pairing endpoint failed with status {res.status_code}. "
+                f"Ensure addon {self.addon_name}/{self.addon_version} is deployed."
+            )
 
         logging.debug(f"Pairing list response data: {res.data!r}")
+        
+        # If empty, try production bundle as fallback
         if not res.data:
             logging.warning(
-                f"Pairing endpoint returned empty. Ensure addon version {self.addon_version} "
-                "is deployed on the server and has paired projects configured."
+                f"Pairing endpoint returned empty from {self.entrypoint}/pairing. "
+                "Attempting to fetch from production bundle as fallback."
             )
+            
+            # Get production bundle info to find the Kitsu addon version
+            try:
+                bundles_res = ayon_api.get("/bundles")
+                if bundles_res.status_code == 200:
+                    production_bundle_name = bundles_res.data.get("productionBundle")
+                    if production_bundle_name:
+                        logging.info(f"Production bundle: {production_bundle_name}")
+                        
+                        # Get the bundle details to find Kitsu addon version
+                        bundles_list = bundles_res.data.get("bundles", [])
+                        production_bundle = next(
+                            (b for b in bundles_list if b["name"] == production_bundle_name),
+                            None
+                        )
+                        
+                        if production_bundle:
+                            production_kitsu_version = production_bundle.get("addons", {}).get(self.addon_name)
+                            if production_kitsu_version:
+                                logging.info(
+                                    f"Found production Kitsu version: {production_kitsu_version}"
+                                )
+                                production_endpoint = f"/addons/{self.addon_name}/{production_kitsu_version}/pairing"
+                                logging.info(f"Trying production endpoint: {production_endpoint}")
+                                prod_res = ayon_api.get(production_endpoint)
+                                
+                                if prod_res.status_code == 200 and prod_res.data:
+                                    logging.info(
+                                        f"Successfully fetched {len(prod_res.data)} pairings "
+                                        f"from production bundle (version {production_kitsu_version})"
+                                    )
+                                    return prod_res.data
+                                else:
+                                    logging.warning(
+                                        f"Production endpoint returned empty or failed. "
+                                        f"Status: {prod_res.status_code}"
+                                    )
+                            else:
+                                logging.warning(
+                                    f"Kitsu addon not found in production bundle {production_bundle_name}"
+                                )
+                        else:
+                            logging.warning(f"Could not find production bundle details")
+                    else:
+                        logging.warning("No production bundle configured")
+                else:
+                    logging.warning(f"Failed to fetch bundles list: {bundles_res.status_code}")
+            except Exception as e:
+                logging.error(f"Error fetching production bundle info: {e}")
+        
         return res.data
 
     def get_paired_ayon_project(self, kitsu_project_id: str) -> str | None:
