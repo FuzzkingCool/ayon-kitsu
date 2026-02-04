@@ -113,4 +113,7 @@ See `example_env` for required environment variables:
 - `AYON_ADDON_NAME` - Addon name (default: kitsu)
 - `AYON_ADDON_VERSION` - Addon version
 
+### Optional
+- `KITSU_URL` - Kitsu server URL (e.g. `https://studio.cg-wire.com`). If set, overrides the `server` setting from AYON addon settings. Useful when addon settings aren't propagating correctly or for testing.
+
  
