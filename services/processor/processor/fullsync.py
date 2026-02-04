@@ -49,26 +49,32 @@ def get_tasks(
     kitsu_project_id: str,
     task_types: dict[str, str],
     task_statuses: dict[str, str],
+    persons_by_id: dict[str, dict],
+    ayon_users_by_email: dict[str, str],
 ) -> list[dict[str, str]]:
     tasks: list[dict[str, str]] = []
     try:
+        logging.debug(f"[fullsync] Calling gazu.task.all_tasks_for_project...")
         records = gazu.task.all_tasks_for_project(kitsu_project_id)
-        for record in records:
+        logging.debug(f"[fullsync] Got {len(records)} task records, processing...")
+        for idx, record in enumerate(records):
+            if idx % 10 == 0:
+                logging.debug(f"[fullsync] Processing task {idx}/{len(records)}")
             try:
                 record["persons"]: list[dict[str, str]] = []
                 for person_id in record.get("assignees", []):
-                    try:
-                        person = gazu.person.get_person(person_id)
+                    person = persons_by_id.get(person_id)
+                    if person:
                         record["persons"].append(
                             {"email": person.get("email", "")}
                         )
-                    except Exception as e:
+                    else:
                         logging.warning(
-                            f"[fullsync] Failed to get person {person_id} for task {record.get('id', 'unknown')}: {e}"
+                            f"[fullsync] Person {person_id} not found in persons list for task {record.get('id', 'unknown')}"
                         )
                 tasks.append(
                     preprocess_task(
-                        kitsu_project_id, record, task_types, task_statuses
+                        kitsu_project_id, record, task_types, task_statuses, ayon_users_by_email
                     )
                 )
             except Exception as e:
@@ -159,9 +165,23 @@ def project_full_sync(
     try:
         persons = gazu.person.all_persons()
         logging.debug(f"[fullsync] Retrieved {len(persons)} persons")
+        # Create lookup dict for efficient person lookup by ID
+        persons_by_id = {person["id"]: person for person in persons}
     except Exception as e:
         logging.error(f"[fullsync] Failed to get persons: {e}")
         log_traceback("Error getting persons")
+        raise
+
+    try:
+        # Get AYON users once for all tasks
+        ayon_users = ayon_api.get_users()
+        ayon_users_by_email = {
+            user["attrib"]["email"]: user["name"] for user in ayon_users
+        }
+        logging.debug(f"[fullsync] Retrieved {len(ayon_users_by_email)} AYON users")
+    except Exception as e:
+        logging.error(f"[fullsync] Failed to get AYON users: {e}")
+        log_traceback("Error getting AYON users")
         raise
 
     try:
@@ -173,7 +193,8 @@ def project_full_sync(
         raise
 
     try:
-        tasks = get_tasks(kitsu_project_id, task_types, task_statuses)
+        logging.debug(f"[fullsync] About to call get_tasks...")
+        tasks = get_tasks(kitsu_project_id, task_types, task_statuses, persons_by_id, ayon_users_by_email)
         logging.info(f"[fullsync] Retrieved {len(tasks)} tasks")
     except Exception as e:
         logging.error(f"[fullsync] Failed to get tasks: {e}")

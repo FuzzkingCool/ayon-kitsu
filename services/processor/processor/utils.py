@@ -102,6 +102,7 @@ def preprocess_task(
     task: dict[str, str | list[str]],
     task_types: dict[str, str | list[str]] = {},
     statuses: dict[str, str] = {},
+    ayon_users_by_email: dict[str, str] | None = None,
 ) -> dict[str, str | list[str]]:
     if not task_types:
         task_types = get_task_types(kitsu_project_id)
@@ -119,13 +120,14 @@ def preprocess_task(
         task["name"] = task["task_type_name"].lower()
 
     # Match the assigned ayon user with the assigned kitsu email
-    ayon_users = {
-        user["attrib"]["email"]: user["name"] for user in ayon_api.get_users()
-    }
+    if ayon_users_by_email is None:
+        ayon_users_by_email = {
+            user["attrib"]["email"]: user["name"] for user in ayon_api.get_users()
+        }
     task_emails = {user["email"] for user in task["persons"]}
     task["assignees"] = []
     task["assignees"].extend(
-        ayon_users[email] for email in task_emails if email in ayon_users
+        ayon_users_by_email[email] for email in task_emails if email in ayon_users_by_email
     )
 
     return task
