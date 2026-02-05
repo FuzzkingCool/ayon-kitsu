@@ -4,6 +4,7 @@ import traceback
 import pyblish.api
 from ayon_core.pipeline import get_current_project_name
 from ayon_harmony.logger import log as log_harmony
+
 from ayon_kitsu.pipeline import (
     KitsuPublishContextPlugin,
 )

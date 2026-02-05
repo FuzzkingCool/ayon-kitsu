@@ -128,8 +128,12 @@ async def handle_task_status_change(addon, event):
             or event.summary.get("taskId")
         )
         # newValue/oldValue (status_changed) or status (data_changed)
-        new_status_raw = event.payload.get("newValue") or event.payload.get("status")
-        new_status = str(new_status_raw).strip() if new_status_raw is not None else None
+        new_status_raw = event.payload.get("newValue") or event.payload.get(
+            "status"
+        )
+        new_status = (
+            str(new_status_raw).strip() if new_status_raw is not None else None
+        )
         old_status = event.payload.get("oldValue")
 
         # For data_changed / updated, resolve status if not in payload
@@ -199,9 +203,9 @@ async def handle_task_status_change(addon, event):
             return
 
         # Task type from entity: lowercase for case-insensitive match with settings
-        task_type = (
-            (task_entity.get("taskType") or {}).get("name") or "unknown"
-        )
+        task_type = (task_entity.get("taskType") or {}).get(
+            "name"
+        ) or "unknown"
         task_type = str(task_type).strip().lower()
 
         # Get the product and task information

@@ -1,13 +1,16 @@
 """Entrypoint for the Kitsu processor service. Logs to stderr so cloud/container logs are visible."""
+
 import os
 import sys
 import traceback
 from datetime import datetime
 
+
 def _log(msg):
     """Log to stderr with timestamp."""
     timestamp = datetime.utcnow().isoformat()
     print(f"[{timestamp}] kitsu-processor: {msg}", file=sys.stderr, flush=True)
+
 
 # Bootstrap: ensure container logs show we started (cloud workers often only capture stdout/stderr)
 def _bootstrap():
@@ -18,7 +21,11 @@ def _bootstrap():
     # Log ALL environment variables for debugging
     _log("Environment variables:")
     for key in sorted(os.environ.keys()):
-        if "PASSWORD" in key.upper() or "SECRET" in key.upper() or "KEY" in key.upper():
+        if (
+            "PASSWORD" in key.upper()
+            or "SECRET" in key.upper()
+            or "KEY" in key.upper()
+        ):
             value = "***REDACTED***"
         else:
             value = os.environ[key]
@@ -28,7 +35,9 @@ def _bootstrap():
     _log("Checking critical environment variables...")
     critical_vars = {
         "AYON_SERVER_URL": os.environ.get("AYON_SERVER_URL"),
-        "AYON_API_KEY": "***SET***" if os.environ.get("AYON_API_KEY") else "NOT SET",
+        "AYON_API_KEY": "***SET***"
+        if os.environ.get("AYON_API_KEY")
+        else "NOT SET",
         "AYON_ADDON_NAME": os.environ.get("AYON_ADDON_NAME"),
         "AYON_ADDON_VERSION": os.environ.get("AYON_ADDON_VERSION"),
         "AYON_SERVICE_NAME": os.environ.get("AYON_SERVICE_NAME"),
@@ -39,11 +48,12 @@ def _bootstrap():
 
     # Fail fast if required env missing so logs are visible
     missing = [
-        k for k in ("AYON_SERVER_URL", "AYON_API_KEY")
-        if not os.environ.get(k)
+        k for k in ("AYON_SERVER_URL", "AYON_API_KEY") if not os.environ.get(k)
     ]
     if missing:
-        _log(f"ERROR: Missing required environment variables: {', '.join(missing)}")
+        _log(
+            f"ERROR: Missing required environment variables: {', '.join(missing)}"
+        )
         _log("Container will exit with code 1")
         sys.exit(1)
 
@@ -56,12 +66,14 @@ if __name__ == "__main__":
     _log("Importing dependencies...")
     try:
         from nxtools import log_traceback, logging
+
         _log("nxtools imported successfully")
         from .processor import (
             KitsuProcessor,
             KitsuServerError,
             KitsuSettingsError,
         )
+
         _log("processor module imported successfully")
     except Exception as e:
         _log(f"FATAL: Import failed: {e}")
