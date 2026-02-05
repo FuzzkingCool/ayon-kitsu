@@ -223,21 +223,23 @@ class KitsuAddon(BaseServerAddon):
     #
 
     async def on_task_status_changed(self, event: EventModel):
-        """Handle task status changes to bubble up uniqueSprites to Kitsu comments.
+        """Handle task status changes (from push/sync) to bubble up uniqueSprites."""
+        from .kitsu.version_status_handler import handle_task_status_change
+        await handle_task_status_change(self, event)
 
-        This is the canonical AYON pattern from ayon-example-addon.
-        Hook methods on the addon class are automatically called by AYON when events occur.
-        """
+    async def on_task_data_changed(self, event: EventModel):
+        """Handle task data changes (e.g. UI status change) to bubble up uniqueSprites."""
         from .kitsu.version_status_handler import handle_task_status_change
         await handle_task_status_change(self, event)
 
     async def event_handler_status(self) -> dict:
         """Check if event handler is registered and working."""
         return {
-            "event_handler": "on_task_status_changed (canonical AYON hook method)",
+            "event_handler": "on_task_status_changed / on_task_data_changed",
             "handler_module": "server.kitsu.version_status_handler",
             "handled_topics": [
-                "entity.task.status_changed"
+                "entity.task.status_changed",
+                "entity.task.data_changed",
             ],
-            "note": "Using canonical AYON hook method pattern from ayon-example-addon"
+            "note": "status_changed = push/sync; data_changed = UI and other core updates",
         }

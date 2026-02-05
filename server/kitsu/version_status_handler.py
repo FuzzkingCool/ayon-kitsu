@@ -33,6 +33,10 @@ async def handle_task_status_change(addon, event):
         logging.info(
             f"[{bundle_name}] [ayon-kitsu] Received event: {event.topic} for project: {event.project}"
         )
+        if event.topic == "entity.task.data_changed":
+            logging.debug(
+                f"[{bundle_name}] [ayon-kitsu] data_changed (UI/core); will resolve status if needed"
+            )
         logging.info(
             f"[{bundle_name}] [ayon-kitsu] Event summary keys: {list(event.summary.keys()) if hasattr(event, 'summary') else 'N/A'}"
         )
@@ -117,14 +121,22 @@ async def handle_task_status_change(addon, event):
             )
             return
 
-        task_id = event.summary.get("entityId")
-        # Normalize status from event for case-insensitive comparison
-        new_status_raw = event.payload.get("newValue")
+        # task_id: status_changed uses entityId; data_changed may use id or taskId
+        task_id = (
+            event.summary.get("entityId")
+            or event.summary.get("id")
+            or event.summary.get("taskId")
+        )
+        # newValue/oldValue (status_changed) or status (data_changed)
+        new_status_raw = event.payload.get("newValue") or event.payload.get("status")
         new_status = str(new_status_raw).strip() if new_status_raw is not None else None
         old_status = event.payload.get("oldValue")
 
-        # For updated events, check if it's a status update
-        if not new_status and event.topic == "entity.task.updated":
+        # For data_changed / updated, resolve status if not in payload
+        if not new_status and event.topic in (
+            "entity.task.updated",
+            "entity.task.data_changed",
+        ):
             # Try multiple ways to get the status
             new_status = (
                 event.summary.get("status")
@@ -133,9 +145,9 @@ async def handle_task_status_change(addon, event):
                 or event.payload.get("newValue")
             )
 
-            # Check if status is in the updated fields
-            updated_fields = event.summary.get("updatedFields", [])
-            if not new_status and "status" in updated_fields:
+            # Check if status is in the updated fields (data_changed / updated)
+            updated_fields = event.summary.get("updatedFields", []) or []
+            if not new_status and task_id and "status" in updated_fields:
                 # Get the task to check current status
                 task_entity = get_task_entity(event.project, task_id)
                 if task_entity:

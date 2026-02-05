@@ -13,11 +13,18 @@ from ayon_server.events import EventStream
 
 # Topic -> addon method name (must exist on addon class).
 # Add new subscriptions here.
+# entity.task.status_changed: dispatched when our push/sync updates task status.
+# entity.task.data_changed: dispatched when core updates task (e.g. UI status change).
 SUBSCRIPTIONS = [
     (
         "entity.task.status_changed",
         "on_task_status_changed",
-        "uniqueSprites bubble-up to Kitsu",
+        "uniqueSprites bubble-up (status_changed)",
+    ),
+    (
+        "entity.task.data_changed",
+        "on_task_data_changed",
+        "uniqueSprites bubble-up (data_changed / UI)",
     ),
 ]
 
