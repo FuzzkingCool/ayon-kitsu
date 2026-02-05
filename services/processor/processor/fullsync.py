@@ -277,6 +277,13 @@ def project_full_sync(
         batch = entities[start_idx:end_idx]
         
         logging.info(f"[fullsync] Sending batch {batch_num + 1}/{total_batches} ({len(batch)} entities)")
+        
+        # Log entity types in this batch for debugging
+        entity_types = {}
+        for entity in batch:
+            entity_type = entity.get("type", "unknown")
+            entity_types[entity_type] = entity_types.get(entity_type, 0) + 1
+        logging.debug(f"[fullsync] Batch {batch_num + 1} contains: {entity_types}")
 
         try:
             response = ayon_api.post(
@@ -291,39 +298,60 @@ def project_full_sync(
             logging.error(
                 f"[fullsync] Failed to push batch {batch_num + 1} for project {project_name}: {e}"
             )
+            logging.error(f"[fullsync] Failed batch contained: {entity_types}")
+            # Log first few entity IDs for debugging
+            entity_ids = [f"{ent.get('type', '?')}:{ent.get('id', '?')[:8]}" for ent in batch[:5]]
+            logging.error(f"[fullsync] First entities in failed batch: {entity_ids}")
             log_traceback(f"Error pushing batch {batch_num + 1} for {project_name}")
-            failed_batches.append((batch, e))
+            
+            # Immediately try processing individually instead of batch retry
+            logging.warning(f"[fullsync] Processing batch {batch_num + 1} entities individually to isolate problem...")
+            individual_success = 0
+            individual_failed = 0
+            
+            for idx, entity in enumerate(batch):
+                entity_type = "unknown"
+                entity_id = "unknown"
+                entity_name = "unknown"
+                
+                try:
+                    entity_type = entity.get("type", "unknown")
+                    entity_id = entity.get("id", "unknown")
+                    entity_data = entity.get("data")
+                    if entity_data and isinstance(entity_data, dict):
+                        entity_name = entity_data.get("name", "unknown")
+                    
+                    response = ayon_api.post(
+                        f"{parent.entrypoint}/push",
+                        project_name=project_name,
+                        entities=[entity],
+                    )
+                    response.raise_for_status()
+                    individual_success += 1
+                    
+                    if idx == 0:
+                        logging.info(f"[fullsync] Individual entity processing working...")
+                    elif (idx + 1) % 10 == 0:
+                        logging.info(f"[fullsync] Processed {idx + 1}/{len(batch)} entities individually ({individual_success} success, {individual_failed} failed)")
+                        
+                except Exception as entity_error:
+                    individual_failed += 1
+                    logging.error(
+                        f"[fullsync] PROBLEMATIC ENTITY #{idx + 1}: {entity_type}:{entity_name} (ID: {entity_id})"
+                    )
+                    logging.error(f"[fullsync] Error: {entity_error}")
+                    logging.debug(f"[fullsync] Entity data: {entity}")
+            
+            processed_count += individual_success
+            logging.info(
+                f"[fullsync] Batch {batch_num + 1} individual processing complete: "
+                f"{individual_success} succeeded, {individual_failed} failed"
+            )
 
     # Log summary
     logging.info(
         f"[fullsync] Processed {processed_count}/{len(entities)} entities successfully"
     )
-    if failed_batches:
-        logging.warning(f"[fullsync] {len(failed_batches)} batches failed. Retrying...")
-        # Retry failed batches
-        for batch, error in failed_batches:
-            max_retries = 3
-            retry_delay = 5  # seconds
-            
-            for retry in range(max_retries):
-                try:
-                    logging.info(f"[fullsync] Retrying batch (attempt {retry + 1}/{max_retries})")
-                    response = ayon_api.post(
-                        f"{parent.entrypoint}/push",
-                        project_name=project_name,
-                        entities=batch,
-                    )
-                    response.raise_for_status()
-                    processed_count += len(batch)
-                    logging.info(f"[fullsync] Batch retried successfully on attempt {retry + 1}")
-                    break
-                except Exception as e:
-                    logging.error(
-                        f"[fullsync] Retry {retry + 1} failed for batch: {e}"
-                    )
-                    time.sleep(retry_delay)
-            else:
-                logging.error(f"[fullsync] Batch failed after {max_retries} retries")
 
     # Final summary
     if processed_count == len(entities):
