@@ -64,8 +64,10 @@ def build_image(image_name, dockerfile_dir):
     cmd = [
         "docker",
         "build",
-        "-t", image_name,
-        "-f", str(dockerfile_path),
+        "-t",
+        image_name,
+        "-f",
+        str(dockerfile_path),
         str(build_context),  # Build context is the parent directory (services)
     ]
 
@@ -84,14 +86,18 @@ def run_container(image_name, env_vars):
     print(f"\nRunning container from image: {image_name}")
 
     cmd = [
-        "docker", "run", "--rm", "-it",
-        "--hostname", "kitsu-dev-worker",
+        "docker",
+        "run",
+        "--rm",
+        "-it",
+        "--hostname",
+        "kitsu-dev-worker",
     ]
 
     # Add environment variables
     for key, value in env_vars.items():
         cmd.extend(["--env", f"{key}={value}"])
- 
+
     # Add image and command
     cmd.append(image_name)
     cmd.extend(["python", "-m", "processor"])
@@ -128,16 +134,24 @@ def main():
     # Load environment variables
     env_vars = load_env_file(env_file)
     if env_file.exists():
-        print(f"\nLoaded {len(env_vars)} environment variables from {env_file}")
+        print(
+            f"\nLoaded {len(env_vars)} environment variables from {env_file}"
+        )
     else:
         print(f"\nWARNING: .env file not found at {env_file}")
         print("You may need to set AYON_API_KEY and AYON_SERVER_URL manually")
 
     # Check for required environment variables
     required = ["AYON_API_KEY", "AYON_SERVER_URL"]
-    missing = [var for var in required if var not in env_vars and var not in os.environ]
+    missing = [
+        var
+        for var in required
+        if var not in env_vars and var not in os.environ
+    ]
     if missing:
-        print(f"\nWARNING: Missing required environment variables: {', '.join(missing)}")
+        print(
+            f"\nWARNING: Missing required environment variables: {', '.join(missing)}"
+        )
         print("These should be set in .env file or your environment")
         response = input("\nContinue anyway? (y/N): ")
         if response.lower() != "y":
@@ -158,6 +172,7 @@ def main():
 
     # Run container
     run_container(image_name, env_vars)
+
 
 if __name__ == "__main__":
     main()
