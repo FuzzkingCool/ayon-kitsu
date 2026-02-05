@@ -56,10 +56,14 @@ def get_tasks(
     try:
         logging.debug(f"[fullsync] Calling gazu.task.all_tasks_for_project...")
         records = gazu.task.all_tasks_for_project(kitsu_project_id)
-        logging.debug(f"[fullsync] Got {len(records)} task records, processing...")
+        logging.debug(
+            f"[fullsync] Got {len(records)} task records, processing..."
+        )
         for idx, record in enumerate(records):
             if idx % 10 == 0:
-                logging.debug(f"[fullsync] Processing task {idx}/{len(records)}")
+                logging.debug(
+                    f"[fullsync] Processing task {idx}/{len(records)}"
+                )
             try:
                 record["persons"]: list[dict[str, str]] = []
                 for person_id in record.get("assignees", []):
@@ -74,7 +78,11 @@ def get_tasks(
                         )
                 tasks.append(
                     preprocess_task(
-                        kitsu_project_id, record, task_types, task_statuses, ayon_users_by_email
+                        kitsu_project_id,
+                        record,
+                        task_types,
+                        task_statuses,
+                        ayon_users_by_email,
                     )
                 )
             except Exception as e:
@@ -111,23 +119,31 @@ def project_full_sync(
         f"[fullsync] Starting sync: Kitsu project {kitsu_project_id} -> Ayon project {project_name}"
     )
 
-    logging.debug(f"[fullsync] parent.kitsu_server_url = {parent.kitsu_server_url!r}")
-    
+    logging.debug(
+        f"[fullsync] parent.kitsu_server_url = {parent.kitsu_server_url!r}"
+    )
+
     if parent.kitsu_server_url is None:
         raise RuntimeError(
             "Cannot perform fullsync: Kitsu server URL is not initialized. "
             "This usually means Kitsu settings are not configured."
         )
-    
+
     try:
-        logging.debug(f"[fullsync] gazu.get_host() before set = {gazu.get_host()!r}")
-        
+        logging.debug(
+            f"[fullsync] gazu.get_host() before set = {gazu.get_host()!r}"
+        )
+
         # Set thread-local so utils._ensure_gazu_host() uses correct URL before every gazu call
         set_kitsu_host(parent.kitsu_server_url)
         parent._ensure_gazu_host(parent.kitsu_server_url)
-        
-        logging.debug(f"[fullsync] gazu.get_host() after set = {gazu.get_host()!r}")
-        logging.info(f"[fullsync] Using Kitsu server: {parent.kitsu_server_url!r}")
+
+        logging.debug(
+            f"[fullsync] gazu.get_host() after set = {gazu.get_host()!r}"
+        )
+        logging.info(
+            f"[fullsync] Using Kitsu server: {parent.kitsu_server_url!r}"
+        )
     except Exception as e:
         logging.error(f"[fullsync] Failed to set Kitsu server URL: {e}")
         raise
@@ -178,7 +194,9 @@ def project_full_sync(
         ayon_users_by_email = {
             user["attrib"]["email"]: user["name"] for user in ayon_users
         }
-        logging.debug(f"[fullsync] Retrieved {len(ayon_users_by_email)} AYON users")
+        logging.debug(
+            f"[fullsync] Retrieved {len(ayon_users_by_email)} AYON users"
+        )
     except Exception as e:
         logging.error(f"[fullsync] Failed to get AYON users: {e}")
         log_traceback("Error getting AYON users")
@@ -194,7 +212,13 @@ def project_full_sync(
 
     try:
         logging.debug(f"[fullsync] About to call get_tasks...")
-        tasks = get_tasks(kitsu_project_id, task_types, task_statuses, persons_by_id, ayon_users_by_email)
+        tasks = get_tasks(
+            kitsu_project_id,
+            task_types,
+            task_statuses,
+            persons_by_id,
+            ayon_users_by_email,
+        )
         logging.info(f"[fullsync] Retrieved {len(tasks)} tasks")
     except Exception as e:
         logging.error(f"[fullsync] Failed to get tasks: {e}")
@@ -265,7 +289,9 @@ def project_full_sync(
     # Chunk the entities into smaller batches (e.g., 100 entities per batch)
     batch_size = 100
     total_batches = (len(entities) + batch_size - 1) // batch_size
-    logging.info(f"[fullsync] Processing {total_batches} batches of {batch_size} entities each")
+    logging.info(
+        f"[fullsync] Processing {total_batches} batches of {batch_size} entities each"
+    )
 
     # Track progress and failures
     processed_count = 0
@@ -275,15 +301,19 @@ def project_full_sync(
         start_idx = batch_num * batch_size
         end_idx = min((batch_num + 1) * batch_size, len(entities))
         batch = entities[start_idx:end_idx]
-        
-        logging.info(f"[fullsync] Sending batch {batch_num + 1}/{total_batches} ({len(batch)} entities)")
-        
+
+        logging.info(
+            f"[fullsync] Sending batch {batch_num + 1}/{total_batches} ({len(batch)} entities)"
+        )
+
         # Log entity types in this batch for debugging
         entity_types = {}
         for entity in batch:
             entity_type = entity.get("type", "unknown")
             entity_types[entity_type] = entity_types.get(entity_type, 0) + 1
-        logging.debug(f"[fullsync] Batch {batch_num + 1} contains: {entity_types}")
+        logging.debug(
+            f"[fullsync] Batch {batch_num + 1} contains: {entity_types}"
+        )
 
         try:
             response = ayon_api.post(
@@ -293,34 +323,45 @@ def project_full_sync(
             )
             response.raise_for_status()
             processed_count += len(batch)
-            logging.info(f"[fullsync] Batch {batch_num + 1} processed successfully")
+            logging.info(
+                f"[fullsync] Batch {batch_num + 1} processed successfully"
+            )
         except Exception as e:
             logging.error(
                 f"[fullsync] Failed to push batch {batch_num + 1} for project {project_name}: {e}"
             )
             logging.error(f"[fullsync] Failed batch contained: {entity_types}")
             # Log first few entity IDs for debugging
-            entity_ids = [f"{ent.get('type', '?')}:{ent.get('id', '?')[:8]}" for ent in batch[:5]]
-            logging.error(f"[fullsync] First entities in failed batch: {entity_ids}")
-            log_traceback(f"Error pushing batch {batch_num + 1} for {project_name}")
-            
+            entity_ids = [
+                f"{ent.get('type', '?')}:{ent.get('id', '?')[:8]}"
+                for ent in batch[:5]
+            ]
+            logging.error(
+                f"[fullsync] First entities in failed batch: {entity_ids}"
+            )
+            log_traceback(
+                f"Error pushing batch {batch_num + 1} for {project_name}"
+            )
+
             # Immediately try processing individually instead of batch retry
-            logging.warning(f"[fullsync] Processing batch {batch_num + 1} entities individually to isolate problem...")
+            logging.warning(
+                f"[fullsync] Processing batch {batch_num + 1} entities individually to isolate problem..."
+            )
             individual_success = 0
             individual_failed = 0
-            
+
             for idx, entity in enumerate(batch):
                 entity_type = "unknown"
                 entity_id = "unknown"
                 entity_name = "unknown"
-                
+
                 try:
                     entity_type = entity.get("type", "unknown")
                     entity_id = entity.get("id", "unknown")
                     entity_data = entity.get("data")
                     if entity_data and isinstance(entity_data, dict):
                         entity_name = entity_data.get("name", "unknown")
-                    
+
                     response = ayon_api.post(
                         f"{parent.entrypoint}/push",
                         project_name=project_name,
@@ -328,12 +369,16 @@ def project_full_sync(
                     )
                     response.raise_for_status()
                     individual_success += 1
-                    
+
                     if idx == 0:
-                        logging.info(f"[fullsync] Individual entity processing working...")
+                        logging.info(
+                            f"[fullsync] Individual entity processing working..."
+                        )
                     elif (idx + 1) % 10 == 0:
-                        logging.info(f"[fullsync] Processed {idx + 1}/{len(batch)} entities individually ({individual_success} success, {individual_failed} failed)")
-                        
+                        logging.info(
+                            f"[fullsync] Processed {idx + 1}/{len(batch)} entities individually ({individual_success} success, {individual_failed} failed)"
+                        )
+
                 except Exception as entity_error:
                     individual_failed += 1
                     logging.error(
@@ -341,7 +386,7 @@ def project_full_sync(
                     )
                     logging.error(f"[fullsync] Error: {entity_error}")
                     logging.debug(f"[fullsync] Entity data: {entity}")
-            
+
             processed_count += individual_success
             logging.info(
                 f"[fullsync] Batch {batch_num + 1} individual processing complete: "
