@@ -35,7 +35,7 @@ run:
 	poetry run python -m processor
 
 build:
-	docker build --build-arg -t $(IMAGE) -t $(IMAGE_LATEST) -f Dockerfile .
+	docker build -t $(IMAGE) -t $(IMAGE_LATEST) -f Dockerfile .
 
 clean:
 	docker rmi $(IMAGE)

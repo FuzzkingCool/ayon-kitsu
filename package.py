@@ -5,7 +5,7 @@ version = "1.2.6-dev.40"
 client_dir = "ayon_kitsu"
 
 services = {
-    "processor": {"image": f"fuzzkingcool/ayon-kitsu-processor:{version}"},
+    "processor": {"image": f"ghcr.io/fuzzkingcool/ayon-kitsu-processor:{version}"},
 }
 
 ayon_required_addons = {
