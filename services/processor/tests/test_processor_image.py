@@ -91,17 +91,7 @@ def run_container(image_name, env_vars):
     # Add environment variables
     for key, value in env_vars.items():
         cmd.extend(["--env", f"{key}={value}"])
-
-    # Add required AYON variables if not in .env
-    required_vars = {
-        "AYON_ADDON_NAME": "kitsu",
-        "AYON_SERVICE_NAME": "processor",
-    }
-
-    for key, default_value in required_vars.items():
-        if key not in env_vars:
-            cmd.extend(["--env", f"{key}={default_value}"])
-
+ 
     # Add image and command
     cmd.append(image_name)
     cmd.extend(["python", "-m", "processor"])

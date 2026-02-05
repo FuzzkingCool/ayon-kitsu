@@ -1,4 +1,4 @@
-# In order for this Dockerfile to work it needs to be built from the `services` directory
+# Build context must be services/processor/ directory
 FROM python:3.11-alpine3.18
 ENV PYTHONUNBUFFERED=1
 
