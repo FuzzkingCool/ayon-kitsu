@@ -95,11 +95,13 @@ async def handle_task_status_change(addon, event):
         if not isinstance(raw_task_types, list):
             raw_task_types = [raw_task_types] if raw_task_types else []
 
+        # Status shortnames: compare case-insensitively (uppercase)
         configured_statuses = [
-            str(s).upper() for s in raw_statuses if str(s).strip()
+            str(s).strip().upper() for s in raw_statuses if str(s).strip()
         ]
+        # Task type names: compare case-insensitively (lowercase)
         configured_task_types = [
-            str(t).lower() for t in raw_task_types if str(t).strip()
+            str(t).strip().lower() for t in raw_task_types if str(t).strip()
         ]
 
         logging.debug(
@@ -116,7 +118,9 @@ async def handle_task_status_change(addon, event):
             return
 
         task_id = event.summary.get("entityId")
-        new_status = event.payload.get("newValue")
+        # Normalize status from event for case-insensitive comparison
+        new_status_raw = event.payload.get("newValue")
+        new_status = str(new_status_raw).strip() if new_status_raw is not None else None
         old_status = event.payload.get("oldValue")
 
         # For updated events, check if it's a status update
@@ -167,8 +171,9 @@ async def handle_task_status_change(addon, event):
             )
             return
 
-        # Check if this status change should trigger bubble-up
-        if str(new_status).upper() not in configured_statuses:
+        # Check if this status change should trigger bubble-up (status: uppercase compare)
+        new_status_upper = (new_status or "").upper()
+        if new_status_upper not in configured_statuses:
             logging.debug(
                 f"[{bundle_name}] [ayon-kitsu] Status '{new_status}' not in configured statuses {configured_statuses}, skipping"
             )
@@ -181,9 +186,11 @@ async def handle_task_status_change(addon, event):
             )
             return
 
+        # Task type from entity: lowercase for case-insensitive match with settings
         task_type = (
-            task_entity.get("taskType", {}).get("name", "Unknown").lower()
+            (task_entity.get("taskType") or {}).get("name") or "unknown"
         )
+        task_type = str(task_type).strip().lower()
 
         # Get the product and task information
         task_name = task_entity.get("name", "Unknown")

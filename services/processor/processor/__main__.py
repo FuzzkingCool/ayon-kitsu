@@ -14,7 +14,7 @@ def _bootstrap():
     _log("=== CONTAINER STARTING ===")
     _log(f"Python version: {sys.version}")
     _log(f"Python executable: {sys.executable}")
-    
+
     # Log ALL environment variables for debugging
     _log("Environment variables:")
     for key in sorted(os.environ.keys()):
@@ -23,7 +23,7 @@ def _bootstrap():
         else:
             value = os.environ[key]
         _log(f"  {key}={value}")
-    
+
     # Check critical environment variables
     _log("Checking critical environment variables...")
     critical_vars = {
@@ -33,10 +33,10 @@ def _bootstrap():
         "AYON_ADDON_VERSION": os.environ.get("AYON_ADDON_VERSION"),
         "AYON_SERVICE_NAME": os.environ.get("AYON_SERVICE_NAME"),
     }
-    
+
     for key, value in critical_vars.items():
         _log(f"  {key}: {value}")
-    
+
     # Fail fast if required env missing so logs are visible
     missing = [
         k for k in ("AYON_SERVER_URL", "AYON_API_KEY")
@@ -46,7 +46,7 @@ def _bootstrap():
         _log(f"ERROR: Missing required environment variables: {', '.join(missing)}")
         _log("Container will exit with code 1")
         sys.exit(1)
-    
+
     _log("All required environment variables present")
 
 
