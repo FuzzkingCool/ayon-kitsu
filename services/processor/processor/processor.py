@@ -9,8 +9,8 @@ import gazu
 from nxtools import log_traceback, logging
 
 from . import utils as processor_utils
+from .ayon_event_loop import run_ayon_event_loop
 from .fullsync import project_full_sync
-from .comment_update import process_comment_update_request
 from .update_from_kitsu import (
     create_or_update_asset,
     create_or_update_concept,
@@ -278,6 +278,19 @@ class KitsuProcessor:
         self.gazu_listener_thread.start()
         logging.info(
             f"Kitsu event listener thread started (alive: {self.gazu_listener_thread.is_alive()})"
+        )
+
+        # ============= AYON event enrollment thread ==============
+        logging.info("Step 9: Starting AYON event loop thread...")
+        self.ayon_event_thread = threading.Thread(
+            target=run_ayon_event_loop,
+            args=(self,),
+            name="AyonEventLoop",
+            daemon=False,
+        )
+        self.ayon_event_thread.start()
+        logging.info(
+            f"AYON event loop thread started (alive: {self.ayon_event_thread.is_alive()})"
         )
 
         logging.info("=" * 60)
@@ -616,6 +629,10 @@ class KitsuProcessor:
         logging.info("=" * 60)
         logging.info("START PROCESSING LOOP")
         logging.info("=" * 60)
+        logging.info(
+            "Main loop: sync only (kitsu.sync_request). "
+            "AYON event thread handles kitsu.comment_update_request."
+        )
         startup = True
         loop_count = 0
         last_status_log = time.time()
@@ -627,7 +644,8 @@ class KitsuProcessor:
             current_time = time.time()
             if current_time - last_status_log >= 60:
                 logging.info(
-                    f"Status: Loop iteration {loop_count}, thread alive: {self.gazu_listener_thread.is_alive()}"
+                    f"Status: Loop {loop_count}, gazu_thread={self.gazu_listener_thread.is_alive()}, "
+                    f"ayon_event_thread={self.ayon_event_thread.is_alive()}"
                 )
                 last_status_log = current_time
 
@@ -638,6 +656,12 @@ class KitsuProcessor:
                     "The processor will no longer receive Kitsu events."
                 )
                 raise RuntimeError("Kitsu event listener thread died")
+            if not self.ayon_event_thread.is_alive():
+                logging.error(
+                    "FATAL: AYON event loop thread has died! "
+                    "Comment updates and other AYON events will not be processed."
+                )
+                raise RuntimeError("AYON event loop thread died")
 
             # Sync all paired projects
             if startup:
@@ -665,46 +689,7 @@ class KitsuProcessor:
                 finally:
                     startup = False
 
-            # Check for comment update job first (uniqueSprites bubble-up)
-            job = ayon_api.enroll_event_job(
-                source_topic="kitsu.comment_update_request",
-                target_topic="addon.kitsu.processor.comment_update",
-                sender=SENDER,
-                description="Update Kitsu comment with uniqueSprites",
-                max_retries=2,
-            )
-            if job:
-                src_ev = ayon_api.get_event(job["dependsOn"])
-                project_name = src_ev.get("project") or ""
-                ayon_api.update_event(
-                    job["id"],
-                    sender=SENDER,
-                    status="in_progress",
-                    project_name=project_name,
-                    description="Updating Kitsu comment...",
-                )
-                try:
-                    process_comment_update_request(self, src_ev)
-                except Exception:
-                    log_traceback("Comment update error")
-                    ayon_api.update_event(
-                        job["id"],
-                        sender=SENDER,
-                        status="failed",
-                        project_name=project_name,
-                        description="Comment update failed",
-                    )
-                else:
-                    ayon_api.update_event(
-                        job["id"],
-                        sender=SENDER,
-                        status="finished",
-                        project_name=project_name,
-                        description="Kitsu comment updated",
-                    )
-                continue
-
-            # Check for sync job
+            # Enroll for sync job only (comment_update runs in AYON event thread)
             job = ayon_api.enroll_event_job(
                 source_topic="kitsu.sync_request",
                 target_topic="kitsu.sync",

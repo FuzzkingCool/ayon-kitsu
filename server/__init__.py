@@ -53,6 +53,9 @@ class KitsuAddon(BaseServerAddon):
         self.add_endpoint("/processor/status", self.processor_status, method="GET")
         self.add_endpoint("/event-handler/status", self.event_handler_status, method="GET")
 
+        from .event_subscribe import register_event_subscriptions
+        register_event_subscriptions(self)
+
     async def setup(self):
         """Called during addon initialization."""
         addon_version = getattr(self, 'version', 'unknown')
