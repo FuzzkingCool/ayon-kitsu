@@ -24,4 +24,4 @@ dist/
 # vs code
 .vscode/
 .history/
- ayon-kitsu.code-workspace
+*.code-workspace
