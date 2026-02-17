@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 Process kitsu.comment_update_request events: add Kitsu task comment with
-uniqueSprites and bubble up uniqueSprites to the parent Kitsu entity (asset/shot).
+uniqueSprites and bubble up uniqueSprites to the parent Kitsu entity (Assets only).
 Runs in the processor service; uses thread-local Kitsu host from processor.
 """
 
@@ -25,7 +25,7 @@ def process_comment_update_request(
 
     - Resolve Kitsu task and status (new_status from event, case-insensitive).
     - Render comment with template and add to Kitsu task.
-    - Update parent entity (asset/shot) data.uniqueSprites with the value.
+    - Update parent entity (Asset only) data.uniqueSprites with the value.
     """
     processor_utils.set_kitsu_host(processor.kitsu_server_url)
     summary = src_event.get("summary") or {}
@@ -94,7 +94,7 @@ def process_comment_update_request(
         logging.error(f"[comment_update] Failed to add comment to task {kitsu_task_id}: {e}")
         return
 
-    # Bubble up uniqueSprites to parent Kitsu entity (asset/shot)
+    # Bubble up uniqueSprites to parent Kitsu entity (Assets only; Shots are skipped)
     entity_id = task.get("entity_id")
     if not entity_id:
         logging.debug("[comment_update] Task has no entity_id, skipping entity data update")
@@ -104,11 +104,17 @@ def process_comment_update_request(
     except Exception as e:
         logging.warning(f"[comment_update] Could not get parent entity {entity_id}: {e}")
         return
-    data = entity.get("data") or {}
-    data["uniqueSprites"] = str(unique_sprites)
-    entity["data"] = data
+    entity_type_id = entity.get("entity_type_id")
+    if entity_type_id:
+        entity_type = gazu.entity.get_entity_type(entity_type_id)
+        type_name = (entity_type or {}).get("name", "")
+    else:
+        type_name = ""
+    if type_name == "Shot":
+        logging.debug("[comment_update] uniqueSprites is for Assets only, skipping Shot entity")
+        return
     try:
-        gazu.asset.update_asset(entity)
+        gazu.asset.update_asset_data(entity, {"uniqueSprites": str(unique_sprites)})
         logging.info(
             f"[comment_update] Updated parent entity {entity_id} data.uniqueSprites={unique_sprites}"
         )

@@ -94,6 +94,29 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
         )
         return None
 
+    def _persist_unique_sprites_to_version(self, context, instance, unique_sprites):
+        """Write uniqueSprites to the AYON version entity so status-change handler can read it."""
+        import ayon_api
+
+        project_name = context.data.get("projectName")
+        version_entity = instance.data.get("versionEntity")
+        if not project_name or not version_entity:
+            return
+        version_id = version_entity.get("id")
+        if not version_id:
+            return
+        try:
+            data = dict(version_entity.get("data") or {})
+            data["uniqueSprites"] = str(unique_sprites)
+            ayon_api.update_version(project_name, version_id, data=data)
+            self.log.debug(
+                f"[KitsuComment] Persisted uniqueSprites={unique_sprites} to version {version_id}"
+            )
+        except Exception as e:
+            self.log.warning(
+                f"[KitsuComment] Failed to persist uniqueSprites to version: {e}"
+            )
+
     def format_publish_comment(self, instance):
         """Format the instance's publish comment
 
@@ -251,6 +274,8 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                         f"[{bundle_name}] [KitsuComment] Using uniqueSprites={unique_sprites} "
                         f"(source: {source_used}) for {product_name}"
                     )
+                    # Persist to AYON version so status-change handler can bubble up to Kitsu
+                    self._persist_unique_sprites_to_version(context, instance, unique_sprites)
                 else:
                     # Log detailed debug info about what data is available
                     product_type = instance.data.get("productType", "")
