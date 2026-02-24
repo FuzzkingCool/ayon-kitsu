@@ -32,13 +32,13 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
 
     def _get_unique_sprites(self, instance):
         """Get uniqueSprites with standardized priority and debug logging.
-        
+
         Priority order for renderlayer/review instances:
         1. maxUniqueSprites from versionData (aggregated from productGroup)
         2. uniqueSprites from instance data
         3. uniqueSprites from versionData
         4. uniqueSprites from versionEntity
-        
+
         This ensures review instances from productGroups get the max value.
         """
         bundle_name = os.getenv("AYON_BUNDLE_NAME", "Unknown")
@@ -268,7 +268,12 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
 
                 # Get uniqueSprites using standardized helper function
                 unique_sprites = self._get_unique_sprites(instance)
-                if unique_sprites is not None:
+                # Treat 0 as "counting was skipped" - omit from comment and revision note
+                has_unique_sprites = unique_sprites is not None and unique_sprites not in (
+                    0,
+                    "0",
+                )
+                if has_unique_sprites:
                     source_used = instance.data.get("_uniqueSpritesSource", "unknown")
                     self.log.info(
                         f"[{bundle_name}] [KitsuComment] Using uniqueSprites={unique_sprites} "
@@ -302,8 +307,8 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     f"template enabled={self.custom_comment_template.get('enabled', False)}"
                 )
                 if self.custom_comment_template["enabled"]:
-                    # Add uniqueSprites to instance.data for template rendering
-                    if unique_sprites is not None:
+                    # Add uniqueSprites to instance.data for template rendering (omit when 0)
+                    if has_unique_sprites:
                         instance.data["uniqueSprites"] = str(unique_sprites)
                     publish_comment = self.format_publish_comment(instance)
                     self.log.debug(
@@ -317,7 +322,7 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                         "family": instance.data.get("family", "render"),
                         "name": product_name,
                     }
-                    if unique_sprites is not None:
+                    if has_unique_sprites:
                         data_map["uniqueSprites"] = str(unique_sprites)
                     self.log.debug(
                         f"[KitsuComment] Using fallback format for {product_name}"
@@ -343,7 +348,7 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                         f"{comment_preview}"
                     )
                     # Check if uniqueSprites is in the comment
-                    if unique_sprites is not None:
+                    if has_unique_sprites:
                         if (
                             "uniqueSprites" in publish_comment
                             or "unique_sprites" in publish_comment
