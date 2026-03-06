@@ -9,6 +9,7 @@ from qtpy import QtCore, QtGui, QtWidgets
 from ayon_kitsu.credentials import (
     clear_credentials,
     load_credentials,
+    normalize_kitsu_host,
     save_credentials,
     validate_credentials,
 )
@@ -148,6 +149,7 @@ class KitsuPasswordDialog(QtWidgets.QDialog):
         self.finished.emit(self.result())
 
     def _on_ok_click(self):
+        self._message_label.setText("")
         # Check if is connectable
         if not self._connectable:
             self._message_label.setText(
@@ -164,7 +166,7 @@ class KitsuPasswordDialog(QtWidgets.QDialog):
         if validate_credentials(login_value, pwd_value, kitsu_url=self._server_url):
             os.environ["KITSU_LOGIN"] = login_value
             os.environ["KITSU_PWD"] = pwd_value
-            os.environ["KITSU_SERVER"] = self._server_url
+            os.environ["KITSU_SERVER"] = normalize_kitsu_host(self._server_url)
         else:
             self._message_label.setText("Authentication failed...")
             return

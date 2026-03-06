@@ -7,6 +7,16 @@ import gazu
 from ayon_core.lib import AYONSecureRegistry, emit_event
 
 
+def normalize_kitsu_host(url: str) -> str:
+    """Ensure host URL ends with /api for gazu (e.g. https://studio.example.com/api)."""
+    url = (url or "").strip().rstrip("/")
+    if not url:
+        return url
+    if not url.endswith("/api"):
+        url = f"{url}/api"
+    return url
+
+
 def validate_credentials(
     login: str,
     password: str,
@@ -28,7 +38,7 @@ def validate_credentials(
         if kitsu_url is None:
             raise ValueError("KITSU_SERVER environment variable is not set")
 
-    # Connect to server
+    kitsu_url = normalize_kitsu_host(kitsu_url)
     validate_host(kitsu_url)
 
     # Authenticate
@@ -48,26 +58,35 @@ def validate_host(kitsu_url: str) -> bool:
     """Validate credentials by trying to connect to Kitsu host URL.
 
     Args:
-        kitsu_url (str, optional): Kitsu host URL.
+        kitsu_url (str): Kitsu host URL (with or without /api; normalized internally).
 
     Returns:
         bool: Is host valid?
 
     Raises:
         gazu.exception.HostException: If host is unreachable or invalid.
-            On macOS, common causes: SSL cert verification (CERTIFICATE_VERIFY_FAILED),
-            proxy/DNS, or HEAD to base URL returning non-200. Check the __cause__
-            on the exception for the underlying error.
     """
+    kitsu_url = normalize_kitsu_host(kitsu_url)
     gazu.set_host(kitsu_url)
+    client = gazu.client.default_client
+    # Run reachability check ourselves so we can raise with the real cause;
+    # gazu.client.host_is_valid() returns False on failure and hides the exception.
     try:
-        if gazu.client.host_is_valid():
-            return True
+        response = client.session.head(kitsu_url, timeout=15)
+        if response.status_code != 200:
+            raise gazu.exception.HostException(
+                f"Host '{kitsu_url}' returned HTTP {response.status_code} (expected 200)."
+            )
+    except gazu.exception.HostException:
+        raise
     except Exception as e:
         raise gazu.exception.HostException(
-            f"Host '{kitsu_url}' is invalid: {e!s}"
+            f"Host '{kitsu_url}' unreachable: {e!s}"
         ) from e
-    raise gazu.exception.HostException(f"Host '{kitsu_url}' is invalid.")
+    # HEAD 200 is sufficient. gazu.client.host_is_valid() also POSTs auth/login with
+    # empty email; some Kitsu setups return a response that gazu doesn't treat as
+    # "valid host", causing false "API validation failed" on macOS and elsewhere.
+    return True
 
 
 def clear_credentials():
