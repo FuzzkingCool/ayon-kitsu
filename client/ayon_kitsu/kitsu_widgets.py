@@ -160,8 +160,8 @@ class KitsuPasswordDialog(QtWidgets.QDialog):
         pwd_value = self._password_input.text()
         remember = self._remember_checkbox.isChecked()
 
-        # Authenticate
-        if validate_credentials(login_value, pwd_value):
+        # Authenticate (pass server URL from dialog, not env)
+        if validate_credentials(login_value, pwd_value, kitsu_url=self._server_url):
             os.environ["KITSU_LOGIN"] = login_value
             os.environ["KITSU_PWD"] = pwd_value
             os.environ["KITSU_SERVER"] = self._server_url

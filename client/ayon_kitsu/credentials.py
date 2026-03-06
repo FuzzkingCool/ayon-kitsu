@@ -52,15 +52,22 @@ def validate_host(kitsu_url: str) -> bool:
 
     Returns:
         bool: Is host valid?
-    """
-    # Connect to server
-    gazu.set_host(kitsu_url)
 
-    # Test host
-    if gazu.client.host_is_valid():
-        return True
-    else:
-        raise gazu.exception.HostException(f"Host '{kitsu_url}' is invalid.")
+    Raises:
+        gazu.exception.HostException: If host is unreachable or invalid.
+            On macOS, common causes: SSL cert verification (CERTIFICATE_VERIFY_FAILED),
+            proxy/DNS, or HEAD to base URL returning non-200. Check the __cause__
+            on the exception for the underlying error.
+    """
+    gazu.set_host(kitsu_url)
+    try:
+        if gazu.client.host_is_valid():
+            return True
+    except Exception as e:
+        raise gazu.exception.HostException(
+            f"Host '{kitsu_url}' is invalid: {e!s}"
+        ) from e
+    raise gazu.exception.HostException(f"Host '{kitsu_url}' is invalid.")
 
 
 def clear_credentials():
