@@ -153,9 +153,11 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
             ]
 
         # Detect grouped vs single review per Kitsu task
-        # Group instances that are review+kitsu by task id
+        # Group instances that are review+kitsu by task id (skip merged-away instances)
         by_task = {}
         for instance in context:
+            if instance.data.get("kitsuMergedInto"):
+                continue
             families = set(
                 [instance.data["family"]] + instance.data.get("families", [])
             )
@@ -243,10 +245,8 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     )
 
             # Get comment text body
-            # Create individual comments for each instance to link AYON Version to Kitsu Revision
             from ayon_kitsu.utils import render_kitsu_comment
 
-            # get the current user
             current_user = gazu.client.get_current_user()
 
             self.log.debug(f"Using note_status ID for comment: {note_status}")
@@ -254,112 +254,126 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
             self.log.debug(f"kitsu_status: {kitsu_status}")
             self.log.debug(f"current_user: {current_user}")
 
-                # Create individual comment for each instance
+            # One comment per task when multiple review instances share the task
+            if is_grouped:
+                product_names = [inst.data.get("productName", "Untitled") for inst in instances]
+                first_instance = instances[0]
+                first_version = first_instance.data.get("version", 1)
+                kitsu_only_group = any(inst.data.get("kitsuOnlyReview", False) for inst in instances)
+                combined_unique_sprites = None
+                if not kitsu_only_group:
+                    for instance in instances:
+                        unique_sprites = self._get_unique_sprites(instance)
+                        if unique_sprites is not None and unique_sprites not in (0, "0"):
+                            self._persist_unique_sprites_to_version(context, instance, unique_sprites)
+                            combined_unique_sprites = unique_sprites
+                combined_name = ", ".join(product_names)
+                data_map = {
+                    "comment": first_instance.data.get("comment", ""),
+                    "version": first_version,
+                    "family": first_instance.data.get("family", "review"),
+                    "name": combined_name,
+                }
+                if combined_unique_sprites is not None:
+                    data_map["uniqueSprites"] = str(combined_unique_sprites)
+                publish_comment = render_kitsu_comment(
+                    self.custom_comment_template, data_map
+                )
+                if not publish_comment:
+                    publish_comment = f"Review: {combined_name}"
+                try:
+                    kitsu_comment = gazu.task.add_comment(
+                        kitsu_task,
+                        note_status,
+                        comment=publish_comment,
+                        person=current_user,
+                    )
+                    comment_id = kitsu_comment.get("id") if isinstance(kitsu_comment, dict) else None
+                    for instance in instances:
+                        instance.data["kitsuComment"] = kitsu_comment
+                        instance.data["kitsuGroupedReviewProcessed"] = True
+                    self.log.debug(
+                        f"[{bundle_name}] [KitsuComment] Created single comment (id={comment_id}) "
+                        f"for task, {len(instances)} instance(s): {combined_name}"
+                    )
+                except Exception as e:
+                    self.log.error(
+                        f"[KitsuComment] Error adding grouped comment to Kitsu task: {e}"
+                    )
+                    self.log.error(traceback.format_exc())
+                continue
+
+            # Create individual comment for each instance
             for instance in instances:
-                # Get version for this specific instance
                 version = instance.data.get("version", 1)
                 product_name = instance.data.get("productName", "Untitled")
                 user_comment = instance.data.get("comment", "")
+                kitsu_only = instance.data.get("kitsuOnlyReview", False)
 
                 self.log.debug(
                     f"[{bundle_name}] [KitsuComment] Processing instance: {product_name}, version {version}, "
                     f"task_id={kitsu_task.get('id')}"
                 )
 
-                # Get uniqueSprites using standardized helper function
-                unique_sprites = self._get_unique_sprites(instance)
-                # Treat 0 as "counting was skipped" - omit from comment and revision note
-                has_unique_sprites = unique_sprites is not None and unique_sprites not in (
-                    0,
-                    "0",
-                )
-                if has_unique_sprites:
-                    source_used = instance.data.get("_uniqueSpritesSource", "unknown")
-                    self.log.info(
-                        f"[{bundle_name}] [KitsuComment] Using uniqueSprites={unique_sprites} "
-                        f"(source: {source_used}) for {product_name}"
-                    )
-                    # Persist to AYON version so status-change handler can bubble up to Kitsu
-                    self._persist_unique_sprites_to_version(context, instance, unique_sprites)
-                else:
-                    # Log detailed debug info about what data is available
-                    product_type = instance.data.get("productType", "")
-                    version_data = instance.data.get("versionData", {})
-                    self.log.warning(
-                        f"[{bundle_name}] [KitsuComment] No uniqueSprites found for {product_name} "
-                        f"(productType={product_type}). "
-                        f"Available versionData keys: {list(version_data.keys())}"
-                    )
-                    # Check if this is a review instance that should have gotten maxUniqueSprites
-                    if product_type == "review" or "review" in instance.data.get("families", []):
-                        product_group = instance.data.get("productGroup")
-                        self.log.warning(
-                            f"[{bundle_name}] [KitsuComment] Review instance {product_name} "
-                            f"missing uniqueSprites. productGroup={product_group}. "
-                            f"Check if AggregateRenderlayerSprites ran and if renderlayers "
-                            f"have uniqueSprites set."
-                        )
-                    source_used = None
-
-                # Build comment using template
-                self.log.debug(
-                    f"[KitsuComment] Building comment for {product_name}, "
-                    f"template enabled={self.custom_comment_template.get('enabled', False)}"
-                )
-                if self.custom_comment_template["enabled"]:
-                    # Add uniqueSprites to instance.data for template rendering (omit when 0)
-                    if has_unique_sprites:
-                        instance.data["uniqueSprites"] = str(unique_sprites)
-                    publish_comment = self.format_publish_comment(instance)
-                    self.log.debug(
-                        f"[KitsuComment] Generated comment using custom template for {product_name}"
-                    )
-                else:
-                    # Use simple format
+                if kitsu_only:
+                    # Kitsu-only review: no uniqueSprites, simple comment only (no template/key warnings)
                     data_map = {
                         "comment": user_comment,
                         "version": version,
-                        "family": instance.data.get("family", "render"),
+                        "family": instance.data.get("family", "review"),
                         "name": product_name,
                     }
-                    if has_unique_sprites:
-                        data_map["uniqueSprites"] = str(unique_sprites)
-                    self.log.debug(
-                        f"[KitsuComment] Using fallback format for {product_name}"
-                    )
                     publish_comment = render_kitsu_comment(
                         self.custom_comment_template, data_map
                     )
-
-                if not publish_comment:
-                    self.log.warning(
-                        f"[KitsuComment] Comment is not set for {product_name}, skipping"
-                    )
-                    continue
+                    if not publish_comment:
+                        publish_comment = f"Review: {product_name}"
+                    unique_sprites = None
                 else:
-                    # Log comment preview (first 200 chars to avoid huge logs)
-                    comment_preview = (
-                        publish_comment[:200] + "..."
-                        if len(publish_comment) > 200
-                        else publish_comment
-                    )
-                    self.log.debug(
-                        f"[KitsuComment] Generated comment for {product_name} (length={len(publish_comment)}): "
-                        f"{comment_preview}"
-                    )
-                    # Check if uniqueSprites is in the comment
+                    # Harmony-style: get uniqueSprites and optional template
+                    unique_sprites = self._get_unique_sprites(instance)
+                    has_unique_sprites = unique_sprites is not None and unique_sprites not in (0, "0")
                     if has_unique_sprites:
-                        if (
-                            "uniqueSprites" in publish_comment
-                            or "unique_sprites" in publish_comment
-                        ):
-                            self.log.debug(
-                                f"[KitsuComment] Confirmed uniqueSprites={unique_sprites} is included in comment for {product_name}"
-                            )
-                        else:
+                        self._persist_unique_sprites_to_version(context, instance, unique_sprites)
+                        if self.custom_comment_template["enabled"]:
+                            instance.data["uniqueSprites"] = str(unique_sprites)
+                    else:
+                        product_type = instance.data.get("productType", "")
+                        version_data = instance.data.get("versionData", {})
+                        self.log.warning(
+                            f"[{bundle_name}] [KitsuComment] No uniqueSprites found for {product_name} "
+                            f"(productType={product_type}). "
+                            f"Available versionData keys: {list(version_data.keys())}"
+                        )
+                        if product_type == "review" or "review" in instance.data.get("families", []):
+                            product_group = instance.data.get("productGroup")
                             self.log.warning(
-                                f"[KitsuComment] uniqueSprites={unique_sprites} may not be included in comment for {product_name}"
+                                f"[{bundle_name}] [KitsuComment] Review instance {product_name} "
+                                f"missing uniqueSprites. productGroup={product_group}. "
+                                f"Check if AggregateRenderlayerSprites ran and if renderlayers "
+                                f"have uniqueSprites set."
                             )
+
+                    if self.custom_comment_template["enabled"]:
+                        publish_comment = self.format_publish_comment(instance)
+                    else:
+                        data_map = {
+                            "comment": user_comment,
+                            "version": version,
+                            "family": instance.data.get("family", "render"),
+                            "name": product_name,
+                        }
+                        if has_unique_sprites:
+                            data_map["uniqueSprites"] = str(unique_sprites)
+                        publish_comment = render_kitsu_comment(
+                            self.custom_comment_template, data_map
+                        )
+
+                    if not publish_comment:
+                        self.log.warning(
+                            f"[KitsuComment] Comment is not set for {product_name}, skipping"
+                        )
+                        continue
 
                 # Add individual comment to kitsu task for this instance
                 self.log.debug(

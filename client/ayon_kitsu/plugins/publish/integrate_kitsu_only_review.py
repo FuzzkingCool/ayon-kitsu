@@ -29,23 +29,25 @@ class IntegrateKitsuOnlyReview(KitsuPublishInstancePlugin):
     def process(self, instance):
         """Process the review instance for Kitsu-only submission."""
 
-        # Skip if this instance is being processed by grouped review plugin
-        if instance.data.get("kitsuGroupedReviewProcessed"):
+        if instance.data.get("kitsuMergedInto"):
             self.log.debug(
-                f"Instance {instance.data.get('productName')} "
-                "already processed by grouped review plugin, skipping"
+                f"Instance {instance.data.get('productName')} was merged into another, skipping"
             )
             return
 
-        # Also skip if this instance has the "review" family 
-        # (should be handled by grouped plugin)
+        # When kitsuGroupedReviewProcessed is set, a single comment was created
+        # for the task; we still run to upload this instance's previews to it.
+
+        # Skip "review" + "kitsu" only when NOT kitsuOnlyReview (e.g. Harmony
+        # render+review uses IntegrateKitsuReview with published_path).
         families = instance.data.get("families", [])
         if "review" in families and "kitsu" in families:
-            self.log.debug(
-                f"Instance {instance.data.get('productName')} "
-                "has review family, will be handled by grouped plugin, skipping"
-            )
-            return
+            if not instance.data.get("kitsuOnlyReview", False):
+                self.log.debug(
+                    f"Instance {instance.data.get('productName')} "
+                    "has review family, will be handled by IntegrateKitsuReview, skipping"
+                )
+                return
 
         # Skip if this is a render instance that has been converted to review
         if (
@@ -108,111 +110,103 @@ class IntegrateKitsuOnlyReview(KitsuPublishInstancePlugin):
                 self.log.error(f"Failed to create fallback comment: {exc}")
                 # Continue without comment if comment creation fails
 
-        # Upload review as preview (main review file)
+        # Upload review as preview (main + additional files)
         try:
-            # Get version number (default to 1 for reviews)
             version = instance.data.get("version", 1)
 
+            # Prefer explicit list from creator; fallback to representations
+            review_file_paths = instance.data.get("reviewFilePaths") or []
+            if not review_file_paths:
+                representations = instance.data.get("representations", [])
+                if not representations and getattr(instance, "transient_data", None):
+                    representations = instance.transient_data.get("representations", [])
+                for representation in representations:
+                    if "kitsureview" not in representation.get("tags", []):
+                        continue
+                    staging_dir = representation.get("stagingDir") or representation.get("staging_dir") or ""
+                    if not staging_dir:
+                        continue
+                    repr_files = representation.get("files")
+                    if isinstance(repr_files, str):
+                        repr_files = [repr_files]
+                    for repr_file in repr_files or []:
+                        if repr_file:
+                            review_file_paths.append(os.path.normpath(os.path.join(staging_dir, repr_file)))
+
+            # Dedupe while preserving order; ensure main review file is first if set
+            seen = set()
+            ordered_paths = []
+            if review_file and os.path.exists(review_file):
+                rn = os.path.normpath(review_file)
+                if rn not in seen:
+                    seen.add(rn)
+                    ordered_paths.append(rn)
+            for p in review_file_paths:
+                pn = os.path.normpath(p)
+                if pn not in seen and os.path.exists(pn):
+                    seen.add(pn)
+                    ordered_paths.append(pn)
+            if not ordered_paths:
+                self.log.error("No review files found to upload")
+                raise ValueError("No review files found to upload")
+
+            main_path = ordered_paths[0]
             if comment_id:
-                # Add main review preview to the comment
                 preview = gazu.task.add_preview(
                     task=task_id,
                     comment=comment_id,
-                    preview_file_path=review_file,
+                    preview_file_path=main_path,
                     normalize_movie=False,
                     revision=version,
                 )
-                self.log.info(
-                    f"Uploaded review to Kitsu with comment: {os.path.basename(review_file)}"
-                )
+                self.log.info(f"Uploaded review to Kitsu: {os.path.basename(main_path)}")
             else:
-                # Upload preview without comment
-                # Create a minimal comment first
                 comment = gazu.task.add_comment(
                     task=kitsu_task,
                     task_status=gazu.task.get_task_status_by_name("wip"),
                     comment="Review submission",
                 )
                 comment_id = comment["id"]
-
                 preview = gazu.task.add_preview(
                     task=task_id,
                     comment=comment_id,
-                    preview_file_path=review_file,
+                    preview_file_path=main_path,
                     normalize_movie=False,
                     revision=version,
                 )
-                self.log.info(
-                    f"Uploaded review to Kitsu: {os.path.basename(review_file)}"
-                )
+                self.log.info(f"Uploaded review to Kitsu: {os.path.basename(main_path)}")
 
-            # Store preview info
             instance.data["kitsuPreview"] = preview
+            uploaded_previews = []
 
-            # Upload additional representations (like screenshots/thumbnails)
-            representations = instance.data.get("representations", [])
-            for representation in representations:
-                if "kitsureview" in representation.get("tags", []):
-                    repr_files = representation.get("files")
-                    staging_dir = representation.get("stagingDir")
+            for path in ordered_paths[1:]:
+                if not os.path.exists(path):
+                    self.log.warning(f"Review file not found: {path}")
+                    continue
+                try:
+                    additional_preview = gazu.task.add_preview(
+                        task=task_id,
+                        comment=comment_id,
+                        preview_file_path=path,
+                        normalize_movie=False,
+                        revision=version,
+                    )
+                    uploaded_previews.append({
+                        "file": os.path.basename(path),
+                        "preview_id": additional_preview.get("id") if additional_preview else None,
+                        "preview_data": additional_preview,
+                    })
+                    self.log.info(f"Uploaded review item to Kitsu: {os.path.basename(path)}")
+                except Exception as exc:
+                    self.log.warning(f"Failed to upload review item {path}: {exc}")
 
-                    if isinstance(repr_files, str):
-                        repr_files = [repr_files]
-
-                    # Track uploaded previews for logging and potential future use
-                    uploaded_previews = []
-
-                    for repr_file in repr_files:
-                        repr_path = os.path.join(staging_dir, repr_file)
-                        if os.path.exists(repr_path):
-                            try:
-                                # Upload additional preview (e.g., screenshot/thumbnail)
-                                additional_preview = gazu.task.add_preview(
-                                    task=task_id,
-                                    comment=comment_id,
-                                    preview_file_path=repr_path,
-                                    normalize_movie=False,
-                                    revision=version,
-                                )
-
-                                # Store preview information for potential future use
-                                preview_info = {
-                                    "file": repr_file,
-                                    "preview_id": additional_preview.get("id")
-                                    if additional_preview
-                                    else None,
-                                    "preview_data": additional_preview,
-                                }
-                                uploaded_previews.append(preview_info)
-
-                                self.log.info(
-                                    f"Uploaded additional review item to Kitsu: {repr_file}"
-                                )
-                                if (
-                                    additional_preview
-                                    and additional_preview.get("id")
-                                ):
-                                    self.log.debug(
-                                        f"Preview ID: {additional_preview['id']}"
-                                    )
-
-                            except Exception as exc:
-                                self.log.warning(
-                                    f"Failed to upload additional review item {repr_file}: {exc}"
-                                )
-                        else:
-                            self.log.warning(
-                                f"Additional review file not found: {repr_path}"
-                            )
-
-                    # Store uploaded previews in instance data for potential future use
-                    if uploaded_previews:
-                        instance.data["uploadedKitsuPreviews"] = (
-                            uploaded_previews
-                        )
-                        self.log.info(
-                            f"Successfully uploaded {len(uploaded_previews)} additional preview(s) to Kitsu"
-                        )
+            if uploaded_previews:
+                instance.data["uploadedKitsuPreviews"] = (
+                    instance.data.get("uploadedKitsuPreviews") or []
+                ) + uploaded_previews
+            self.log.info(
+                f"Uploaded {1 + len(uploaded_previews)} item(s) to Kitsu revision"
+            )
 
         except Exception as exc:
             self.log.error(f"Failed to upload review to Kitsu: {exc}")

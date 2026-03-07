@@ -114,11 +114,10 @@ class ValidateKitsuOnlyReview(
                 "Instance must have 'kitsu' family for Kitsu integration"
             )
 
-        # Validate comment if enabled
-        if instance.data.get("enableComment", True):
+        # Validate comment if enabled (skip warning for Kitsu-only; empty comment is normal)
+        if instance.data.get("enableComment", True) and not instance.data.get("kitsuOnlyReview", False):
             comment = instance.data.get("comment", "")
             if not comment.strip():
-                # This is just a warning, not an error
                 self.log.warning(
                     "Comment is enabled but no comment text provided. A default comment will be used."
                 )

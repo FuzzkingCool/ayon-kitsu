@@ -554,6 +554,9 @@ Features:
                 "No files specified. Please drag and drop files or capture a screenshot."
             )
 
+        # Explicit list of all paths for integrate plugin (single source of truth)
+        instance_data["reviewFilePaths"] = [p.as_posix() for p in all_files]
+
         # Use the first file as the main review file for Kitsu upload
         main_review_file = all_files[0]
 
