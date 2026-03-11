@@ -27,7 +27,11 @@ def render_kitsu_comment(template_cfg: Dict[str, Any], data: Dict[str, Any]) -> 
             return "" if key not in data else str(data[key])
 
         pattern = r"\{([^}]*)\}"
-        return re.sub(pattern, replace_missing_key, template)
+        result = re.sub(pattern, replace_missing_key, template)
+        # Omit uniqueSprites line when value is 0 or empty (tab or table template format)
+        if str(data.get("uniqueSprites", "")).strip() in ("", "0"):
+            result = re.sub(r"\n[^\n]*uniqueSprites[^\n]*", "", result)
+        return result
 
     # Fallback to tab-delimited format (preserves line breaks in Kitsu)
     version = data.get("version", "")

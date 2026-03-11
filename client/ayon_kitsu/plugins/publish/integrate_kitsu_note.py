@@ -138,7 +138,11 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
 
         template = self.custom_comment_template["comment_template"]
         pattern = r"\{([^}]*)\}"
-        return re.sub(pattern, replace_missing_key, template)
+        result = re.sub(pattern, replace_missing_key, template)
+        # Omit uniqueSprites line when value is 0 or empty (tab or table template format)
+        if str(instance.data.get("uniqueSprites", "")).strip() in ("", "0"):
+            result = re.sub(r"\n[^\n]*uniqueSprites[^\n]*", "", result)
+        return result
 
     def process(self, context):
         bundle_name = os.getenv("AYON_BUNDLE_NAME", "Unknown")
@@ -264,7 +268,7 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                 if not kitsu_only_group:
                     for instance in instances:
                         unique_sprites = self._get_unique_sprites(instance)
-                        if unique_sprites is not None and unique_sprites not in (0, "0"):
+                        if unique_sprites is not None and str(unique_sprites).strip() not in ("", "0"):
                             self._persist_unique_sprites_to_version(context, instance, unique_sprites)
                             combined_unique_sprites = unique_sprites
                 combined_name = ", ".join(product_names)
@@ -274,7 +278,10 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     "family": first_instance.data.get("family", "review"),
                     "name": combined_name,
                 }
-                if combined_unique_sprites is not None:
+                if (
+                    combined_unique_sprites is not None
+                    and str(combined_unique_sprites).strip() not in ("", "0")
+                ):
                     data_map["uniqueSprites"] = str(combined_unique_sprites)
                 publish_comment = render_kitsu_comment(
                     self.custom_comment_template, data_map
@@ -332,7 +339,10 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                 else:
                     # Harmony-style: get uniqueSprites and optional template
                     unique_sprites = self._get_unique_sprites(instance)
-                    has_unique_sprites = unique_sprites is not None and unique_sprites not in (0, "0")
+                    has_unique_sprites = (
+                        unique_sprites is not None
+                        and str(unique_sprites).strip() not in ("", "0")
+                    )
                     if has_unique_sprites:
                         self._persist_unique_sprites_to_version(context, instance, unique_sprites)
                         if self.custom_comment_template["enabled"]:

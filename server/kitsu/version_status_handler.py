@@ -257,6 +257,11 @@ async def handle_task_status_change(addon, event):
                 f"[{bundle_name}] [ayon-kitsu] No uniqueSprites found in version data for {product_name}"
             )
             return
+        if str(unique_sprites).strip() in ("", "0"):
+            logging.debug(
+                f"[{bundle_name}] [ayon-kitsu] uniqueSprites is 0 or empty for {product_name}, skipping comment update"
+            )
+            return
 
         # Get comment template settings
         settings = addon.get_project_settings(project_name)

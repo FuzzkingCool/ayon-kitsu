@@ -77,8 +77,9 @@ def process_comment_update_request(
         "version": version,
         "family": "review",
         "name": product_name,
-        "uniqueSprites": str(unique_sprites),
     }
+    if str(unique_sprites).strip() not in ("", "0"):
+        data_map["uniqueSprites"] = str(unique_sprites)
     comment_text = processor_utils.render_kitsu_comment(template_cfg, data_map)
     if not comment_text:
         logging.warning("[comment_update] Empty comment text, skipping")
