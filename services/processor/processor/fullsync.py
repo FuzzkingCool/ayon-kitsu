@@ -8,6 +8,11 @@ from nxtools import log_traceback, logging
 if TYPE_CHECKING:
     from .processor import KitsuProcessor
 
+from .sync_error_format import (
+    format_batch_push_headline,
+    format_entity_sync_headline,
+    format_partial_sync_headline,
+)
 from .sync_events import emit_sync_entity_failed, emit_sync_summary, parse_http_error_detail
 from .task_relink import merge_push_response_folder_map, push_entities_with_relink
 from .utils import (
@@ -331,24 +336,29 @@ def project_full_sync(
                 f"[fullsync] Batch {batch_num + 1} processed successfully"
             )
         except Exception as e:
-            logging.error(
-                f"[fullsync] Failed to push batch {batch_num + 1} for project {project_name}: {e}"
-            )
-            logging.error(f"[fullsync] Failed batch contained: {entity_types}")
-            # Log first few entity IDs for debugging
+            parsed = parse_http_error_detail(e)
             entity_ids = [
                 f"{ent.get('type', '?')}:{ent.get('id', '?')[:8]}"
                 for ent in batch[:5]
             ]
-            logging.error(
+            headline = format_batch_push_headline(
+                project_name,
+                batch_num + 1,
+                total_batches,
+                entity_types,
+                parsed,
+            )
+            logging.error(f"[fullsync] {headline}")
+            logging.error(f"[fullsync] Failed batch entity mix: {entity_types}")
+            logging.debug(
                 f"[fullsync] First entities in failed batch: {entity_ids}"
             )
             log_traceback(
-                f"Error pushing batch {batch_num + 1} for {project_name}"
+                f"Batch {batch_num + 1} push traceback ({project_name})"
             )
             emit_sync_entity_failed(
                 project_name,
-                f"Kitsu fullsync batch {batch_num + 1}/{total_batches} push failed: {e}",
+                headline,
                 {
                     "phase": "batch_push",
                     "batchIndex": batch_num + 1,
@@ -356,7 +366,7 @@ def project_full_sync(
                     "entityTypeCounts": entity_types,
                     "firstEntityIds": entity_ids,
                 },
-                payload=parse_http_error_detail(e),
+                payload=parsed,
             )
 
             # Immediately try processing individually instead of batch retry
@@ -400,14 +410,22 @@ def project_full_sync(
 
                 except Exception as entity_error:
                     individual_failed += 1
-                    logging.error(
-                        f"[fullsync] PROBLEMATIC ENTITY #{idx + 1}: {entity_type}:{entity_name} (ID: {entity_id})"
+                    eparsed = parse_http_error_detail(entity_error)
+                    ind_headline = format_entity_sync_headline(
+                        project_name,
+                        str(entity_type),
+                        str(entity_name),
+                        str(entity_id),
+                        eparsed,
                     )
-                    logging.error(f"[fullsync] Error: {entity_error}")
-                    logging.debug(f"[fullsync] Entity data: {entity}")
+                    logging.error(f"[fullsync] {ind_headline}")
+                    logging.debug(
+                        f"[fullsync] Entity #{idx + 1} snapshot: {entity}",
+                        exc_info=True,
+                    )
                     emit_sync_entity_failed(
                         project_name,
-                        f"Kitsu fullsync entity failed after relink retry: {entity_type} {entity_name} ({entity_id})",
+                        ind_headline,
                         {
                             "phase": "individual_push",
                             "batchIndex": batch_num + 1,
@@ -415,10 +433,14 @@ def project_full_sync(
                             "entityType": entity_type,
                             "kitsuEntityId": str(entity_id),
                             "entityName": str(entity_name),
-                            "kitsuParentEntityId": str(entity.get("entity_id", "")),
-                            "taskTypeName": str(entity.get("task_type_name", "")),
+                            "kitsuParentEntityId": str(
+                                entity.get("entity_id", "")
+                            ),
+                            "taskTypeName": str(
+                                entity.get("task_type_name", "")
+                            ),
                         },
-                        payload=parse_http_error_detail(entity_error),
+                        payload=eparsed,
                     )
 
             processed_count += individual_success
@@ -445,7 +467,9 @@ def project_full_sync(
         )
         emit_sync_summary(
             project_name,
-            f"Kitsu fullsync finished with {failed_n} of {len(entities)} entities not pushed",
+            format_partial_sync_headline(
+                project_name, failed_n, len(entities)
+            ),
             {
                 "phase": "fullsync_complete",
                 "processedCount": processed_count,

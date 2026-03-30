@@ -11,6 +11,7 @@ from nxtools import logging
 from .kitsu import Kitsu, KitsuMock
 from .kitsu.init_pairing import InitPairingRequest, init_pairing, sync_request
 from .kitsu.pairing_list import PairingItemModel, get_pairing_list
+from .kitsu.sync_issues import dedupe_sync_issue_rows, issue_row_to_dict
 from .kitsu.push import (
     PushEntitiesRequestModel,
     RemoveEntitiesRequestModel,
@@ -51,6 +52,7 @@ class KitsuAddon(BaseServerAddon):
         self.add_endpoint("/push", self.push, method="POST")
         self.add_endpoint("/remove", self.remove, method="POST")
         self.add_endpoint("/processor/status", self.processor_status, method="GET")
+        self.add_endpoint("/processor/sync-issues", self.processor_sync_issues, method="GET")
         self.add_endpoint("/event-handler/status", self.event_handler_status, method="GET")
 
         from .event_subscribe import register_event_subscriptions
@@ -135,6 +137,79 @@ class KitsuAddon(BaseServerAddon):
             "pending_comment_jobs": pending_comment,
             "recent_events": recent_events,
             "addon_version": getattr(self, 'version', 'unknown'),
+        }
+
+    async def processor_sync_issues(
+        self,
+        user: CurrentUser,
+        project: str | None = None,
+        limit: int = 100,
+        dedupe: bool = True,
+    ) -> dict:
+        """Recent Kitsu processor sync failures and partial-sync summaries (stored events)."""
+        if not user.is_manager:
+            raise ForbiddenException("Only managers can view Kitsu sync issues")
+
+        from ayon_server.lib.postgres import Postgres
+
+        lim = max(1, min(int(limit), 500))
+
+        base_where = """
+            (topic ILIKE '%kitsuProcessorSyncEntityFailed%'
+             OR topic ILIKE '%kitsuProcessorSyncSummary%')
+        """
+
+        if project:
+            query = f"""
+                SELECT
+                    id,
+                    topic,
+                    description,
+                    project AS project_name,
+                    status,
+                    summary,
+                    payload,
+                    created_at,
+                    updated_at
+                FROM events
+                WHERE {base_where}
+                AND project = $1
+                ORDER BY created_at DESC
+                LIMIT $2
+            """
+            args: tuple = (project, lim)
+        else:
+            query = f"""
+                SELECT
+                    id,
+                    topic,
+                    description,
+                    project AS project_name,
+                    status,
+                    summary,
+                    payload,
+                    created_at,
+                    updated_at
+                FROM events
+                WHERE {base_where}
+                ORDER BY created_at DESC
+                LIMIT $1
+            """
+            args = (lim,)
+
+        raw_rows: list[dict] = []
+        async for row in Postgres.iterate(query, *args):
+            raw_rows.append(issue_row_to_dict(row))
+
+        if dedupe:
+            raw_rows = dedupe_sync_issue_rows(raw_rows)
+
+        return {
+            "issues": raw_rows,
+            "count": len(raw_rows),
+            "limit": lim,
+            "dedupe": dedupe,
+            "addon_version": getattr(self, "version", "unknown"),
         }
 
     async def push(

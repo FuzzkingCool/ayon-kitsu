@@ -5,6 +5,7 @@ import ReactDOM from 'react-dom/client'
 import { AddonProvider, AddonContext } from '@ynput/ayon-react-addon-provider'
 
 import PairingList from './PairingList'
+import SyncIssuesPanel from './SyncIssuesPanel'
 
 import '@ynput/ayon-react-components/dist/style.css'
 
@@ -20,12 +21,39 @@ const MainContainer = styled.div`
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
+  padding: 24px 16px;
+  box-sizing: border-box;
+  overflow-y: auto;
 
   h1 {
     font-size: 18px;
     padding: 0 0 10px 0;
     border-bottom: 1px solid #ccc;
+  }
+`
+
+const TabBar = styled.div`
+  display: flex;
+  gap: 0;
+  margin-bottom: 20px;
+  border-bottom: 1px solid #ccc;
+`
+
+const TabButton = styled.button`
+  padding: 10px 18px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  background: transparent;
+  cursor: pointer;
+  font-size: 14px;
+  color: ${(p) => (p.$active ? '#111' : '#666')};
+  font-weight: ${(p) => (p.$active ? 600 : 400)};
+  border-bottom-color: ${(p) => (p.$active ? '#333' : 'transparent')};
+
+  &:hover {
+    color: #111;
   }
 `
 
@@ -36,6 +64,7 @@ const App = () => {
   const addonName = useContext(AddonContext).addonName
   const addonVersion = useContext(AddonContext).addonVersion
   const [tokenSet, setTokenSet] = useState(false)
+  const [activeTab, setActiveTab] = useState('pairing')
 
   useEffect(() =>{
     if (addonName && addonVersion){
@@ -59,7 +88,27 @@ const App = () => {
     return "no token"
   }
 
-  return <PairingList />
+  return (
+    <>
+      <TabBar>
+        <TabButton
+          type="button"
+          $active={activeTab === 'pairing'}
+          onClick={() => setActiveTab('pairing')}
+        >
+          Pairing
+        </TabButton>
+        <TabButton
+          type="button"
+          $active={activeTab === 'issues'}
+          onClick={() => setActiveTab('issues')}
+        >
+          Sync issues
+        </TabButton>
+      </TabBar>
+      {activeTab === 'pairing' ? <PairingList /> : <SyncIssuesPanel />}
+    </>
+  )
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(

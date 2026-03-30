@@ -1,6 +1,7 @@
-import re
 import subprocess
 import sys
+from pathlib import Path
+
 
 def tag_exists(tag: str) -> bool:
     """Check if a git tag exists."""
@@ -9,7 +10,7 @@ def tag_exists(tag: str) -> bool:
             ["git", "rev-parse", "--verify", f"refs/tags/{tag}"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            check=True
+            check=True,
         )
         return True
     except subprocess.CalledProcessError:
@@ -17,13 +18,18 @@ def tag_exists(tag: str) -> bool:
 
 
 def get_version() -> str:
-    """Read the project version from pyproject.toml using a regex."""
-    with open("pyproject.toml", "r", encoding="utf-8") as f:
-        content = f.read()
-    match = re.search(r'version\s*=\s*"([^"]+)"', content)
-    if not match:
-        raise RuntimeError("Could not find version in pyproject.toml")
-    return match.group(1)
+    """Addon release version from repo-root package.py (matches zip / AYON / image tags)."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    package_py = repo_root / "package.py"
+    if not package_py.is_file():
+        raise RuntimeError(f"package.py not found at {package_py}")
+    ns: dict = {}
+    with package_py.open("r", encoding="utf-8") as f:
+        exec(f.read(), ns)
+    version = ns.get("version")
+    if not version:
+        raise RuntimeError("package.py defines no 'version'")
+    return str(version)
 
 
 def run_git_command(args):

@@ -5,6 +5,7 @@ import gazu
 from nxtools import log_traceback, logging
 
 from . import utils
+from .sync_error_format import format_entity_sync_headline
 from .sync_events import emit_sync_entity_failed, parse_http_error_detail
 from .task_relink import push_entities_with_relink
 
@@ -257,6 +258,7 @@ def create_or_update_task(parent: "KitsuProcessor", data: dict[str, str]):
         logging.debug(f"[update_from_kitsu] Project {data.get('project_id')} not paired, skipping task {data.get('task_id')}")
         return
     utils.set_kitsu_host(parent.kitsu_server_url)
+    entity: dict | None = None
     try:
         entity = gazu.task.get_task(data["task_id"])
         entity = utils.preprocess_task(entity["project_id"], entity)
@@ -269,19 +271,32 @@ def create_or_update_task(parent: "KitsuProcessor", data: dict[str, str]):
             [entity],
             folder_map,
         )
-        logging.info(f"[update_from_kitsu] Successfully updated task {data.get('task_id')} in {project_name}")
+        logging.info(
+            f"[update_from_kitsu] Successfully updated task {data.get('task_id')} in {project_name}"
+        )
     except Exception as e:
-        logging.error(f"[update_from_kitsu] Failed to update task {data.get('task_id')} in {project_name}: {e}")
-        log_traceback(f"Error updating task {data.get('task_id')}")
+        task_id = str(data.get("task_id", "unknown"))
+        task_name = "unknown"
+        if entity is not None:
+            task_name = str(entity.get("name", "unknown"))
+        parsed = parse_http_error_detail(e)
+        headline = format_entity_sync_headline(
+            project_name, "Task", task_name, task_id, parsed
+        )
+        logging.error(f"[update_from_kitsu] {headline}")
+        log_traceback(f"Incremental task {task_id}")
         emit_sync_entity_failed(
             project_name,
-            f"Kitsu incremental task push failed: {data.get('task_id')}",
+            headline,
             {
                 "phase": "incremental_task",
-                "kitsuTaskId": str(data.get("task_id", "")),
+                "entityType": "Task",
+                "entityName": task_name,
+                "kitsuEntityId": task_id,
+                "kitsuTaskId": task_id,
                 "projectId": str(data.get("project_id", "")),
             },
-            payload=parse_http_error_detail(e),
+            payload=parsed,
         )
 
 
