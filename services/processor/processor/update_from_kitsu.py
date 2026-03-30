@@ -5,6 +5,8 @@ import gazu
 from nxtools import log_traceback, logging
 
 from . import utils
+from .sync_events import emit_sync_entity_failed, parse_http_error_detail
+from .task_relink import push_entities_with_relink
 
 if TYPE_CHECKING:
     from .processor import KitsuProcessor
@@ -260,16 +262,27 @@ def create_or_update_task(parent: "KitsuProcessor", data: dict[str, str]):
         entity = utils.preprocess_task(entity["project_id"], entity)
         entity["ayon_server_url"] = ayon_api.get_base_url()
 
-        response = ayon_api.post(
-            f"{parent.entrypoint}/push",
-            project_name=project_name,
-            entities=[entity],
+        folder_map: dict[str, str] = {}
+        push_entities_with_relink(
+            parent.entrypoint,
+            project_name,
+            [entity],
+            folder_map,
         )
-        response.raise_for_status()
         logging.info(f"[update_from_kitsu] Successfully updated task {data.get('task_id')} in {project_name}")
     except Exception as e:
         logging.error(f"[update_from_kitsu] Failed to update task {data.get('task_id')} in {project_name}: {e}")
         log_traceback(f"Error updating task {data.get('task_id')}")
+        emit_sync_entity_failed(
+            project_name,
+            f"Kitsu incremental task push failed: {data.get('task_id')}",
+            {
+                "phase": "incremental_task",
+                "kitsuTaskId": str(data.get("task_id", "")),
+                "projectId": str(data.get("project_id", "")),
+            },
+            payload=parse_http_error_detail(e),
+        )
 
 
 def delete_task(parent: "KitsuProcessor", data: dict[str, str]):

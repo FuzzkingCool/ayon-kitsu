@@ -8,6 +8,8 @@ from nxtools import log_traceback, logging
 if TYPE_CHECKING:
     from .processor import KitsuProcessor
 
+from .sync_events import emit_sync_entity_failed, emit_sync_summary, parse_http_error_detail
+from .task_relink import merge_push_response_folder_map, push_entities_with_relink
 from .utils import (
     get_asset_types,
     get_statuses,
@@ -296,6 +298,7 @@ def project_full_sync(
     # Track progress and failures
     processed_count = 0
     failed_batches = []
+    kitsu_folder_map: dict[str, str] = {}
 
     for batch_num in range(total_batches):
         start_idx = batch_num * batch_size
@@ -322,6 +325,7 @@ def project_full_sync(
                 entities=batch,
             )
             response.raise_for_status()
+            merge_push_response_folder_map(kitsu_folder_map, response.data)
             processed_count += len(batch)
             logging.info(
                 f"[fullsync] Batch {batch_num + 1} processed successfully"
@@ -342,6 +346,18 @@ def project_full_sync(
             log_traceback(
                 f"Error pushing batch {batch_num + 1} for {project_name}"
             )
+            emit_sync_entity_failed(
+                project_name,
+                f"Kitsu fullsync batch {batch_num + 1}/{total_batches} push failed: {e}",
+                {
+                    "phase": "batch_push",
+                    "batchIndex": batch_num + 1,
+                    "batchTotal": total_batches,
+                    "entityTypeCounts": entity_types,
+                    "firstEntityIds": entity_ids,
+                },
+                payload=parse_http_error_detail(e),
+            )
 
             # Immediately try processing individually instead of batch retry
             logging.warning(
@@ -359,15 +375,18 @@ def project_full_sync(
                     entity_type = entity.get("type", "unknown")
                     entity_id = entity.get("id", "unknown")
                     entity_data = entity.get("data")
-                    if entity_data and isinstance(entity_data, dict):
+                    entity_name = entity.get("name", "unknown")
+                    if entity_name == "unknown" and isinstance(
+                        entity_data, dict
+                    ):
                         entity_name = entity_data.get("name", "unknown")
 
-                    response = ayon_api.post(
-                        f"{parent.entrypoint}/push",
-                        project_name=project_name,
-                        entities=[entity],
+                    response = push_entities_with_relink(
+                        parent.entrypoint,
+                        project_name,
+                        [entity],
+                        kitsu_folder_map,
                     )
-                    response.raise_for_status()
                     individual_success += 1
 
                     if idx == 0:
@@ -386,6 +405,21 @@ def project_full_sync(
                     )
                     logging.error(f"[fullsync] Error: {entity_error}")
                     logging.debug(f"[fullsync] Entity data: {entity}")
+                    emit_sync_entity_failed(
+                        project_name,
+                        f"Kitsu fullsync entity failed after relink retry: {entity_type} {entity_name} ({entity_id})",
+                        {
+                            "phase": "individual_push",
+                            "batchIndex": batch_num + 1,
+                            "entityIndexInBatch": idx + 1,
+                            "entityType": entity_type,
+                            "kitsuEntityId": str(entity_id),
+                            "entityName": str(entity_name),
+                            "kitsuParentEntityId": str(entity.get("entity_id", "")),
+                            "taskTypeName": str(entity.get("task_type_name", "")),
+                        },
+                        payload=parse_http_error_detail(entity_error),
+                    )
 
             processed_count += individual_success
             logging.info(
@@ -405,6 +439,17 @@ def project_full_sync(
             f"completed successfully in {time.time() - start_time:.2f}s"
         )
     else:
+        failed_n = len(entities) - processed_count
         logging.warning(
-            f"[fullsync] Sync for project {project_name} completed with {len(entities) - processed_count} entities failed"
+            f"[fullsync] Sync for project {project_name} completed with {failed_n} entities failed"
+        )
+        emit_sync_summary(
+            project_name,
+            f"Kitsu fullsync finished with {failed_n} of {len(entities)} entities not pushed",
+            {
+                "phase": "fullsync_complete",
+                "processedCount": processed_count,
+                "totalEntities": len(entities),
+                "failedCount": failed_n,
+            },
         )
