@@ -1,13 +1,12 @@
 
 name = "kitsu"
 title = "Kitsu"
-version = "1.2.6+prod.0.1.4"
-_processor_image_tag = version.replace("+", "-")
+version = "1.2.6-prod.0.2.0"
 client_dir = "ayon_kitsu"
 
 services = {
     "processor": {
-        "image": f"ghcr.io/fuzzkingcool/ayon-kitsu-processor:{_processor_image_tag}",
+        "image": f"ghcr.io/fuzzkingcool/ayon-kitsu-processor:{version}",
         "environment": {
             "AYON_ADDON_NAME": name,
             "AYON_ADDON_VERSION": version,
