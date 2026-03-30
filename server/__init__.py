@@ -165,7 +165,7 @@ class KitsuAddon(BaseServerAddon):
                     id,
                     topic,
                     description,
-                    project AS project_name,
+                    project_name,
                     status,
                     summary,
                     payload,
@@ -173,7 +173,7 @@ class KitsuAddon(BaseServerAddon):
                     updated_at
                 FROM events
                 WHERE {base_where}
-                AND project = $1
+                AND project_name = $1
                 ORDER BY created_at DESC
                 LIMIT $2
             """
@@ -184,7 +184,7 @@ class KitsuAddon(BaseServerAddon):
                     id,
                     topic,
                     description,
-                    project AS project_name,
+                    project_name,
                     status,
                     summary,
                     payload,

@@ -35,25 +35,58 @@ const MainContainer = styled.div`
 
 const TabBar = styled.div`
   display: flex;
-  gap: 0;
+  gap: 4px;
+  width: 100%;
+  max-width: 900px;
   margin-bottom: 20px;
-  border-bottom: 1px solid #ccc;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  font-family: inherit;
+
+  @media (prefers-color-scheme: light) {
+    border-bottom-color: rgba(0, 0, 0, 0.12);
+  }
 `
 
 const TabButton = styled.button`
   padding: 10px 18px;
   border: none;
+  border-radius: 6px 6px 0 0;
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
   background: transparent;
   cursor: pointer;
-  font-size: 14px;
-  color: ${(p) => (p.$active ? '#111' : '#666')};
-  font-weight: ${(p) => (p.$active ? 600 : 400)};
-  border-bottom-color: ${(p) => (p.$active ? '#333' : 'transparent')};
+  font-family: inherit;
+  font-size: 0.9375rem;
+  letter-spacing: 0.02em;
+  line-height: 1.3;
+  /* Dark UI (AYON Studio default): inactive must stay readable on dark surfaces */
+  color: ${(p) =>
+    p.$active ? 'rgba(255, 255, 255, 0.98)' : 'rgba(255, 255, 255, 0.72)'};
+  font-weight: ${(p) => (p.$active ? 700 : 600)};
+  border-bottom-color: ${(p) =>
+    p.$active ? 'rgba(255, 255, 255, 0.9)' : 'transparent'};
 
   &:hover {
-    color: #111;
+    color: rgba(255, 255, 255, 0.95);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(100, 180, 255, 0.85);
+    outline-offset: 2px;
+  }
+
+  @media (prefers-color-scheme: light) {
+    color: ${(p) => (p.$active ? '#111827' : '#4b5563')};
+    font-weight: ${(p) => (p.$active ? 700 : 600)};
+    border-bottom-color: ${(p) => (p.$active ? '#111827' : 'transparent')};
+
+    &:hover {
+      color: #111827;
+    }
+
+    &:focus-visible {
+      outline-color: #2563eb;
+    }
   }
 `
 
@@ -90,9 +123,11 @@ const App = () => {
 
   return (
     <>
-      <TabBar>
+      <TabBar role="tablist" aria-label="Kitsu addon sections">
         <TabButton
           type="button"
+          role="tab"
+          aria-selected={activeTab === 'pairing'}
           $active={activeTab === 'pairing'}
           onClick={() => setActiveTab('pairing')}
         >
@@ -100,6 +135,8 @@ const App = () => {
         </TabButton>
         <TabButton
           type="button"
+          role="tab"
+          aria-selected={activeTab === 'issues'}
           $active={activeTab === 'issues'}
           onClick={() => setActiveTab('issues')}
         >

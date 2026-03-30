@@ -1,11 +1,11 @@
-"""Relink stale data.kitsuId on AYON tasks using ayon_api only (no Postgres)."""
+"""Relink stale data.kitsuId on AYON tasks and asset folders using ayon_api only."""
 
 from __future__ import annotations
 
 from typing import Any
 
 import ayon_api
-from nxtools import logging
+from nxtools import logging, slugify
 
 
 def merge_push_response_folder_map(
@@ -58,6 +58,93 @@ def is_task_unique_violation(exc: BaseException) -> bool:
         except Exception:
             pass
     return False
+
+
+def is_folder_unique_violation(exc: BaseException) -> bool:
+    """True if error indicates duplicate AYON folder (parent_id + name)."""
+    msg = str(exc).lower()
+    if "folder with parent_id" in msg and "already exists" in msg:
+        return True
+    if hasattr(exc, "response") and exc.response is not None:
+        try:
+            body = exc.response.json()
+            if isinstance(body, dict):
+                det = str(body.get("detail", "")).lower()
+                err = str(body.get("error", "")).lower()
+                if "folder with parent_id" in det and "already exists" in det:
+                    return True
+                if err == "unique-violation" and "folder" in det and "already exists" in det:
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def _ayon_asset_folder_name(kitsu_name: str) -> str:
+    """Match server/kitsu/utils.create_name_and_label slug for folder.name."""
+    return slugify(kitsu_name, separator="_")
+
+
+def try_relink_stale_kitsu_asset_folder(
+    project_name: str,
+    asset_entity: dict[str, Any],
+    folder_map: dict[str, str],
+) -> bool:
+    """If AYON has a folder under the type parent with matching slug but wrong kitsuId, fix data.
+
+    Returns True if ayon_api.update_folder was applied.
+    """
+    if asset_entity.get("type") != "Asset":
+        return False
+    kitsu_asset_id = asset_entity.get("id")
+    entity_type_id = asset_entity.get("entity_type_id")
+    kitsu_name = asset_entity.get("name")
+    if not kitsu_asset_id or not entity_type_id or not kitsu_name:
+        return False
+
+    parent_id = folder_map.get(entity_type_id)
+    if not parent_id:
+        parent_id = find_folder_id_for_kitsu_entity(
+            project_name, entity_type_id, folder_map
+        )
+    if not parent_id:
+        logging.warning(
+            f"[folder_relink] No AYON parent folder for asset type "
+            f"{entity_type_id!r}, skip relink"
+        )
+        return False
+
+    expected_name = _ayon_asset_folder_name(kitsu_name)
+    candidate = None
+    for folder in ayon_api.get_folders(project_name, active=True):
+        if folder.get("parentId") != parent_id:
+            continue
+        if folder.get("name") != expected_name:
+            continue
+        candidate = folder
+        break
+
+    if not candidate:
+        return False
+
+    current_kitsu = (candidate.get("data") or {}).get("kitsuId")
+    if current_kitsu and _normalize_uuid(current_kitsu) == _normalize_uuid(
+        kitsu_asset_id
+    ):
+        return False
+
+    new_data = {**(candidate.get("data") or {}), "kitsuId": kitsu_asset_id}
+    ayon_api.update_folder(
+        project_name,
+        candidate["id"],
+        data=new_data,
+    )
+    logging.info(
+        f"[folder_relink] Relinked AYON folder {candidate['id']!r} "
+        f"kitsuId {current_kitsu!r} -> {kitsu_asset_id!r} "
+        f"(parent={parent_id!r}, name={expected_name!r})"
+    )
+    return True
 
 
 def try_relink_stale_kitsu_task(
@@ -130,7 +217,7 @@ def push_entities_with_relink(
     entities: list[dict[str, Any]],
     folder_map: dict[str, str],
 ):
-    """POST /push; for a single Task, relink stale kitsuId once on unique violation."""
+    """POST /push; relink stale kitsuId once on task or asset folder unique violation."""
     response = ayon_api.post(
         f"{entrypoint}/push",
         project_name=project_name,
@@ -148,6 +235,21 @@ def push_entities_with_relink(
             entity.get("type") == "Task"
             and is_task_unique_violation(e)
             and try_relink_stale_kitsu_task(project_name, entity, folder_map)
+        ):
+            response2 = ayon_api.post(
+                f"{entrypoint}/push",
+                project_name=project_name,
+                entities=entities,
+            )
+            response2.raise_for_status()
+            merge_push_response_folder_map(folder_map, response2.data)
+            return response2
+        if (
+            entity.get("type") == "Asset"
+            and is_folder_unique_violation(e)
+            and try_relink_stale_kitsu_asset_folder(
+                project_name, entity, folder_map
+            )
         ):
             response2 = ayon_api.post(
                 f"{entrypoint}/push",

@@ -5,9 +5,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from processor.task_relink import (
+    is_folder_unique_violation,
     is_task_unique_violation,
     merge_push_response_folder_map,
     push_entities_with_relink,
+    try_relink_stale_kitsu_asset_folder,
     try_relink_stale_kitsu_task,
 )
 from processor.sync_events import parse_http_error_detail
@@ -28,6 +30,35 @@ def test_is_task_unique_violation_string():
     )
     assert is_task_unique_violation(
         Exception("Task with folder_id, name 'x, y' already exists.")
+    )
+
+
+def test_is_folder_unique_violation_string():
+    assert is_folder_unique_violation(
+        Exception(
+            "Folder with parent_id, name 'uuid, char_foo' already exists."
+        )
+    )
+
+
+def test_is_folder_unique_violation_response_json():
+    resp = MagicMock()
+
+    def json():
+        return {
+            "detail": "Folder with parent_id, name 'x, y' already exists.",
+            "error": "unique-violation",
+        }
+
+    resp.json = json
+    exc = type("E", (Exception,), {})("fail")
+    exc.response = resp
+    assert is_folder_unique_violation(exc)
+
+
+def test_is_folder_unique_violation_not_task_only():
+    assert not is_folder_unique_violation(
+        Exception("Task with folder_id, name 'a, b' already exists.")
     )
 
 
@@ -91,6 +122,90 @@ def test_try_relink_skips_when_multiple_matches(
     }
     assert try_relink_stale_kitsu_task("P", task_entity, {"e": "f1"}) is False
     mock_update.assert_not_called()
+
+
+@patch("processor.task_relink.ayon_api.update_folder", create=True)
+@patch("processor.task_relink.ayon_api.get_folders", create=True)
+def test_try_relink_stale_kitsu_asset_folder_updates(
+    mock_get_folders, mock_update
+):
+    mock_get_folders.return_value = [
+        {
+            "id": "fold1",
+            "parentId": "type_parent",
+            "name": "char_blueDudepowerdash",
+            "data": {"kitsuId": "old-asset-uuid"},
+        }
+    ]
+    asset = {
+        "type": "Asset",
+        "id": "new-kitsu-uuid",
+        "entity_type_id": "etype-1",
+        "name": "CHAR_blueDudePowerDash",
+    }
+    assert (
+        try_relink_stale_kitsu_asset_folder(
+            "Proj", asset, {"etype-1": "type_parent"}
+        )
+        is True
+    )
+    mock_update.assert_called_once()
+    assert mock_update.call_args[0][0] == "Proj"
+    assert mock_update.call_args[0][1] == "fold1"
+    assert mock_update.call_args[1]["data"]["kitsuId"] == "new-kitsu-uuid"
+
+
+@patch("processor.task_relink.ayon_api.update_folder", create=True)
+@patch("processor.task_relink.ayon_api.get_folders", create=True)
+def test_try_relink_asset_skips_when_kitsu_id_matches(
+    mock_get_folders, mock_update
+):
+    mock_get_folders.return_value = [
+        {
+            "id": "f1",
+            "parentId": "p1",
+            "name": "char_x",
+            "data": {"kitsuId": "same-uuid"},
+        }
+    ]
+    asset = {
+        "type": "Asset",
+        "id": "same-uuid",
+        "entity_type_id": "e1",
+        "name": "CHAR_X",
+    }
+    assert try_relink_stale_kitsu_asset_folder("P", asset, {"e1": "p1"}) is False
+    mock_update.assert_not_called()
+
+
+@patch("processor.task_relink.try_relink_stale_kitsu_asset_folder")
+@patch("processor.task_relink.ayon_api.post")
+def test_push_entities_with_relink_retries_asset(mock_post, mock_relink_asset):
+    mock_relink_asset.return_value = True
+    ok = MagicMock()
+    ok.raise_for_status = MagicMock()
+    ok.data = {"folders": {}}
+    fail = MagicMock()
+
+    def rs():
+        if mock_post.call_count == 1:
+            raise RuntimeError(
+                "Folder with parent_id, name 'a, b' already exists."
+            )
+        return None
+
+    fail.raise_for_status = rs
+    mock_post.side_effect = [fail, ok]
+
+    asset = {
+        "type": "Asset",
+        "id": "kid",
+        "entity_type_id": "etype",
+        "name": "CHAR_Foo",
+    }
+    push_entities_with_relink("/addons/kitsu/x", "MyProj", [asset], {"etype": "par"})
+    assert mock_post.call_count == 2
+    mock_relink_asset.assert_called_once()
 
 
 @patch("processor.task_relink.try_relink_stale_kitsu_task")
