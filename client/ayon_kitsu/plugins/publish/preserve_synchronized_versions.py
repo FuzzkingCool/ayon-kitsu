@@ -30,7 +30,7 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
 
     def process(self, context):
         """Process all instances and restore synchronized versions if needed."""
-        self.log.info("PreserveSynchronizedVersions plugin starting...")
+        self.log.debug("PreserveSynchronizedVersions: starting")
         project_name = context.data.get("projectName")
         if not project_name:
             self.log.warning(
@@ -54,13 +54,18 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
             if self._restore_synchronized_version(instance):
                 instances_restored += 1
 
-        self.log.info(
-            f"PreserveSynchronizedVersions: {total_instances} total instances, {synced_instances} synced instances, {instances_restored} restored"
+        self.log.debug(
+            "PreserveSynchronizedVersions: total=%s synced=%s reapplied_after_anatomy=%s",
+            total_instances,
+            synced_instances,
+            instances_restored,
         )
 
         if instances_restored > 0:
             self.log.info(
-                f"Restored synchronized versions for {instances_restored} instances"
+                "Kitsu: reapplied coordinated publish version on %s instance(s) "
+                "after anatomy collection",
+                instances_restored,
             )
         else:
             self.log.debug(
@@ -82,6 +87,16 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
         if not instance.data.get("versionSynced"):
             self.log.debug(
                 f"Instance {product_name} not versionSynced, skipping"
+            )
+            return False
+
+        # Workfile instances that follow the scene basename must keep
+        # CollectAnatomyInstanceData's context-driven version; do not restore
+        # kitsuTargetVersion over it (aligns with Harmony workfile publish).
+        if instance.data.get("followWorkfileVersion"):
+            self.log.debug(
+                "Instance %s uses followWorkfileVersion; skipping version restore",
+                product_name,
             )
             return False
 
@@ -107,9 +122,11 @@ class PreserveSynchronizedVersions(KitsuPublishContextPlugin):
 
         # If current version differs from synchronized version, restore it
         if current_version != synchronized_version:
-            self.log.info(
-                f"Restoring synchronized version {synchronized_version} for "
-                f"{product_name} (was overridden to {current_version})"
+            self.log.debug(
+                "Reapply kitsu target v%s for %s (anatomy had v%s)",
+                synchronized_version,
+                product_name,
+                current_version,
             )
 
             # Update both instance version and anatomy data

@@ -28,8 +28,8 @@ class CollectKitsuLatestReviewVersion(KitsuPublishContextPlugin):
     log.debug("CollectKitsuLatestReviewVersion plugin loaded")
 
     def process(self, context):
-        self.log.info(
-            "[KitsuLatestReview] Collecting Kitsu versions for ALL tasks in context"
+        self.log.debug(
+            "[KitsuLatestReview] Collecting Kitsu versions for tasks in context"
         )
 
         # Group ALL instances by task context (folderPath + task name)
@@ -51,15 +51,17 @@ class CollectKitsuLatestReviewVersion(KitsuPublishContextPlugin):
             self.log.debug("[KitsuLatestReview] No valid task contexts found")
             return
 
-        self.log.info(
-            f"[KitsuLatestReview] Found {len(task_groups)} task contexts to check"
+        self.log.debug(
+            "[KitsuLatestReview] %s task context(s) to check",
+            len(task_groups),
         )
 
         # For each task context, get Kitsu version and apply to all instances
         for task_key, instances in task_groups.items():
             folder_path, task_name = task_key.split("::", 1)
-            self.log.info(
-                f"[KitsuLatestReview] Processing task context: {task_key}"
+            self.log.debug(
+                "[KitsuLatestReview] Task context: %s",
+                task_key,
             )
 
             # Get Kitsu latest version for this task context

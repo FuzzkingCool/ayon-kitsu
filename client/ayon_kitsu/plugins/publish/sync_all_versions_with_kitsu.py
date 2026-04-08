@@ -1,7 +1,8 @@
 """Universal version synchronization with Kitsu for all product types and hosts."""
 
+import collections
+
 import pyblish.api
-from ayon_harmony.logger import log as log_harmony
 
 from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 
@@ -25,9 +26,6 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
     )  # Run after CollectKitsuLatestReviewVersion (0.479) but before other sync plugins
     # No hosts restriction - this works for ALL hosts
 
-    log = log_harmony
-    log.debug("SyncAllVersionsWithKitsu plugin loaded")
-
     def process(self, context):
         """Process all instances and sync their versions with Kitsu data."""
         project_name = context.data.get("projectName")
@@ -46,8 +44,9 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             )
             return
 
-        self.log.info(
-            f"Found {len(instances_to_sync)} instances for Kitsu version synchronization"
+        self.log.debug(
+            "SyncAllVersionsWithKitsu: %s instance(s) to synchronize",
+            len(instances_to_sync),
         )
 
         # Group instances by task for coordinated versioning
@@ -111,7 +110,6 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             "harmony.template",
             "harmony.layeredtemplate",
             "harmony.palette",
-            "harmony.tbg",
             # Photoshop-specific
             "image",
             "psd",
@@ -183,25 +181,32 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             instances (list): List of instances for this task
             project_name (str): Project name
         """
-        self.log.info(
-            f"Synchronizing versions for task group: {task_key} ({len(instances)} instances)"
+        self.log.debug(
+            "SyncAllVersionsWithKitsu: task %s (%s instances)",
+            task_key,
+            len(instances),
         )
 
         # Get the highest Kitsu version across all instances in this task
         max_kitsu_version = 0
         kitsu_instances = []
 
+        kitsu_by_product = [
+            (
+                inst.data.get("productName", "unknown"),
+                inst.data.get("kitsuLatestVersion", 0),
+            )
+            for inst in instances
+        ]
         self.log.debug(
-            f"Checking Kitsu versions for {len(instances)} instances in task {task_key}"
+            "Kitsu latestVersion by product (task %s): %s",
+            task_key,
+            kitsu_by_product,
         )
 
         for instance in instances:
             kitsu_latest = instance.data.get("kitsuLatestVersion", 0)
             product_name = instance.data.get("productName", "unknown")
-
-            self.log.debug(
-                f"Instance {product_name}: kitsuLatestVersion={kitsu_latest}"
-            )
 
             if kitsu_latest and kitsu_latest > max_kitsu_version:
                 max_kitsu_version = kitsu_latest
@@ -210,14 +215,17 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                 kitsu_instances.append(product_name)
 
         if max_kitsu_version > 0:
-            self.log.info(
-                f"Found Kitsu latest version {max_kitsu_version} for task {task_key} "
-                f"from instances: {kitsu_instances}"
+            self.log.debug(
+                "Kitsu max=%s for task %s (from products: %s)",
+                max_kitsu_version,
+                task_key,
+                kitsu_instances,
             )
         else:
-            self.log.info(
-                f"No Kitsu version found for task {task_key}. "
-                f"Instances checked: {[inst.data.get('productName', 'unknown') for inst in instances]}"
+            self.log.debug(
+                "No Kitsu revision for task %s (instances: %s)",
+                task_key,
+                [inst.data.get("productName", "unknown") for inst in instances],
             )
 
         # Get the highest AYON version across all instances in this task
@@ -228,10 +236,17 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
         # Determine the target version (highest of Kitsu or AYON + 1)
         target_version = max(max_kitsu_version, max_ayon_version) + 1
 
+        self.log.debug(
+            "Version sync detail %s: Kitsu=%s AYON=%s -> target v%s",
+            task_key,
+            max_kitsu_version,
+            max_ayon_version,
+            target_version,
+        )
         self.log.info(
-            f"Version sync for {task_key}: Kitsu={max_kitsu_version}, "
-            f"AYON={max_ayon_version}, Target={target_version} "
-            f"(using max of both + 1)"
+            "Kitsu version sync %s -> publish v%s",
+            task_key,
+            target_version,
         )
 
         # Apply the target version to all instances in this task group
@@ -247,9 +262,11 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             if "review" in instance.data.get("families", []):
                 instance.data["kitsuGroupedVersion"] = target_version
 
-            self.log.info(
-                f"Synced {instance.data.get('productName')}: "
-                f"v{original_version} -> v{target_version}"
+            self.log.debug(
+                "Synced %s: v%s -> v%s",
+                instance.data.get("productName"),
+                original_version,
+                target_version,
             )
 
     def _get_max_ayon_version_for_task(self, instances, project_name):
@@ -268,21 +285,14 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             # Collect all folder paths and product names from instances
             folder_paths = set()
             product_names_by_folder = {}
+            skipped_incomplete = 0
 
-            self.log.debug("Collecting product names from instances:")
             for instance in instances:
                 product_name = instance.data.get("productName")
                 folder_path = instance.data.get("folderPath")
-                product_type = instance.data.get("productType")
-
-                self.log.debug(
-                    f"  Instance: {product_name} (type: {product_type}) in {folder_path}"
-                )
 
                 if not all([product_name, folder_path]):
-                    self.log.debug(
-                        f"  Skipping instance with missing data: product={product_name}, folder={folder_path}"
-                    )
+                    skipped_incomplete += 1
                     continue
 
                 folder_paths.add(folder_path)
@@ -290,14 +300,23 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                     product_names_by_folder[folder_path] = set()
                 product_names_by_folder[folder_path].add(product_name)
 
+            distinct_names = set()
+            for names in product_names_by_folder.values():
+                distinct_names.update(names)
+
+            self.log.debug(
+                "AYON max version: %s instances, %s folder paths, %s distinct "
+                "product names (skipped incomplete: %s)",
+                len(instances),
+                len(folder_paths),
+                len(distinct_names),
+                skipped_incomplete,
+            )
+
             if not folder_paths:
-                self.log.debug(
-                    "No valid folder paths found for AYON version query"
-                )
+                self.log.debug("No valid folder paths for AYON version query")
                 return 0
 
-            # Get folder entities
-            self.log.debug(f"Querying folders for paths: {list(folder_paths)}")
             folder_entities = list(
                 ayon_api.get_folders(
                     project_name,
@@ -307,93 +326,63 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
             )
 
             if not folder_entities:
-                self.log.debug(
-                    "No folder entities found for AYON version query"
-                )
+                self.log.debug("No folder entities resolved for AYON version query")
                 return 0
 
-            folder_ids = [folder["id"] for folder in folder_entities]
-            folder_paths_list = [folder["path"] for folder in folder_entities]
             self.log.debug(
-                f"Found {len(folder_ids)} folder entities: {folder_paths_list}"
+                "Resolved %s folder(s) for AYON product lookup",
+                len(folder_entities),
             )
 
-            # Create a mapping from folder_id to folder_path for lookup
-            folder_id_to_path = {
-                folder["id"]: folder["path"] for folder in folder_entities
+            path_to_folder_id = {
+                folder["path"]: folder["id"] for folder in folder_entities
             }
+            names_by_folder_ids = collections.defaultdict(set)
+            unresolved_paths = []
+            for folder_path, names in product_names_by_folder.items():
+                folder_id = path_to_folder_id.get(folder_path)
+                if folder_id:
+                    names_by_folder_ids[folder_id].update(names)
+                else:
+                    unresolved_paths.append(folder_path)
 
-            # Use a simpler approach: get all products for these folders, then filter by name
-            all_products = list(
+            if unresolved_paths:
+                self.log.debug(
+                    "Folder path(s) not resolved (omitted from product query): %s",
+                    unresolved_paths,
+                )
+
+            if not names_by_folder_ids:
+                self.log.debug("No folder IDs mapped for AYON product query")
+                return 0
+
+            product_entities = list(
                 ayon_api.get_products(
                     project_name,
-                    folder_ids=folder_ids,
-                    fields={"id", "name", "folderId"},
+                    names_by_folder_ids=dict(names_by_folder_ids),
                 )
             )
 
-            if not all_products:
-                self.log.debug("No products found for AYON version query")
-                return 0
-
-            self.log.debug(
-                f"Found {len(all_products)} total products in folders"
-            )
-
-            # Filter products by name and folder
-            valid_products = []
-            self.log.debug(
-                f"Looking for products in folders: {list(product_names_by_folder.keys())}"
-            )
-            self.log.debug(
-                f"Looking for product names: {[list(names) for names in product_names_by_folder.values()]}"
-            )
-
-            for product in all_products:
-                product_name = product["name"]
-                folder_id = product["folderId"]
-
-                # Find which folder path this corresponds to using the mapping
-                folder_path = folder_id_to_path.get(folder_id)
-
-                self.log.debug(
-                    f"  Checking product: {product_name} in folder_id={folder_id} (path={folder_path})"
-                )
-
-                if folder_path and folder_path in product_names_by_folder:
-                    expected_names = product_names_by_folder[folder_path]
-                    self.log.debug(
-                        f"    Expected names for {folder_path}: {list(expected_names)}"
-                    )
-                    if product_name in expected_names:
-                        valid_products.append(product)
-                        self.log.debug(
-                            f"    ✅ Valid product: {product_name} in {folder_path}"
-                        )
-                    else:
-                        self.log.debug(
-                            f"    ❌ Product name '{product_name}' not in expected names: {list(expected_names)}"
-                        )
-                else:
-                    self.log.debug(
-                        f"    ❌ Folder path {folder_path} not found in expected folders"
-                    )
-
-            if not valid_products:
+            if not product_entities:
                 self.log.info(
-                    "No valid products found after filtering by name and folder"
+                    "No AYON products matched publish instance names and folders "
+                    "(%s folder id(s) queried)",
+                    len(names_by_folder_ids),
                 )
                 return 0
 
-            valid_product_ids = [product["id"] for product in valid_products]
             self.log.debug(
-                f"Found {len(valid_product_ids)} valid products: {[p['name'] for p in valid_products]}"
+                "Matched %s AYON product(s) for version lookup: %s",
+                len(product_entities),
+                [p["name"] for p in product_entities],
             )
+
+            product_ids = [product["id"] for product in product_entities]
 
             # Get latest versions for all products at once
             last_versions = ayon_api.get_last_versions(
                 project_name,
-                valid_product_ids,
+                product_ids,
                 fields={"version", "productId"},
             )
 
@@ -407,14 +396,14 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                     if version_int is not None and version_int > max_version:
                         max_version = version_int
 
-            self.log.debug(f"Max AYON version found: {max_version}")
+            self.log.debug("Max AYON version: %s", max_version)
             return max_version
 
-        except Exception as e:
-            self.log.warning(f"Failed to get AYON latest versions: {e}")
-            import traceback
-
-            self.log.debug(traceback.format_exc())
+        except Exception:
+            self.log.warning(
+                "Failed to get AYON latest versions",
+                exc_info=True,
+            )
 
             # Fallback to checking instance data directly
             max_version = 0
@@ -423,9 +412,7 @@ class SyncAllVersionsWithKitsu(KitsuPublishContextPlugin):
                 if current_version > max_version:
                     max_version = current_version
 
-            self.log.debug(
-                f"Fallback max version from instances: {max_version}"
-            )
+            self.log.debug("Fallback max version from instance data: %s", max_version)
             return max_version
 
     def _get_version_start(self, instance, project_name):
