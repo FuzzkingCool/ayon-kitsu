@@ -30,23 +30,39 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
         "comment_template": "{comment}",
     }
 
+    def _unique_sprites_applies(self, context, instance):
+        """True when Harmony uniqueSprites should appear on Kitsu notes / persist to version.
+
+        Includes ``review`` because Kitsu comments are created for review instances that
+        carry ``versionData.maxUniqueSprites`` aggregated from renderlayers (see Harmony
+        AggregateRenderlayerSprites). Render/renderlayer products are included when those
+        instances are processed directly.
+        """
+        host = (
+            context.data.get("hostName")
+            or os.environ.get("AYON_HOST_NAME")
+            or ""
+        )
+        if str(host).lower() != "harmony":
+            return False
+        product_type = instance.data.get("productType") or ""
+        return product_type in ("render", "renderlayer", "review")
+
     def _get_unique_sprites(self, instance):
         """Get uniqueSprites with standardized priority and debug logging.
 
-        Priority order for renderlayer/review instances:
-        1. maxUniqueSprites from versionData (aggregated from productGroup)
+        Priority order for Harmony render / renderlayer / review instances:
+        1. maxUniqueSprites from versionData (aggregated from productGroup; review uses this)
         2. uniqueSprites from instance data
         3. uniqueSprites from versionData
         4. uniqueSprites from versionEntity
-
-        This ensures review instances from productGroups get the max value.
         """
         bundle_name = os.getenv("AYON_BUNDLE_NAME", "Unknown")
         sources_tried = []
         product_type = instance.data.get("productType", "")
 
-        # Priority 1: Aggregated max for renderlayers and reviews (from productGroup aggregation)
-        if product_type in ["renderlayer", "review"]:
+        # Priority 1: Aggregated max from productGroup (render, renderlayer, review)
+        if product_type in ("render", "renderlayer", "review"):
             max_sprites = instance.data.get("versionData", {}).get("maxUniqueSprites")
             sources_tried.append("versionData.maxUniqueSprites")
             if max_sprites is not None:
@@ -88,10 +104,14 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                 )
                 return sprites
 
-        self.log.warning(
+        msg = (
             f"[{bundle_name}] [KitsuComment] No uniqueSprites found for {product_type} instance "
             f"{instance.data.get('productName', 'Unknown')} - tried sources: {sources_tried}"
         )
+        if product_type in ("render", "renderlayer"):
+            self.log.warning(msg)
+        else:
+            self.log.debug(msg)
         return None
 
     def _persist_unique_sprites_to_version(self, context, instance, unique_sprites):
@@ -267,6 +287,8 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                 combined_unique_sprites = None
                 if not kitsu_only_group:
                     for instance in instances:
+                        if not self._unique_sprites_applies(context, instance):
+                            continue
                         unique_sprites = self._get_unique_sprites(instance)
                         if unique_sprites is not None and str(unique_sprites).strip() not in ("", "0"):
                             self._persist_unique_sprites_to_version(context, instance, unique_sprites)
@@ -322,8 +344,8 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     f"task_id={kitsu_task.get('id')}"
                 )
 
-                if kitsu_only:
-                    # Kitsu-only review: no uniqueSprites, simple comment only (no template/key warnings)
+                if kitsu_only or not self._unique_sprites_applies(context, instance):
+                    # Kitsu-only review, or non-Harmony / non-applicable product: no uniqueSprites
                     data_map = {
                         "comment": user_comment,
                         "version": version,
@@ -337,7 +359,7 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                         publish_comment = f"Review: {product_name}"
                     unique_sprites = None
                 else:
-                    # Harmony-style: get uniqueSprites and optional template
+                    # Harmony render / renderlayer / review: uniqueSprites and optional template
                     unique_sprites = self._get_unique_sprites(instance)
                     has_unique_sprites = (
                         unique_sprites is not None
@@ -350,19 +372,16 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     else:
                         product_type = instance.data.get("productType", "")
                         version_data = instance.data.get("versionData", {})
-                        self.log.warning(
+                        msg = (
                             f"[{bundle_name}] [KitsuComment] No uniqueSprites found for {product_name} "
                             f"(productType={product_type}). "
-                            f"Available versionData keys: {list(version_data.keys())}"
+                            f"Available versionData keys: {list(version_data.keys())}. "
+                            f"Check AggregateRenderlayerSprites and renderlayer uniqueSprites if expected."
                         )
-                        if product_type == "review" or "review" in instance.data.get("families", []):
-                            product_group = instance.data.get("productGroup")
-                            self.log.warning(
-                                f"[{bundle_name}] [KitsuComment] Review instance {product_name} "
-                                f"missing uniqueSprites. productGroup={product_group}. "
-                                f"Check if AggregateRenderlayerSprites ran and if renderlayers "
-                                f"have uniqueSprites set."
-                            )
+                        if product_type in ("render", "renderlayer"):
+                            self.log.warning(msg)
+                        else:
+                            self.log.debug(msg)
 
                     if self.custom_comment_template["enabled"]:
                         publish_comment = self.format_publish_comment(instance)
