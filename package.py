@@ -18,3 +18,6 @@ ayon_required_addons = {
     "core": ">=0.3.0",
 }
 ayon_compatible_addons = {}
+
+# Allow project to override addon version
+project_can_override_addon_version = True
