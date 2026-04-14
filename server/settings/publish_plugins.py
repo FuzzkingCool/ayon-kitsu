@@ -94,7 +94,7 @@ class CustomCommentTemplateModel(BaseSettingsModel):
 
 class UniqueSpritesBubbleUpModel(BaseSettingsModel):
     """Settings for unique sprites bubble-up feature.
-    
+
     When enabled, this feature will update the parent Kitsu Asset's uniqueSprites
     field when a version's status changes to one of the configured statuses.
     """
