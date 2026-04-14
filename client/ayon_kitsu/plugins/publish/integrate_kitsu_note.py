@@ -399,10 +399,11 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                         )
 
                     if not publish_comment:
-                        self.log.warning(
-                            f"[KitsuComment] Comment is not set for {product_name}, skipping"
+                        publish_comment = f"Review: {product_name}"
+                        self.log.debug(
+                            f"[KitsuComment] Empty comment after template for {product_name}; "
+                            f"using fallback so Kitsu review can attach"
                         )
-                        continue
 
                 # Add individual comment to kitsu task for this instance
                 self.log.debug(
