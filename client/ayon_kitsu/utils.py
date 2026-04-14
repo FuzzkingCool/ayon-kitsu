@@ -40,6 +40,9 @@ def render_kitsu_comment(template_cfg: Dict[str, Any], data: Dict[str, Any]) -> 
     unique_sprites = data.get("uniqueSprites", "")
 
     result = f"version\t{version}\nfamily\t{family}\nname\t{name}"
+    task_val = data.get("task_name")
+    if task_val not in (None, ""):
+        result += f"\ntask_name\t{task_val}"
     # Omit uniqueSprites when 0 (counting was skipped) or empty
     if unique_sprites not in (None, "", 0, "0"):
         result += f"\nuniqueSprites\t{unique_sprites}"

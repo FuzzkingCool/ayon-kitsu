@@ -339,6 +339,7 @@ PUBLISH_DEFAULT_VALUES = {
 | version | `{version}` |
 | family | `{family}` |
 | name | `{name}` |
+| task | `{task_name}` |
 | uniqueSprites | `{uniqueSprites}` |""",
         },
         "unique_sprites_bubble_up": {

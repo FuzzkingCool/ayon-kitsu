@@ -6,6 +6,26 @@ from ayon_core.pipeline import KnownPublishError
 from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 
 
+def _kitsu_task_type_lookup_name(task_entity):
+    """Name to pass to gazu.task.get_task_type_by_name when kitsuId is absent.
+
+    Checklist-style AYON tasks may use a slug ``name`` that is not a Kitsu task type.
+    When ``name`` and ``taskType.name`` differ (case-insensitive), use the type name
+    so the canonical Kitsu task row for that pipeline type is resolved.
+    """
+    task_name = (task_entity.get("name") or "").strip()
+    tt = task_entity.get("taskType")
+    if isinstance(tt, dict):
+        task_type_name = (tt.get("name") or "").strip()
+    elif isinstance(tt, str):
+        task_type_name = tt.strip()
+    else:
+        task_type_name = ""
+    if task_type_name and task_name.lower() != task_type_name.lower():
+        return task_type_name
+    return task_name
+
+
 class CollectKitsuEntities(KitsuPublishContextPlugin):
     """Collect Kitsu entities according to the current context"""
 
@@ -72,15 +92,37 @@ class CollectKitsuEntities(KitsuPublishContextPlugin):
                     kitsu_task_id
                 ) or gazu.task.get_task(kitsu_task_id)
             else:
-                kitsu_task_type = gazu.task.get_task_type_by_name(task_name)
+                lookup_name = _kitsu_task_type_lookup_name(task_entity)
+                if not lookup_name:
+                    raise KnownPublishError(
+                        "Cannot resolve Kitsu task type: AYON task has empty name or "
+                        f"taskType (folder={folder_path}, task id={task_entity.get('id')})."
+                    )
+                if lookup_name != task_name:
+                    self.log.info(
+                        "Kitsu task lookup redirect: AYON task id=%s name=%r != taskType; "
+                        "using type name %r for get_task_type_by_name on Kitsu entity %s",
+                        task_entity.get("id"),
+                        task_name,
+                        lookup_name,
+                        kitsu_entity.get("id"),
+                    )
+                kitsu_task_type = gazu.task.get_task_type_by_name(lookup_name)
                 if not kitsu_task_type:
                     raise KnownPublishError(
-                        f"Task type {task_name} not found in Kitsu!"
+                        f"Task type {lookup_name!r} not found in Kitsu "
+                        f"(AYON task name={task_name!r}, taskType={task_entity.get('taskType')!r})."
                     )
 
                 kitsu_task = gazu.task.get_task_by_name(
                     kitsu_entity, kitsu_task_type
                 )
+                if kitsu_task and lookup_name != task_name:
+                    self.log.info(
+                        "Kitsu task resolved for redirect: kitsu_task_id=%s kitsu name=%r",
+                        kitsu_task.get("id"),
+                        kitsu_task.get("name"),
+                    )
 
             if not kitsu_task:
                 raise KnownPublishError(

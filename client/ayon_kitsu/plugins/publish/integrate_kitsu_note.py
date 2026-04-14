@@ -9,6 +9,30 @@ import pyblish.api
 from ayon_kitsu.pipeline import KitsuPublishContextPlugin
 
 
+def _kitsu_note_task_field(task_entity):
+    """Value for Kitsu note ``task_name`` field when AYON task slug differs from task type.
+
+    Returns ``label`` if set and non-empty, else ``name``, only when
+    ``name`` and ``taskType`` name differ case-insensitively.
+    """
+    if not task_entity or not isinstance(task_entity, dict):
+        return None
+    task_name = (task_entity.get("name") or "").strip()
+    tt = task_entity.get("taskType")
+    if isinstance(tt, dict):
+        task_type_name = (tt.get("name") or "").strip()
+    elif isinstance(tt, str):
+        task_type_name = tt.strip()
+    else:
+        task_type_name = ""
+    if not task_name or not task_type_name:
+        return None
+    if task_name.lower() == task_type_name.lower():
+        return None
+    label = (task_entity.get("label") or "").strip()
+    return label if label else task_name
+
+
 class IntegrateKitsuNote(KitsuPublishContextPlugin):
     """Integrate Kitsu Note"""
 
@@ -300,6 +324,11 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     "family": first_instance.data.get("family", "review"),
                     "name": combined_name,
                 }
+                task_note = _kitsu_note_task_field(
+                    first_instance.data.get("taskEntity")
+                )
+                if task_note:
+                    data_map["task_name"] = task_note
                 if (
                     combined_unique_sprites is not None
                     and str(combined_unique_sprites).strip() not in ("", "0")
@@ -352,6 +381,14 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                         "family": instance.data.get("family", "review"),
                         "name": product_name,
                     }
+                    task_note = _kitsu_note_task_field(
+                        instance.data.get("taskEntity")
+                    )
+                    if task_note:
+                        data_map["task_name"] = task_note
+                        instance.data["task_name"] = task_note
+                    else:
+                        instance.data.pop("task_name", None)
                     publish_comment = render_kitsu_comment(
                         self.custom_comment_template, data_map
                     )
@@ -384,6 +421,13 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                             self.log.debug(msg)
 
                     if self.custom_comment_template["enabled"]:
+                        task_note = _kitsu_note_task_field(
+                            instance.data.get("taskEntity")
+                        )
+                        if task_note:
+                            instance.data["task_name"] = task_note
+                        else:
+                            instance.data.pop("task_name", None)
                         publish_comment = self.format_publish_comment(instance)
                     else:
                         data_map = {
@@ -394,6 +438,14 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                         }
                         if has_unique_sprites:
                             data_map["uniqueSprites"] = str(unique_sprites)
+                        task_note = _kitsu_note_task_field(
+                            instance.data.get("taskEntity")
+                        )
+                        if task_note:
+                            data_map["task_name"] = task_note
+                            instance.data["task_name"] = task_note
+                        else:
+                            instance.data.pop("task_name", None)
                         publish_comment = render_kitsu_comment(
                             self.custom_comment_template, data_map
                         )
