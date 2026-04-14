@@ -16,6 +16,7 @@ import time
 import ayon_api
 from nxtools import log_traceback, logging
 
+from .checklist_kitsu_update import process_checklist_kitsu_update_request
 from .comment_update import process_comment_update_request
 
 
@@ -33,6 +34,13 @@ AYON_EVENT_ENROLLMENTS = [
         "Update Kitsu comment with uniqueSprites",
         2,
         process_comment_update_request,
+    ),
+    (
+        "kitsu.checklist_kitsu_update_request",
+        "addon.kitsu.processor.checklist_kitsu_update",
+        "Sync Kitsu checklist row from AYON task status",
+        2,
+        process_checklist_kitsu_update_request,
     ),
 ]
 

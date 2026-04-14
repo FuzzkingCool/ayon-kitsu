@@ -10,6 +10,12 @@ from nxtools import log_traceback, logging
 
 from . import utils as processor_utils
 from .ayon_event_loop import run_ayon_event_loop
+from .content_sync import (
+    delete_comment_from_ayon,
+    sync_comment_to_ayon,
+    sync_preview_to_ayon,
+    update_comment_on_ayon,
+)
 from .fullsync import project_full_sync
 from .update_from_kitsu import (
     create_or_update_asset,
@@ -443,6 +449,40 @@ class KitsuProcessor:
                     "concept:delete",
                     lambda data: delete_concept(self, data),
                 )
+
+            # Content sync listeners: comments and preview files
+            gazu.events.add_listener(
+                self.event_client,
+                "comment:new",
+                lambda data: sync_comment_to_ayon(
+                    self, data.get("comment_id", ""),
+                    data.get("task_id", ""), data.get("project_id", ""),
+                ),
+            )
+            gazu.events.add_listener(
+                self.event_client,
+                "comment:update",
+                lambda data: update_comment_on_ayon(
+                    self, data.get("comment_id", ""),
+                    data.get("task_id", ""), data.get("project_id", ""),
+                ),
+            )
+            gazu.events.add_listener(
+                self.event_client,
+                "comment:delete",
+                lambda data: delete_comment_from_ayon(
+                    self, data.get("comment_id", ""),
+                    data.get("task_id", ""), data.get("project_id", ""),
+                ),
+            )
+            gazu.events.add_listener(
+                self.event_client,
+                "preview-file:add-file",
+                lambda data: sync_preview_to_ayon(
+                    self, data.get("preview_file_id", ""),
+                    data.get("task_id", ""), data.get("project_id", ""),
+                ),
+            )
 
             logging.info("All Kitsu event listeners registered")
             logging.info("Starting Kitsu event client (blocking call)...")

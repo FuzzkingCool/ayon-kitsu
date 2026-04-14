@@ -120,7 +120,10 @@ class KitsuAddon(BaseServerAddon):
         pending_comment_query = """
             SELECT COUNT(*) as count
             FROM events
-            WHERE topic = 'kitsu.comment_update_request'
+            WHERE topic IN (
+                'kitsu.comment_update_request',
+                'kitsu.checklist_kitsu_update_request'
+            )
             AND status IN ('pending', 'in_progress')
         """
 

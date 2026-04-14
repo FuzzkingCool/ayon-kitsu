@@ -187,22 +187,23 @@ def find_files_in_subdir(
     return output
 
 
-def _get_yarn_executable():
-    cmd = "which"
-    if platform.system().lower() == "windows":
-        cmd = "where"
-
-    for line in subprocess.check_output(
-        [cmd, "yarn"], encoding="utf-8"
-    ).splitlines():
-        if not line or not os.path.exists(line):
-            continue
-        try:
-            subprocess.call([line, "--version"])
-            return line
-        except OSError:
-            continue
-    return None
+def _get_yarn_executable() -> Optional[str]:
+    """Resolve Yarn on PATH without shelling out to where/which (those exit 1 if missing)."""
+    yarn = shutil.which("yarn")
+    if not yarn:
+        return None
+    try:
+        completed = subprocess.run(
+            [yarn, "--version"],
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+    except OSError:
+        return None
+    if completed.returncode != 0:
+        return None
+    return yarn
 
 
 def copy_server_content(addon_output_dir: str, log: logging.Logger):

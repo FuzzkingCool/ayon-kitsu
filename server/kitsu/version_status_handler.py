@@ -47,6 +47,11 @@ async def handle_task_status_change(addon, event):
             f"[{bundle_name}] [ayon-kitsu] Full event summary: {event.summary}, payload: {event.payload}"
         )
 
+        from .checklist_task_dispatch import try_dispatch_checklist_kitsu_update
+
+        if await try_dispatch_checklist_kitsu_update(addon, event):
+            return
+
         bubble_up_settings = get_bubble_up_settings(addon, event.project)
         if not bubble_up_settings:
             logging.debug(

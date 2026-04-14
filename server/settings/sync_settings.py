@@ -88,6 +88,76 @@ class DefaultSyncInfo(BaseSettingsModel):
     )
 
 
+class ChecklistSubtasksSettings(BaseSettingsModel):
+    """Map Kitsu pinned comments with checklists to AYON child tasks (processor).
+
+    Index-based keys tie each row to ``{comment_id}:{index}``; reordering rows in
+    Kitsu can reassign semantics. Child tasks use the same task type as the
+    parent Kitsu-synced task.
+
+    Bulk checklist sync after full project entity sync does not require Content
+    sync (no AYON comment activities). Enable **Sync pinned checklists after
+    full project sync** for that path."""
+
+    enabled: bool = SettingsField(
+        False,
+        title="Enable checklist child tasks",
+        description=(
+            "Create/update AYON child tasks from Kitsu pinned comments with "
+            "checklists. For a full-project pass without Content sync, also enable "
+            "**Sync pinned checklists after full project sync** below."
+        ),
+    )
+    done_status_name: str = SettingsField(
+        "Done",
+        title="AYON status name for checked items",
+    )
+    wip_status_name: str = SettingsField(
+        "In Progress",
+        title="AYON status name for unchecked items",
+    )
+    delete_tasks_on_comment_delete: bool = SettingsField(
+        True,
+        title="Delete child tasks when the Kitsu comment is deleted",
+    )
+    delete_tasks_when_unpinned: bool = SettingsField(
+        False,
+        title="Delete child tasks when the comment is unpinned",
+    )
+    bulk_sync_after_fullsync: bool = SettingsField(
+        False,
+        title="Sync pinned checklists after full project sync",
+        description=(
+            "After structural Kitsu→AYON sync for a project, scan Kitsu task "
+            "comments and upsert child tasks for pinned checklists. Does not "
+            "require Content sync or AYON comment activities."
+        ),
+    )
+
+
+class ContentSyncSettings(BaseSettingsModel):
+    """Sync Kitsu content (thumbnails, comments, previews) to AYON.
+    Disabled by default -- enable after bulk migration via scripts.
+
+    Pinned checklist → AYON child tasks can be synced after full project entity
+    sync via **Checklist child tasks** without enabling Content sync here."""
+
+    enabled: bool = SettingsField(False, title="Enable content sync")
+    sync_thumbnails: bool = SettingsField(True, title="Sync entity thumbnails")
+    sync_comments: bool = SettingsField(
+        True, title="Sync task comments to activity feed"
+    )
+    sync_previews: bool = SettingsField(
+        True, title="Sync preview files as reviewables"
+    )
+    sync_attachments: bool = SettingsField(
+        True, title="Sync comment attachments"
+    )
+    review_product_type: str = SettingsField(
+        "review", title="Product type for synced reviews"
+    )
+
+
 class SyncSettings(BaseSettingsModel):
     """Enabling 'Delete projects' will remove projects on Ayon when they get deleted on Kitsu"""
 
@@ -100,10 +170,38 @@ class SyncSettings(BaseSettingsModel):
         default_factory=DefaultSyncInfo,
         title="Default sync info",
     )
+    content_sync: ContentSyncSettings = SettingsField(
+        default_factory=ContentSyncSettings,
+        title="Content sync",
+    )
+    checklist_subtasks: ChecklistSubtasksSettings = SettingsField(
+        default_factory=ChecklistSubtasksSettings,
+        title="Checklist child tasks (Kitsu ↔ AYON)",
+    )
 
+
+CONTENT_SYNC_DEFAULT_VALUES = {
+    "enabled": False,
+    "sync_thumbnails": True,
+    "sync_comments": True,
+    "sync_previews": True,
+    "sync_attachments": True,
+    "review_product_type": "review",
+}
+
+CHECKLIST_SUBTASKS_DEFAULT_VALUES = {
+    "enabled": False,
+    "done_status_name": "Done",
+    "wip_status_name": "In Progress",
+    "delete_tasks_on_comment_delete": True,
+    "delete_tasks_when_unpinned": False,
+    "bulk_sync_after_fullsync": False,
+}
 
 SYNC_DEFAULT_VALUES = {
     "delete_projects": False,
+    "content_sync": CONTENT_SYNC_DEFAULT_VALUES,
+    "checklist_subtasks": CHECKLIST_SUBTASKS_DEFAULT_VALUES,
     "sync_users": {
         "enabled": False,
         "default_password": "default_password",

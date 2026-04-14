@@ -8,6 +8,10 @@ from nxtools import log_traceback, logging
 if TYPE_CHECKING:
     from .processor import KitsuProcessor
 
+from .content_sync import (
+    sync_all_content_for_project,
+    sync_pinned_checklists_for_project,
+)
 from .sync_error_format import (
     format_batch_push_headline,
     format_entity_sync_headline,
@@ -477,3 +481,21 @@ def project_full_sync(
                 "failedCount": failed_n,
             },
         )
+
+    # Content sync (thumbnails, comments, previews) -- runs only if enabled
+    try:
+        sync_all_content_for_project(parent, kitsu_project_id, project_name)
+    except Exception as e:
+        logging.error(f"[fullsync] Content sync failed for {project_name}: {e}")
+        log_traceback(f"Content sync error for {project_name}")
+
+    # Pinned checklists → AYON child tasks (no Content sync required)
+    try:
+        sync_pinned_checklists_for_project(
+            parent, kitsu_project_id, project_name
+        )
+    except Exception as e:
+        logging.error(
+            f"[fullsync] Pinned checklist bulk sync failed for {project_name}: {e}"
+        )
+        log_traceback(f"Pinned checklist bulk sync error for {project_name}")
