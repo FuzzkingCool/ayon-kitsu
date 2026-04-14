@@ -14,6 +14,10 @@ import gazu
 from nxtools import slugify
 
 from . import utils as processor_utils
+from .checklist_constants import (
+    DEFAULT_CHECKLIST_DONE_STATUS_NAME,
+    DEFAULT_CHECKLIST_WIP_STATUS_NAME,
+)
 
 if TYPE_CHECKING:
     from .processor import KitsuProcessor
@@ -63,14 +67,20 @@ def _checklist_item_key(comment_id: str, index: int) -> str:
 
 def _target_status(checked: bool, settings: dict[str, Any]) -> str:
     if checked:
-        return str(settings.get("done_status_name") or "Done")
-    return str(settings.get("wip_status_name") or "In Progress")
+        return str(
+            settings.get("done_status_name") or DEFAULT_CHECKLIST_DONE_STATUS_NAME,
+        )
+    return str(
+        settings.get("wip_status_name") or DEFAULT_CHECKLIST_WIP_STATUS_NAME,
+    )
 
 
 def checklist_checked_from_ayon_status(
     status: str | None, settings: dict[str, Any],
 ) -> bool:
-    return _norm(status) == _norm(str(settings.get("done_status_name") or "Done"))
+    return _norm(status) == _norm(
+        str(settings.get("done_status_name") or DEFAULT_CHECKLIST_DONE_STATUS_NAME),
+    )
 
 
 def _ayon_task_by_kitsu_id(project_name: str, kitsu_id: str) -> dict | None:

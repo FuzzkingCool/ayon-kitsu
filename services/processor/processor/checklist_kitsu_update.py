@@ -9,6 +9,10 @@ from typing import TYPE_CHECKING, Any
 import gazu
 
 from . import utils as processor_utils
+from .checklist_constants import (
+    DEFAULT_CHECKLIST_DONE_STATUS_NAME,
+    DEFAULT_CHECKLIST_WIP_STATUS_NAME,
+)
 from .checklist_subtask_sync import (
     _checklist_settings,
     checklist_checked_from_ayon_status,
@@ -41,10 +45,10 @@ def process_checklist_kitsu_update_request(
         return
 
     done_name = summary.get("done_status_name") or settings.get(
-        "done_status_name", "Done",
+        "done_status_name", DEFAULT_CHECKLIST_DONE_STATUS_NAME,
     )
     wip_name = summary.get("wip_status_name") or settings.get(
-        "wip_status_name", "In Progress",
+        "wip_status_name", DEFAULT_CHECKLIST_WIP_STATUS_NAME,
     )
     eff = {"done_status_name": done_name, "wip_status_name": wip_name}
     desired_checked = checklist_checked_from_ayon_status(str(new_status), eff)

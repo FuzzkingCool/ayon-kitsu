@@ -9,6 +9,11 @@ from typing import Any, Optional
 
 from ayon_server.events import dispatch_event
 
+from ..settings.checklist_constants import (
+    DEFAULT_CHECKLIST_DONE_STATUS_NAME,
+    DEFAULT_CHECKLIST_WIP_STATUS_NAME,
+)
+
 
 def _extract_new_old_status(event: Any, project_name: str, task_id: str) -> tuple[Optional[str], Optional[str]]:
     """Best-effort status resolution (mirrors version_status_handler patterns)."""
@@ -89,8 +94,12 @@ async def try_dispatch_checklist_kitsu_update(addon, event) -> bool:
         )
         return False
 
-    done_name = str(getattr(cs, "done_status_name", "") or "Done")
-    wip_name = str(getattr(cs, "wip_status_name", "") or "In Progress")
+    done_name = str(
+        getattr(cs, "done_status_name", "") or DEFAULT_CHECKLIST_DONE_STATUS_NAME,
+    )
+    wip_name = str(
+        getattr(cs, "wip_status_name", "") or DEFAULT_CHECKLIST_WIP_STATUS_NAME,
+    )
 
     try:
         await dispatch_event(

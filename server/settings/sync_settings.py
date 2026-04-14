@@ -1,6 +1,15 @@
 from ayon_server.settings import BaseSettingsModel, SettingsField
 from ayon_server.types import NAME_REGEX
 
+from .checklist_constants import (
+    DEFAULT_CHECKLIST_DONE_STATUS_NAME,
+    DEFAULT_CHECKLIST_WIP_STATUS_NAME,
+    SYNC_STATE_LABEL_BLOCKED,
+    SYNC_STATE_LABEL_DONE,
+    SYNC_STATE_LABEL_IN_PROGRESS,
+    SYNC_STATE_LABEL_NOT_STARTED,
+)
+
 
 #
 ## Sync users
@@ -61,10 +70,10 @@ class TaskCondition(BaseSettingsModel):
 
 def _states_enum():
     return [
-        {"value": "not_started", "label": "Not started"},
-        {"value": "in_progress", "label": "In progress"},
-        {"value": "done", "label": "Done"},
-        {"value": "blocked", "label": "Blocked"},
+        {"value": "not_started", "label": SYNC_STATE_LABEL_NOT_STARTED},
+        {"value": "in_progress", "label": SYNC_STATE_LABEL_IN_PROGRESS},
+        {"value": "done", "label": SYNC_STATE_LABEL_DONE},
+        {"value": "blocked", "label": SYNC_STATE_LABEL_BLOCKED},
     ]
 
 
@@ -109,11 +118,11 @@ class ChecklistSubtasksSettings(BaseSettingsModel):
         ),
     )
     done_status_name: str = SettingsField(
-        "Done",
+        DEFAULT_CHECKLIST_DONE_STATUS_NAME,
         title="AYON status name for checked items",
     )
     wip_status_name: str = SettingsField(
-        "In Progress",
+        DEFAULT_CHECKLIST_WIP_STATUS_NAME,
         title="AYON status name for unchecked items",
     )
     delete_tasks_on_comment_delete: bool = SettingsField(
@@ -191,8 +200,8 @@ CONTENT_SYNC_DEFAULT_VALUES = {
 
 CHECKLIST_SUBTASKS_DEFAULT_VALUES = {
     "enabled": False,
-    "done_status_name": "Done",
-    "wip_status_name": "In Progress",
+    "done_status_name": DEFAULT_CHECKLIST_DONE_STATUS_NAME,
+    "wip_status_name": DEFAULT_CHECKLIST_WIP_STATUS_NAME,
     "delete_tasks_on_comment_delete": True,
     "delete_tasks_when_unpinned": False,
     "bulk_sync_after_fullsync": False,
