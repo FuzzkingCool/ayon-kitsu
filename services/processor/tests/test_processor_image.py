@@ -6,6 +6,12 @@ This script:
 2. Loads environment variables from ../.env
 3. Builds the Docker image
 4. Runs the container with the environment variables
+
+Poetry in ``pyproject.toml`` may use a PEP 440 *local* segment with ``+`` (e.g.
+``1.2.6+prod.0.2.31``) because that validates for ``poetry install`` in the
+image. OCI/Docker image tags must not contain ``+``, so repo ``package.py``
+uses hyphens for the same logical release (e.g. ``1.2.6-prod.0.2.31``) and we
+normalize defensively when tagging (see ``oci_image_tag``).
 """
 
 import os
@@ -27,6 +33,52 @@ def get_version():
         content = {}
         exec(f.read(), content)
         return content.get("version", "latest")
+
+
+def get_poetry_version(processor_dir: Path) -> str:
+    """Version from ``services/processor/pyproject.toml`` (Poetry / PEP 440).
+
+    Parsed without ``tomllib`` so this script runs on Python < 3.11.
+    """
+    pyproject = processor_dir / "pyproject.toml"
+    if not pyproject.is_file():
+        raise FileNotFoundError(f"pyproject.toml not found at {pyproject}")
+    in_poetry = False
+    with pyproject.open("r", encoding="utf-8") as f:
+        for raw in f:
+            stripped = raw.split("#", 1)[0].strip()
+            if stripped.startswith("[") and stripped.endswith("]"):
+                header = stripped[1:-1].strip()
+                in_poetry = header == "tool.poetry"
+                continue
+            if not in_poetry or not stripped.startswith("version"):
+                continue
+            if "=" not in stripped:
+                continue
+            _, rhs = stripped.split("=", 1)
+            val = rhs.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                return val[1:-1]
+    raise RuntimeError("pyproject.toml has no [tool.poetry] version = ... line")
+
+
+def oci_image_tag(version: str) -> str:
+    """Map a version string to a valid Docker/OCI image tag component."""
+    return version.replace("+", "-")
+
+
+def assert_addon_version_matches_poetry(processor_dir: Path, package_version: str) -> None:
+    """Ensure addon and processor Poetry versions are one release (PEP 440 + vs OCI -)."""
+    poetry_version = get_poetry_version(processor_dir)
+    if oci_image_tag(poetry_version) != package_version:
+        print(
+            "ERROR: package.py `version` must match processor pyproject.toml "
+            "[tool.poetry] version when `+` in Poetry is mapped to `-` for OCI.\n"
+            f"  package.py: {package_version!r}\n"
+            f"  pyproject.toml: {poetry_version!r} -> OCI {oci_image_tag(poetry_version)!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 
 def load_env_file(env_path):
@@ -126,7 +178,11 @@ def main():
     # Get version
     try:
         version = get_version()
+        processor_dir = script_dir.parent
+        assert_addon_version_matches_poetry(processor_dir, version)
+        poetry_version = get_poetry_version(processor_dir)
         print(f"\nAddon version: {version}")
+        print(f"Poetry version: {poetry_version} (aligned for OCI tag)")
     except Exception as e:
         print(f"ERROR: Failed to get version: {e}")
         sys.exit(1)
@@ -166,8 +222,9 @@ def main():
     # Set version in env vars
     env_vars["AYON_ADDON_VERSION"] = version
 
-    # Build image
-    image_name = f"ghcr.io/fuzzkingcool/ayon-kitsu-processor:{version}"
+    # Build image (tag must be OCI-safe; package.py uses hyphen form)
+    image_tag = oci_image_tag(version)
+    image_name = f"ghcr.io/fuzzkingcool/ayon-kitsu-processor:{image_tag}"
     build_image(image_name, script_dir)
 
     # Run container

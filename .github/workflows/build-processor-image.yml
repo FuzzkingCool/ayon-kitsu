@@ -8,6 +8,7 @@ on:
       - develop
     paths:
       - 'services/processor/**'
+      - 'package.py'
       - '.github/workflows/build-processor-image.yml'
   workflow_dispatch:
 
@@ -29,14 +30,15 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Extract version from pyproject.toml
+      # package.py `version` is what AYON uses for services.processor.image (OCI-safe, no '+').
+      # pyproject.toml may use PEP 440 `+` for Poetry inside the image; do not use that raw string as a Docker tag.
+      - name: Extract addon version from package.py
         id: version
-        working-directory: services/processor
         run: |
-          VERSION=$(grep -oP 'version\s*=\s*"\K[^"]+' pyproject.toml)
+          VERSION=$(python3 -c "ns={}; exec(open('package.py', encoding='utf-8').read(), ns); print(ns['version'])")
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Extracted version: $VERSION"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Extracted version: $VERSION (image :$VERSION, git tag v${VERSION})"
 
       - name: Check if tag exists
         id: check_tag
