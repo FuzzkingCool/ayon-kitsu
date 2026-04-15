@@ -8,6 +8,7 @@ from ayon_harmony.logger import log as log_harmony
 from ayon_kitsu.pipeline import (
     KitsuPublishContextPlugin,
 )
+from ayon_kitsu.utils import resolve_canonical_kitsu_task
 
 
 class CollectKitsuLatestReviewVersion(KitsuPublishContextPlugin):
@@ -119,9 +120,8 @@ class CollectKitsuLatestReviewVersion(KitsuPublishContextPlugin):
                 )
                 return 0
 
-            # Get Kitsu IDs from AYON entities
+            # Get Kitsu folder id from AYON
             kitsu_folder_id = folder_entity.get("data", {}).get("kitsuId")
-            kitsu_task_id = task_entity.get("data", {}).get("kitsuId")
 
             if not kitsu_folder_id:
                 self.log.debug(
@@ -129,28 +129,21 @@ class CollectKitsuLatestReviewVersion(KitsuPublishContextPlugin):
                 )
                 return 0
 
-            # Find Kitsu task - use explicit ID if available, otherwise query by name
-            if kitsu_task_id:
-                kitsu_task = gazu.task.get_task(kitsu_task_id)
-            else:
-                # Fallback: find task by folder and task type name
-                kitsu_entity = gazu.entity.get_entity(kitsu_folder_id)
-                if not kitsu_entity:
-                    self.log.debug(
-                        f"[KitsuLatestReview] Kitsu entity not found: {kitsu_folder_id}"
-                    )
-                    return 0
-
-                kitsu_task_type = gazu.task.get_task_type_by_name(task_name)
-                if not kitsu_task_type:
-                    self.log.debug(
-                        f"[KitsuLatestReview] Kitsu task type not found: {task_name}"
-                    )
-                    return 0
-
-                kitsu_task = gazu.task.get_task_by_name(
-                    kitsu_entity, kitsu_task_type
+            kitsu_entity = gazu.entity.get_entity(kitsu_folder_id)
+            if not kitsu_entity:
+                self.log.debug(
+                    f"[KitsuLatestReview] Kitsu entity not found: {kitsu_folder_id}"
                 )
+                return 0
+
+            # Canonical Kitsu task (entity + pipeline task type; checklist children
+            # resolve via type / parent id, not AYON task slug as Kitsu type name)
+            kitsu_task = resolve_canonical_kitsu_task(
+                task_entity,
+                kitsu_entity,
+                kitsu_entities_by_id=None,
+                log=self.log,
+            )
 
             if not kitsu_task:
                 self.log.debug(

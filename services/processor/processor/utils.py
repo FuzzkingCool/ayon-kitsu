@@ -133,6 +133,29 @@ def preprocess_task(
     return task
 
 
+def format_kitsu_task_display(value: Any) -> str:
+    """Format task for Kitsu comment placeholders and tab lines.
+
+    Anatomy-style dicts ``{"name", "type", "short"}`` become ``name ( type )``.
+
+    Keep in sync with client/ayon_kitsu/utils.py:format_kitsu_task_display.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        name = (value.get("name") or "").strip()
+        typ = (value.get("type") or "").strip()
+        if name and typ:
+            return f"{name} ( {typ} )"
+        if name:
+            return name
+        if typ:
+            return typ
+    return str(value)
+
+
 def render_kitsu_comment(
     template_cfg: Dict[str, Any], data: Dict[str, Any]
 ) -> str:
@@ -158,7 +181,11 @@ def render_kitsu_comment(
         # Replace unknown keys with empty string
         def replace_missing_key(match: re.Match[str]) -> str:
             key = match.group(1)
-            return "" if key not in data else str(data[key])
+            if key not in data:
+                return ""
+            if key in ("task", "task_name"):
+                return format_kitsu_task_display(data[key])
+            return str(data[key])
 
         pattern = r"\{([^}]*)\}"
         result = re.sub(pattern, replace_missing_key, template)
@@ -174,8 +201,8 @@ def render_kitsu_comment(
     unique_sprites = data.get("uniqueSprites", "")
 
     result = f"version\t{version}\nfamily\t{family}\nname\t{name}"
-    task_val = data.get("task_name")
-    if task_val not in (None, ""):
+    task_val = format_kitsu_task_display(data.get("task_name"))
+    if task_val:
         result += f"\ntask_name\t{task_val}"
     # Omit uniqueSprites when 0 (counting was skipped) or empty
     if unique_sprites not in (None, "", 0, "0"):

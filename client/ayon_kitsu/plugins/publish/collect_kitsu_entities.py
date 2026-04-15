@@ -4,26 +4,7 @@ import pyblish.api
 
 from ayon_core.pipeline import KnownPublishError
 from ayon_kitsu.pipeline import KitsuPublishContextPlugin
-
-
-def _kitsu_task_type_lookup_name(task_entity):
-    """Name to pass to gazu.task.get_task_type_by_name when kitsuId is absent.
-
-    Checklist-style AYON tasks may use a slug ``name`` that is not a Kitsu task type.
-    When ``name`` and ``taskType.name`` differ (case-insensitive), use the type name
-    so the canonical Kitsu task row for that pipeline type is resolved.
-    """
-    task_name = (task_entity.get("name") or "").strip()
-    tt = task_entity.get("taskType")
-    if isinstance(tt, dict):
-        task_type_name = (tt.get("name") or "").strip()
-    elif isinstance(tt, str):
-        task_type_name = tt.strip()
-    else:
-        task_type_name = ""
-    if task_type_name and task_name.lower() != task_type_name.lower():
-        return task_type_name
-    return task_name
+from ayon_kitsu.utils import resolve_canonical_kitsu_task
 
 
 class CollectKitsuEntities(KitsuPublishContextPlugin):
@@ -83,50 +64,28 @@ class CollectKitsuEntities(KitsuPublishContextPlugin):
                 continue
 
             task_name = task_entity["name"]
-            kitsu_task_id = task_entity["data"].get("kitsuId")
 
             self.log.debug(f"Collect kitsu: {kitsu_entity}")
 
-            if kitsu_task_id:
-                kitsu_task = kitsu_entities_by_id.get(
-                    kitsu_task_id
-                ) or gazu.task.get_task(kitsu_task_id)
-            else:
-                lookup_name = _kitsu_task_type_lookup_name(task_entity)
-                if not lookup_name:
-                    raise KnownPublishError(
-                        "Cannot resolve Kitsu task type: AYON task has empty name or "
-                        f"taskType (folder={folder_path}, task id={task_entity.get('id')})."
-                    )
-                if lookup_name != task_name:
-                    self.log.info(
-                        "Kitsu task lookup redirect: AYON task id=%s name=%r != taskType; "
-                        "using type name %r for get_task_type_by_name on Kitsu entity %s",
-                        task_entity.get("id"),
-                        task_name,
-                        lookup_name,
-                        kitsu_entity.get("id"),
-                    )
-                kitsu_task_type = gazu.task.get_task_type_by_name(lookup_name)
-                if not kitsu_task_type:
-                    raise KnownPublishError(
-                        f"Task type {lookup_name!r} not found in Kitsu "
-                        f"(AYON task name={task_name!r}, taskType={task_entity.get('taskType')!r})."
-                    )
-
-                kitsu_task = gazu.task.get_task_by_name(
-                    kitsu_entity, kitsu_task_type
-                )
-                if kitsu_task and lookup_name != task_name:
-                    self.log.info(
-                        "Kitsu task resolved for redirect: kitsu_task_id=%s kitsu name=%r",
-                        kitsu_task.get("id"),
-                        kitsu_task.get("name"),
-                    )
+            kitsu_task = resolve_canonical_kitsu_task(
+                task_entity,
+                kitsu_entity,
+                kitsu_entities_by_id=kitsu_entities_by_id,
+                log=self.log,
+            )
 
             if not kitsu_task:
                 raise KnownPublishError(
-                    f"Task {task_name} not found in kitsu!"
+                    f"Task {task_name} not found in kitsu "
+                    f"(folder={folder_path}, task id={task_entity.get('id')})!"
+                )
+
+            ts = kitsu_task.get("task_status")
+            if not isinstance(ts, dict) or not ts.get("short_name"):
+                raise KnownPublishError(
+                    "Kitsu task payload has no embedded task_status for publish "
+                    f"(task id={kitsu_task.get('id')}, keys={sorted(kitsu_task.keys())}). "
+                    "Check gazu/Kitsu API or task id / cache resolution."
                 )
 
             kitsu_entities_by_id[kitsu_task["id"]] = kitsu_task

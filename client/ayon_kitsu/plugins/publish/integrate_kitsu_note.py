@@ -7,13 +7,14 @@ import gazu
 import pyblish.api
 
 from ayon_kitsu.pipeline import KitsuPublishContextPlugin
+from ayon_kitsu.utils import format_kitsu_task_display
 
 
 def _kitsu_note_task_field(task_entity):
-    """Value for Kitsu note ``task_name`` field when AYON task slug differs from task type.
+    """Value for Kitsu note ``task_name`` when AYON task slug differs from task type.
 
-    Returns ``label`` if set and non-empty, else ``name``, only when
-    ``name`` and ``taskType`` name differ case-insensitively.
+    Returns ``name ( taskType )`` only when ``name`` and ``taskType`` name differ
+    case-insensitively; otherwise ``None``.
     """
     if not task_entity or not isinstance(task_entity, dict):
         return None
@@ -29,8 +30,7 @@ def _kitsu_note_task_field(task_entity):
         return None
     if task_name.lower() == task_type_name.lower():
         return None
-    label = (task_entity.get("label") or "").strip()
-    return label if label else task_name
+    return f"{task_name} ( {task_type_name} )"
 
 
 class IntegrateKitsuNote(KitsuPublishContextPlugin):
@@ -177,8 +177,9 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                     "in the comment".format(key)
                 )
                 return ""
-            else:
-                return str(instance.data[key])
+            if key in ("task", "task_name"):
+                return format_kitsu_task_display(instance.data[key])
+            return str(instance.data[key])
 
         template = self.custom_comment_template["comment_template"]
         pattern = r"\{([^}]*)\}"
