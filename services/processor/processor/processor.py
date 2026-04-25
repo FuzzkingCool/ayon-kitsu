@@ -23,6 +23,7 @@ from .update_from_kitsu import (
     create_or_update_edit,
     create_or_update_episode,
     create_or_update_person,
+    create_or_update_playlist,
     create_or_update_sequence,
     create_or_update_shot,
     create_or_update_task,
@@ -31,6 +32,7 @@ from .update_from_kitsu import (
     delete_edit,
     delete_episode,
     delete_person,
+    delete_playlist,
     delete_project,
     delete_sequence,
     delete_shot,
@@ -396,6 +398,21 @@ class KitsuProcessor:
                 self.event_client,
                 "task:delete",
                 lambda data: delete_task(self, data),
+            )
+            gazu.events.add_listener(
+                self.event_client,
+                "playlist:new",
+                lambda data: create_or_update_playlist(self, data),
+            )
+            gazu.events.add_listener(
+                self.event_client,
+                "playlist:update",
+                lambda data: create_or_update_playlist(self, data),
+            )
+            gazu.events.add_listener(
+                self.event_client,
+                "playlist:delete",
+                lambda data: delete_playlist(self, data),
             )
             gazu.events.add_listener(
                 self.event_client,

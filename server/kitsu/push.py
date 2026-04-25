@@ -33,6 +33,8 @@ from .utils import (
 
 from .addon_helpers import to_username, required_values
 from .concept_utils import concept_folder_display_name, concept_vizdev_surrogate_kitsu_id
+from .playlist_entity_sync import delete_playlist as delete_playlist_entity
+from .playlist_entity_sync import sync_playlist as sync_playlist_entity
 
 if TYPE_CHECKING:
     from .. import KitsuAddon
@@ -50,6 +52,7 @@ KitsuEntityType = Literal[
     "Task",
     "Person",
     "Project",
+    "Playlist",
 ]
 
 
@@ -830,6 +833,14 @@ async def push_entities(
                     users,
                     entity_dict,
                 )
+        elif entity_dict["type"] == "Playlist":
+            playlist_settings = getattr(
+                settings.sync_settings, "playlist_sync", None
+            )
+            if playlist_settings is not None and getattr(
+                playlist_settings, "enabled", False
+            ):
+                await sync_playlist_entity(addon, user, project, entity_dict)
         elif entity_dict["type"] != "Task":
             await sync_folder(
                 addon,
@@ -898,6 +909,15 @@ async def remove_entities(
                 continue
 
             await target_user.delete()
+
+        elif entity_dict["type"] == "Playlist":
+            playlist_settings = getattr(
+                settings.sync_settings, "playlist_sync", None
+            )
+            if playlist_settings is not None and getattr(
+                playlist_settings, "enabled", False
+            ):
+                await delete_playlist_entity(addon, user, project, entity_dict)
 
         elif entity_dict["type"] == "Task":
             task = await get_task_by_kitsu_id(

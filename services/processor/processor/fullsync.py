@@ -12,6 +12,7 @@ from .content_sync import (
     sync_all_content_for_project,
     sync_pinned_checklists_for_project,
 )
+from .playlist_push_entity import sync_playlists_via_push_for_project
 from .sync_error_format import (
     format_batch_push_headline,
     format_entity_sync_headline,
@@ -481,6 +482,17 @@ def project_full_sync(
                 "failedCount": failed_n,
             },
         )
+
+    # Kitsu playlists → AYON entity lists (folder), after folder map is populated
+    try:
+        sync_playlists_via_push_for_project(
+            parent, kitsu_project_id, project_name, kitsu_folder_map
+        )
+    except Exception as e:
+        logging.error(
+            f"[fullsync] Playlist→list sync failed for {project_name}: {e}"
+        )
+        log_traceback(f"Playlist sync error for {project_name}")
 
     # Content sync (thumbnails, comments, previews) -- runs only if enabled
     try:

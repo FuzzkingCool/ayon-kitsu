@@ -5,6 +5,10 @@ import gazu
 from nxtools import log_traceback, logging
 
 from . import utils
+from .playlist_push_entity import (
+    build_playlist_push_entity,
+    playlist_sync_enabled,
+)
 from .sync_error_format import format_entity_sync_headline
 from .sync_events import emit_sync_entity_failed, parse_http_error_detail
 from .task_relink import push_entities_with_relink
@@ -419,6 +423,84 @@ def delete_concept(parent: "KitsuProcessor", data: dict[str, str]):
     except Exception as e:
         logging.error(f"[update_from_kitsu] Failed to delete concept {data.get('concept_id')} from {project_name}: {e}")
         log_traceback(f"Error deleting concept {data.get('concept_id')}")
+
+
+def create_or_update_playlist(parent: "KitsuProcessor", data: dict[str, str]):
+    logging.info(f"[update_from_kitsu] create_or_update_playlist: {data}")
+    if not playlist_sync_enabled(parent):
+        logging.debug("[update_from_kitsu] playlist sync disabled, skipping")
+        return
+    project_name = parent.get_paired_ayon_project(data.get("project_id"))
+    if not project_name:
+        logging.debug(
+            f"[update_from_kitsu] Project {data.get('project_id')} not paired, "
+            f"skipping playlist {data.get('playlist_id')}"
+        )
+        return
+    playlist_id = data.get("playlist_id") or data.get("id")
+    if not playlist_id:
+        logging.warning("[update_from_kitsu] playlist event missing playlist_id")
+        return
+    utils.set_kitsu_host(parent.kitsu_server_url)
+    try:
+        full = gazu.playlist.get_playlist(playlist_id)
+        entity = build_playlist_push_entity(
+            project_name, full, {}, ayon_api.get_base_url()
+        )
+        response = ayon_api.post(
+            f"{parent.entrypoint}/push",
+            project_name=project_name,
+            entities=[entity],
+        )
+        response.raise_for_status()
+        logging.info(
+            f"[update_from_kitsu] Successfully synced playlist {playlist_id} "
+            f"in {project_name}"
+        )
+    except Exception as e:
+        logging.error(
+            f"[update_from_kitsu] Failed to sync playlist {playlist_id} "
+            f"in {project_name}: {e}"
+        )
+        log_traceback(f"Error syncing playlist {playlist_id}")
+
+
+def delete_playlist(parent: "KitsuProcessor", data: dict[str, str]):
+    logging.info(f"[update_from_kitsu] delete_playlist: {data}")
+    if not playlist_sync_enabled(parent):
+        return
+    project_name = parent.get_paired_ayon_project(data.get("project_id"))
+    if not project_name:
+        logging.debug(
+            f"[update_from_kitsu] Project {data.get('project_id')} not paired, "
+            f"skipping playlist delete {data.get('playlist_id')}"
+        )
+        return
+    playlist_id = data.get("playlist_id") or data.get("id")
+    if not playlist_id:
+        return
+    try:
+        entity = {
+            "id": playlist_id,
+            "type": "Playlist",
+            "ayon_server_url": ayon_api.get_base_url(),
+        }
+        response = ayon_api.post(
+            f"{parent.entrypoint}/remove",
+            project_name=project_name,
+            entities=[entity],
+        )
+        response.raise_for_status()
+        logging.info(
+            f"[update_from_kitsu] Successfully removed playlist {playlist_id} "
+            f"from {project_name}"
+        )
+    except Exception as e:
+        logging.error(
+            f"[update_from_kitsu] Failed to delete playlist {playlist_id} "
+            f"from {project_name}: {e}"
+        )
+        log_traceback(f"Error deleting playlist {playlist_id}")
 
 
 def create_or_update_person(parent: "KitsuProcessor", data: dict[str, str]):

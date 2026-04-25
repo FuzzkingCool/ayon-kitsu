@@ -167,6 +167,24 @@ class ContentSyncSettings(BaseSettingsModel):
     )
 
 
+class PlaylistSyncSettings(BaseSettingsModel):
+    """Mirror Kitsu playlists into AYON folder-type entity lists (processor + /push).
+
+    Lists are stored under the project's first entity-list folder. Each list
+    carries ``data.kitsuId`` with the Kitsu playlist id for idempotent updates.
+    """
+
+    enabled: bool = SettingsField(
+        False,
+        title="Sync Kitsu playlists to AYON lists",
+        description=(
+            "When enabled, the processor mirrors Kitsu playlists as AYON entity "
+            "lists (entity type folder) after structural sync, and on "
+            "``playlist:new`` / ``playlist:update`` / ``playlist:delete`` events."
+        ),
+    )
+
+
 class ConceptSyncSettings(BaseSettingsModel):
     """Kitsu Concept entities: folder display naming and a default AYON task for reviews.
 
@@ -226,6 +244,10 @@ class SyncSettings(BaseSettingsModel):
         default_factory=ConceptSyncSettings,
         title="Concept entities (VizDev task, naming)",
     )
+    playlist_sync: PlaylistSyncSettings = SettingsField(
+        default_factory=PlaylistSyncSettings,
+        title="Kitsu playlists → AYON lists",
+    )
 
 
 CONTENT_SYNC_DEFAULT_VALUES = {
@@ -253,11 +275,16 @@ CONCEPT_SYNC_DEFAULT_VALUES = {
     "sanitize_kitsu_auto_naming": True,
 }
 
+PLAYLIST_SYNC_DEFAULT_VALUES = {
+    "enabled": False,
+}
+
 SYNC_DEFAULT_VALUES = {
     "delete_projects": False,
     "content_sync": CONTENT_SYNC_DEFAULT_VALUES,
     "checklist_subtasks": CHECKLIST_SUBTASKS_DEFAULT_VALUES,
     "concept_sync": CONCEPT_SYNC_DEFAULT_VALUES,
+    "playlist_sync": PLAYLIST_SYNC_DEFAULT_VALUES,
     "sync_users": {
         "enabled": False,
         "default_password": "default_password",
