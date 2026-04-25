@@ -32,6 +32,7 @@ from .utils import (
 
 
 from .addon_helpers import to_username, required_values
+from .concept_utils import concept_folder_display_name, concept_vizdev_surrogate_kitsu_id
 
 if TYPE_CHECKING:
     from .. import KitsuAddon
@@ -446,6 +447,61 @@ async def sync_project(
     await update_project(project.name, **anatomy_data)
 
 
+async def ensure_concept_vizdev_task(
+    addon: "KitsuAddon",
+    project: "ProjectEntity",
+    concept_id: str,
+    folder_id: str,
+    existing_tasks: dict[str, Any],
+) -> None:
+    """Upsert one default task on a Concept folder for reviews / pipeline push alignment."""
+    settings = await addon.get_studio_settings()
+    cs = getattr(settings.sync_settings, "concept_sync", None)
+    if cs is None or not getattr(cs, "enabled", True):
+        return
+    surrogate = concept_vizdev_surrogate_kitsu_id(concept_id)
+    task_type_name = getattr(cs, "vizdev_task_type_name", None) or "VizDev"
+    status_name = getattr(cs, "vizdev_task_status_name", None) or "todo"
+
+    await ensure_task_status(project, status_name)
+    await ensure_task_type(project, task_type_name)
+
+    target_task = await get_task_by_kitsu_id(
+        project.name,
+        surrogate,
+        existing_tasks,
+    )
+    if target_task is None:
+        logging.info(
+            "Creating VizDev surrogate task for Concept %s (kitsuId=%r)",
+            concept_id,
+            surrogate,
+        )
+        new_task = await create_task(
+            project_name=project.name,
+            folder_id=folder_id,
+            status=status_name,
+            task_type=task_type_name,
+            name=task_type_name,
+            data={
+                "kitsuId": surrogate,
+                "kitsuConceptId": concept_id,
+                "kitsuMirrorSlot": "VizDev",
+            },
+            assignees=[],
+        )
+        existing_tasks[surrogate] = new_task.id
+    else:
+        existing_tasks[surrogate] = target_task.id
+        await update_task(
+            project_name=project.name,
+            task_id=target_task.id,
+            name=task_type_name,
+            status=status_name,
+            task_type=task_type_name,
+        )
+
+
 async def delete_project(
     addon: "KitsuAddon",
     user: "UserEntity",
@@ -469,12 +525,26 @@ async def sync_folder(
     project: "ProjectEntity",
     existing_folders: dict[str, Any],
     entity_dict: "EntityDict",
+    existing_tasks: dict[str, Any] | None = None,
 ):
     target_folder = await get_folder_by_kitsu_id(
         project.name,
         entity_dict["id"],
         existing_folders,
     )
+
+    studio_settings = await addon.get_studio_settings()
+    folder_label = (entity_dict.get("name") or "").strip() or "folder"
+    if entity_dict["type"] == "Concept":
+        cs_name = getattr(studio_settings.sync_settings, "concept_sync", None)
+        sanitize = (
+            cs_name is None
+            or getattr(cs_name, "sanitize_kitsu_auto_naming", True)
+        )
+        folder_label = concept_folder_display_name(
+            entity_dict.get("name") or "",
+            sanitize=sanitize,
+        )
 
     # Add description to attrib data
     data: dict[str, str | int | None] | None = entity_dict.get("data", {})
@@ -539,7 +609,7 @@ async def sync_folder(
             )
             await project.save()
 
-        logging.info(f"Creating {entity_dict['type']} {entity_dict['name']}")
+        logging.info(f"Creating {entity_dict['type']} {folder_label}")
         if not parent_folder:
             parent_folder = await FolderEntity.load(project.name, parent_id)
         # Calculate the end-frame
@@ -548,7 +618,7 @@ async def sync_folder(
         target_folder = await create_folder(
             project_name=project.name,
             attrib=parse_attrib(data),
-            name=entity_dict["name"],
+            name=folder_label,
             folder_type=entity_dict["type"],
             parent_id=parent_id,
             data={"kitsuId": entity_dict["id"]},
@@ -563,14 +633,23 @@ async def sync_folder(
             project_name=project.name,
             folder_id=target_folder.id,
             attrib=parse_attrib(data),
-            name=entity_dict["name"],
+            name=folder_label,
             folder_type=entity_dict["type"],
         )
         if changed:
             logging.info(
-                f"Updating {entity_dict['type']} '{entity_dict['name']}'"
+                f"Updating {entity_dict['type']} '{folder_label}'"
             )
             existing_folders[entity_dict["id"]] = target_folder.id
+
+    if entity_dict["type"] == "Concept" and existing_tasks is not None:
+        await ensure_concept_vizdev_task(
+            addon,
+            project,
+            entity_dict["id"],
+            target_folder.id,
+            existing_tasks,
+        )
 
 
 async def ensure_task_type(
@@ -758,6 +837,7 @@ async def push_entities(
                 project,
                 folders,
                 entity_dict,
+                existing_tasks=tasks,
             )
         else:
             logging.debug(
@@ -837,6 +917,20 @@ async def remove_entities(
             tasks[entity_dict["id"]] = task.id
 
         else:
+            if entity_dict["type"] == "Concept":
+                surrogate = concept_vizdev_surrogate_kitsu_id(entity_dict["id"])
+                viz_task = await get_task_by_kitsu_id(
+                    project.name,
+                    surrogate,
+                    tasks,
+                )
+                if viz_task:
+                    await delete_task(
+                        project_name=project.name,
+                        task_id=viz_task.id,
+                        user=user,
+                    )
+                    tasks[surrogate] = viz_task.id
             folder = await get_folder_by_kitsu_id(
                 project.name,
                 entity_dict["id"],

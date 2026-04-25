@@ -167,6 +167,41 @@ class ContentSyncSettings(BaseSettingsModel):
     )
 
 
+class ConceptSyncSettings(BaseSettingsModel):
+    """Kitsu Concept entities: folder display naming and a default AYON task for reviews.
+
+    Kitsu often names concepts as ``filename-<uuid>``. The surrogate task id
+    ``kitsu:concept:{concept_id}:vizdev`` is stored on ``data.kitsuId`` so
+    pipeline tools (e.g. ``ayon_push``) can match exports that use the same id.
+    """
+
+    enabled: bool = SettingsField(
+        True,
+        title="Create VizDev task for each Concept",
+        description=(
+            "When enabled, after each Concept folder sync, upsert one task on that "
+            "folder with a deterministic data.kitsuId for mirror/pull/push alignment."
+        ),
+    )
+    vizdev_task_type_name: str = SettingsField(
+        "VizDev",
+        title="Task type name for the default concept task",
+    )
+    vizdev_task_status_name: str = SettingsField(
+        "todo",
+        title="Initial task status (short name, e.g. todo)",
+    )
+    sanitize_kitsu_auto_naming: bool = SettingsField(
+        True,
+        title="Sanitize Concept folder name",
+        description=(
+            "If the Kitsu name looks like ``file.ext-<uuid>``, use the stem before "
+            "the extension as the AYON folder display name; data.kitsuId stays the "
+            "real Kitsu concept id."
+        ),
+    )
+
+
 class SyncSettings(BaseSettingsModel):
     """Enabling 'Delete projects' will remove projects on Ayon when they get deleted on Kitsu"""
 
@@ -186,6 +221,10 @@ class SyncSettings(BaseSettingsModel):
     checklist_subtasks: ChecklistSubtasksSettings = SettingsField(
         default_factory=ChecklistSubtasksSettings,
         title="Checklist child tasks (Kitsu ↔ AYON)",
+    )
+    concept_sync: ConceptSyncSettings = SettingsField(
+        default_factory=ConceptSyncSettings,
+        title="Concept entities (VizDev task, naming)",
     )
 
 
@@ -207,10 +246,18 @@ CHECKLIST_SUBTASKS_DEFAULT_VALUES = {
     "bulk_sync_after_fullsync": False,
 }
 
+CONCEPT_SYNC_DEFAULT_VALUES = {
+    "enabled": True,
+    "vizdev_task_type_name": "VizDev",
+    "vizdev_task_status_name": "todo",
+    "sanitize_kitsu_auto_naming": True,
+}
+
 SYNC_DEFAULT_VALUES = {
     "delete_projects": False,
     "content_sync": CONTENT_SYNC_DEFAULT_VALUES,
     "checklist_subtasks": CHECKLIST_SUBTASKS_DEFAULT_VALUES,
+    "concept_sync": CONCEPT_SYNC_DEFAULT_VALUES,
     "sync_users": {
         "enabled": False,
         "default_password": "default_password",
@@ -222,6 +269,11 @@ SYNC_DEFAULT_VALUES = {
                 "name": "Concept",
                 "short_name": "cncp",
                 "icon": "lightbulb",
+            },
+            {
+                "name": "VizDev",
+                "short_name": "vizd",
+                "icon": "image",
             },
             {
                 "name": "Modeling",
