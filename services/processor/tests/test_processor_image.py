@@ -10,7 +10,7 @@ This script:
 Poetry in ``pyproject.toml`` may use a PEP 440 *local* segment with ``+`` (e.g.
 ``1.2.6+prod.0.2.31``) because that validates for ``poetry install`` in the
 image. OCI/Docker image tags must not contain ``+``, so repo ``package.py``
-uses hyphens for the same logical release (e.g. ``1.2.6-prod.0.2.31``) and we
+uses hyphens for the same logical release (e.g. ``1.2.6-prod.0.3.0``) and we
 normalize defensively when tagging (see ``oci_image_tag``).
 """
 

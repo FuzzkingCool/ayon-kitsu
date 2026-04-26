@@ -25,3 +25,28 @@ dist/
 .vscode/
 .history/
 *.code-workspace
+
+# >>> enforce_ignores_for_git_project.py - managed block (do not delete header/footer)
+
+# VSCode
+**/.vscode
+**/.history
+**/.venv
+
+# AYON
+**/package
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# Node
+node_modules/
+
+# Tooling
+/.ruff_cache
+# <<< enforce_ignores_for_git_project.py
