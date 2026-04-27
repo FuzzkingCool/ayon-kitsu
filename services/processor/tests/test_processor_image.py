@@ -3,15 +3,16 @@
 
 This script:
 1. Reads version from package.py
-2. Loads environment variables from ../.env
+2. Loads environment variables from the repo-root ``.env``, then
+   ``services/processor/.env`` (later file overrides keys from the former)
 3. Builds the Docker image
 4. Runs the container with the environment variables
 
 Poetry in ``pyproject.toml`` may use a PEP 440 *local* segment with ``+`` (e.g.
-``1.2.6+prod.0.2.31``) because that validates for ``poetry install`` in the
-image. OCI/Docker image tags must not contain ``+``, so repo ``package.py``
-uses hyphens for the same logical release (e.g. ``1.2.6-prod.0.3.0``) and we
-normalize defensively when tagging (see ``oci_image_tag``).
+``1.0.0+build.1``) because that validates for ``poetry install`` in the image.
+OCI/Docker image tags must not contain ``+``, so repo ``package.py`` uses
+hyphens for the same logical release (e.g. ``1.0.0-build.1``) and we normalize
+defensively when tagging (see ``oci_image_tag``).
 """
 
 import os
@@ -168,8 +169,9 @@ def run_container(image_name, env_vars):
 def main():
     """Main function."""
     script_dir = Path(__file__).parent
-    services_dir = script_dir.parent
-    env_file = services_dir / ".env"
+    processor_dir = script_dir.parent
+    repo_root = processor_dir.parent.parent
+    env_paths = (repo_root / ".env", processor_dir / ".env")
 
     print("=" * 60)
     print("Kitsu Processor Docker Image Builder & Runner")
@@ -178,7 +180,6 @@ def main():
     # Get version
     try:
         version = get_version()
-        processor_dir = script_dir.parent
         assert_addon_version_matches_poetry(processor_dir, version)
         poetry_version = get_poetry_version(processor_dir)
         print(f"\nAddon version: {version}")
@@ -187,15 +188,23 @@ def main():
         print(f"ERROR: Failed to get version: {e}")
         sys.exit(1)
 
-    # Load environment variables
-    env_vars = load_env_file(env_file)
-    if env_file.exists():
+    # Load environment variables (repo root first, then processor-local overlay)
+    env_vars = {}
+    loaded_from: list[Path] = []
+    for path in env_paths:
+        if path.is_file():
+            env_vars.update(load_env_file(path))
+            loaded_from.append(path)
+    if loaded_from:
         print(
-            f"\nLoaded {len(env_vars)} environment variables from {env_file}"
+            f"\nLoaded {len(env_vars)} environment variables from:\n  "
+            + "\n  ".join(str(p) for p in loaded_from)
         )
     else:
-        print(f"\nWARNING: .env file not found at {env_file}")
-        print("You may need to set AYON_API_KEY and AYON_SERVER_URL manually")
+        print(
+            f"\nWARNING: No .env file found at:\n  {env_paths[0]}\n  {env_paths[1]}"
+        )
+        print("You may need to set AYON_API_KEY, AYON_SERVER_URL, KITSU_SERVER, …")
 
     # Check for required environment variables
     required = ["AYON_API_KEY", "AYON_SERVER_URL"]
@@ -216,6 +225,17 @@ def main():
 
     # Merge with system environment (system env takes precedence)
     for key in required:
+        if key in os.environ:
+            env_vars[key] = os.environ[key]
+
+    optional_from_shell = (
+        "KITSU_SERVER",
+        "KITSU_URL",
+        "KITSU_LOGIN",
+        "KITSU_EMAIL",
+        "KITSU_PWD",
+    )
+    for key in optional_from_shell:
         if key in os.environ:
             env_vars[key] = os.environ[key]
 

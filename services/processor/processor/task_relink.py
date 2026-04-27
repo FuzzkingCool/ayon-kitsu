@@ -19,6 +19,17 @@ def merge_push_response_folder_map(
         folder_map.update(folders)
 
 
+def kitsu_folder_map_from_ayon_project(project_name: str) -> dict[str, str]:
+    """Build Kitsu id → AYON folder id from ``data.kitsuId`` on all active folders."""
+    out: dict[str, str] = {}
+    for folder in ayon_api.get_folders(project_name, active=True):
+        data = folder.get("data") or {}
+        kid = data.get("kitsuId")
+        if kid:
+            out[str(kid)] = str(folder["id"])
+    return out
+
+
 def find_folder_id_for_kitsu_entity(
     project_name: str,
     kitsu_entity_id: str,

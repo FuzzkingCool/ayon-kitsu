@@ -183,6 +183,19 @@ class PlaylistSyncSettings(BaseSettingsModel):
             "``playlist:new`` / ``playlist:update`` / ``playlist:delete`` events."
         ),
     )
+    auto_create_entity_list_folder: bool = SettingsField(
+        True,
+        title="Create default list folder when none exist",
+        description=(
+            "If the AYON project has no entity-list folders, POST one with "
+            "``list_folder_label`` so playlist lists can be created."
+        ),
+    )
+    list_folder_label: str = SettingsField(
+        "Kitsu playlists",
+        title="Label for auto-created entity list folder",
+        description="Used only when ``auto_create_entity_list_folder`` creates the folder.",
+    )
 
 
 class ConceptSyncSettings(BaseSettingsModel):
@@ -277,6 +290,8 @@ CONCEPT_SYNC_DEFAULT_VALUES = {
 
 PLAYLIST_SYNC_DEFAULT_VALUES = {
     "enabled": False,
+    "auto_create_entity_list_folder": True,
+    "list_folder_label": "Kitsu playlists",
 }
 
 SYNC_DEFAULT_VALUES = {

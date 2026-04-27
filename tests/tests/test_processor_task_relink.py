@@ -7,6 +7,7 @@ import pytest
 from processor.task_relink import (
     is_folder_unique_violation,
     is_task_unique_violation,
+    kitsu_folder_map_from_ayon_project,
     merge_push_response_folder_map,
     push_entities_with_relink,
     try_relink_stale_kitsu_asset_folder,
@@ -22,6 +23,18 @@ def test_merge_push_response_folder_map():
     merge_push_response_folder_map(acc, None)
     merge_push_response_folder_map(acc, {})
     assert acc == {"a": "1", "b": "2", "c": "3"}
+
+
+@patch("processor.task_relink.ayon_api.get_folders", create=True)
+def test_kitsu_folder_map_from_ayon_project(mock_get_folders):
+    mock_get_folders.return_value = [
+        {"id": "ay-1", "data": {"kitsuId": "kitsu-shot-1"}},
+        {"id": "ay-2", "data": {}},
+        {"id": "ay-3", "data": {"kitsuId": "kitsu-shot-2"}},
+    ]
+    m = kitsu_folder_map_from_ayon_project("demo")
+    mock_get_folders.assert_called_once_with("demo", active=True)
+    assert m == {"kitsu-shot-1": "ay-1", "kitsu-shot-2": "ay-3"}
 
 
 def test_is_task_unique_violation_string():
@@ -245,6 +258,7 @@ def test_emit_sync_entity_failed_swallows_errors(mock_create, mock_update):
     mock_create.side_effect = RuntimeError("network")
     emit_sync_entity_failed("P", "desc", {"k": "v"})
     mock_update.assert_not_called()
+    assert mock_create.call_count == 3
 
 
 def test_parse_http_error_detail_plain():

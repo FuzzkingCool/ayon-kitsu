@@ -42,6 +42,34 @@ def create_name_and_label(kitsu_name: str) -> dict[str, str]:
     return {"name": name_slug, "label": kitsu_name}
 
 
+def is_task_folder_name_unique_violation(exc: BaseException) -> bool:
+    """True when DB rejects create_task because that folder already has this task name/type."""
+    msg = str(exc).lower()
+    return "already exists" in msg and "task" in msg
+
+
+async def find_task_id_by_folder_name_type(
+    project_name: str,
+    folder_id: str,
+    task_name_from_kitsu: str,
+    task_type: str,
+) -> str | None:
+    """Single matching task id, or None if none or ambiguous."""
+    name_slug = create_name_and_label(task_name_from_kitsu)["name"]
+    rows = await Postgres.fetch(
+        f"""
+        SELECT id FROM project_{project_name}.tasks
+        WHERE folder_id = $1 AND name = $2 AND task_type = $3
+        """,
+        folder_id,
+        name_slug,
+        task_type,
+    )
+    if len(rows) != 1:
+        return None
+    return rows[0]["id"]
+
+
 async def get_user_by_kitsu_id(
     kitsu_id: str,
 ) -> UserEntity | None:

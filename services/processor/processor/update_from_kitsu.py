@@ -11,7 +11,7 @@ from .playlist_push_entity import (
 )
 from .sync_error_format import format_entity_sync_headline
 from .sync_events import emit_sync_entity_failed, parse_http_error_detail
-from .task_relink import push_entities_with_relink
+from .task_relink import kitsu_folder_map_from_ayon_project, push_entities_with_relink
 
 if TYPE_CHECKING:
     from .processor import KitsuProcessor
@@ -385,15 +385,20 @@ def create_or_update_concept(parent: "KitsuProcessor", data: dict[str, str]):
         return
     utils.set_kitsu_host(parent.kitsu_server_url)
     try:
-        entity = gazu.concept.get_concept(data["concept_id"])
+        entity = utils.load_concept_entity_for_sync(
+            str(data["project_id"]),
+            str(data["concept_id"]),
+            data.get("parent_id"),
+        )
         entity["ayon_server_url"] = ayon_api.get_base_url()
 
-        response = ayon_api.post(
-            f"{parent.entrypoint}/push",
-            project_name=project_name,
-            entities=[entity],
+        folder_map: dict[str, str] = {}
+        push_entities_with_relink(
+            parent.entrypoint,
+            project_name,
+            [entity],
+            folder_map,
         )
-        response.raise_for_status()
         logging.info(f"[update_from_kitsu] Successfully updated concept {data.get('concept_id')} in {project_name}")
     except Exception as e:
         logging.error(f"[update_from_kitsu] Failed to update concept {data.get('concept_id')} in {project_name}: {e}")
@@ -444,8 +449,9 @@ def create_or_update_playlist(parent: "KitsuProcessor", data: dict[str, str]):
     utils.set_kitsu_host(parent.kitsu_server_url)
     try:
         full = gazu.playlist.get_playlist(playlist_id)
+        folder_map = kitsu_folder_map_from_ayon_project(project_name)
         entity = build_playlist_push_entity(
-            project_name, full, {}, ayon_api.get_base_url()
+            project_name, full, folder_map, ayon_api.get_base_url()
         )
         response = ayon_api.post(
             f"{parent.entrypoint}/push",

@@ -3,10 +3,11 @@ import time
 from typing import TYPE_CHECKING, Any, Literal, get_args
 
 import httpx
-from nxtools import logging
+from nxtools import logging, slugify
 
 from ayon_server.auth.session import Session
-from ayon_server.entities import FolderEntity, ProjectEntity, UserEntity
+from ayon_server.entities import FolderEntity, ProjectEntity, TaskEntity, UserEntity
+from ayon_server.events import dispatch_event
 from ayon_server.helpers.deploy_project import anatomy_to_project_data
 from ayon_server.lib.postgres import Postgres
 from ayon_server.types import Field, OPModel
@@ -21,9 +22,11 @@ from .utils import (
     create_task,
     delete_folder,
     delete_task,
+    find_task_id_by_folder_name_type,
     get_folder_by_kitsu_id,
     get_task_by_kitsu_id,
     get_user_by_kitsu_id,
+    is_task_folder_name_unique_violation,
     update_project,
 
     update_folder,
@@ -119,6 +122,92 @@ async def get_root_folder_id(
         )
         sub_id = sub_folder.id
     return sub_id
+
+
+async def try_relink_orphan_concept_folder(
+    user: "UserEntity",
+    project: "ProjectEntity",
+    entity_dict: "EntityDict",
+    existing_folders: dict[str, Any],
+    *,
+    sanitize_folder_display: bool = True,
+) -> bool:
+    """Set data.kitsuId on a legacy Concept folder (slug from raw Kitsu name).
+
+    Used when an AYON folder was created without ``data.kitsuId`` so
+    ``get_folder_by_kitsu_id`` misses and the folder keeps an image-style name.
+    Only Concepts with ``parent_id is None`` (under the Concepts root) are handled.
+    """
+    if entity_dict.get("parent_id") is not None:
+        return False
+
+    raw_name = (
+        (entity_dict.get("code") or entity_dict.get("name") or "").strip() or "folder"
+    )
+    legacy_slug = slugify(raw_name, separator="_")
+    display_stem = concept_folder_display_name(
+        raw_name,
+        sanitize=sanitize_folder_display,
+    )
+    display_slug = slugify(display_stem, separator="_")
+    name_candidates = list(
+        dict.fromkeys(s for s in (legacy_slug, display_slug) if s)
+    )
+
+    concepts_root_id = await get_root_folder_id(
+        user=user,
+        project_name=project.name,
+        kitsu_type="Concepts",
+        kitsu_type_id="concept",
+    )
+
+    res = await Postgres.fetch(
+        f"""
+        SELECT id, data FROM project_{project.name}.folders
+        WHERE parent_id = $1
+          AND folder_type = 'Concept'
+          AND name = ANY($2::text[])
+          AND (
+            data IS NULL
+            OR data->>'kitsuId' IS NULL
+            OR data->>'kitsuId' = ''
+          )
+        """,
+        concepts_root_id,
+        name_candidates,
+    )
+
+    if not res:
+        return False
+    if len(res) > 1:
+        logging.warning(
+            "[concept_relink] ambiguous: %s Concept folders under Concepts root "
+            "matching %r, skipping",
+            len(res),
+            name_candidates,
+        )
+        return False
+
+    folder_id = res[0]["id"]
+    folder = await FolderEntity.load(project.name, folder_id)
+    merged = {**(folder.data or {}), "kitsuId": entity_dict["id"]}
+    folder.data = merged
+    await folder.save()
+    existing_folders[entity_dict["id"]] = folder.id
+    logging.info(
+        "[concept_relink] set kitsuId on folder %r (name=%r) -> concept %s",
+        folder_id,
+        folder.name,
+        entity_dict["id"],
+    )
+    event = {
+        "topic": "entity.folder.updated",
+        "description": f"Folder {folder.name} updated",
+        "summary": {"entityId": folder.id, "parentId": folder.parent_id},
+        "project": project.name,
+    }
+    await dispatch_event(**event)
+    return True
 
 
 async def create_access_group(
@@ -537,17 +626,42 @@ async def sync_folder(
     )
 
     studio_settings = await addon.get_studio_settings()
-    folder_label = (entity_dict.get("name") or "").strip() or "folder"
+    # Concepts: prefer ``code`` when Kitsu keeps the long auto string in ``name``.
     if entity_dict["type"] == "Concept":
         cs_name = getattr(studio_settings.sync_settings, "concept_sync", None)
-        sanitize = (
+        concept_sanitize = (
             cs_name is None
             or getattr(cs_name, "sanitize_kitsu_auto_naming", True)
         )
-        folder_label = concept_folder_display_name(
-            entity_dict.get("name") or "",
-            sanitize=sanitize,
+        concept_kitsu_title = (
+            (entity_dict.get("code") or entity_dict.get("name") or "").strip()
         )
+        folder_label = concept_folder_display_name(
+            concept_kitsu_title,
+            sanitize=concept_sanitize,
+        )
+    else:
+        raw_display = (entity_dict.get("name") or entity_dict.get("code") or "").strip()
+        folder_label = raw_display or "folder"
+
+    if (
+        entity_dict["type"] == "Concept"
+        and target_folder is None
+        and entity_dict.get("parent_id") is None
+    ):
+        relinked = await try_relink_orphan_concept_folder(
+            user=user,
+            project=project,
+            entity_dict=entity_dict,
+            existing_folders=existing_folders,
+            sanitize_folder_display=concept_sanitize,
+        )
+        if relinked:
+            target_folder = await get_folder_by_kitsu_id(
+                project.name,
+                entity_dict["id"],
+                existing_folders,
+            )
 
     # Add description to attrib data
     data: dict[str, str | int | None] | None = entity_dict.get("data", {})
@@ -751,16 +865,64 @@ async def sync_task(
             )
             return
 
-        target_task = await create_task(
-            project_name=project.name,
-            folder_id=parent_id,
-            status=entity_dict["task_status_name"],
-            task_type=entity_dict["task_type_name"],
-            name=entity_dict["name"],
-            data={"kitsuId": entity_dict["id"]},
-            assignees=entity_dict["assignees"],
-        )
+        adopted_from_duplicate = False
+        try:
+            target_task = await create_task(
+                project_name=project.name,
+                folder_id=parent_id,
+                status=entity_dict["task_status_name"],
+                task_type=entity_dict["task_type_name"],
+                name=entity_dict["name"],
+                data={"kitsuId": entity_dict["id"]},
+                assignees=entity_dict["assignees"],
+            )
+        except Exception as e:
+            if not is_task_folder_name_unique_violation(e):
+                raise
+            stale_id = await find_task_id_by_folder_name_type(
+                project.name,
+                parent_id,
+                entity_dict["name"],
+                entity_dict["task_type_name"],
+            )
+            if stale_id is None:
+                logging.warning(
+                    "create_task hit unique-like error but could not resolve a single "
+                    "task row (folder_id=%s name=%r type=%r): %s",
+                    parent_id,
+                    entity_dict["name"],
+                    entity_dict["task_type_name"],
+                    e,
+                )
+                raise
+            target_task = await TaskEntity.load(project.name, stale_id)
+            merged_data = dict(target_task.data or {})
+            merged_data["kitsuId"] = entity_dict["id"]
+            target_task.data = merged_data
+            await target_task.save()
+            adopted_from_duplicate = True
+            logging.info(
+                "Adopted existing AYON task %s for Kitsu id %s (folder_id=%s name=%r)",
+                target_task.id,
+                entity_dict["id"],
+                parent_id,
+                entity_dict["name"],
+            )
         existing_tasks[entity_dict["id"]] = target_task.id
+
+        if adopted_from_duplicate:
+            changed = await update_task(
+                project_name=project.name,
+                task_id=target_task.id,
+                name=entity_dict.get("name", target_task.name),
+                assignees=entity_dict.get("assignees", target_task.assignees),
+                status=entity_dict.get("task_status_name", target_task.status),
+                task_type=entity_dict.get("task_type_name", target_task.task_type),
+            )
+            if changed:
+                logging.info(
+                    f"Updating {entity_dict['type']} '{entity_dict['name']}'"
+                )
 
     else:
         changed = await update_task(

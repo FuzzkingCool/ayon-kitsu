@@ -192,3 +192,58 @@ def test_delete_task(api, gazu, processor, monkeypatch):
     assert res.status_code == 200
     pprint(res.data)
     assert task["id"] in res.data["tasks"]
+
+
+def test_create_or_update_concept_prefers_official_list_api(
+    gazu, processor, monkeypatch
+):
+    """GET /data/concepts?project_id= should win over gazu.concept.get_concept."""
+    captured: dict = {}
+
+    def fake_push(entrypoint, project_name, entities, folder_map):
+        captured["entities"] = list(entities)
+
+        class Resp:
+            status_code = 200
+            data: dict = {"folders": {}, "tasks": {}}
+
+            def raise_for_status(self):
+                pass
+
+        return Resp()
+
+    monkeypatch.setattr(
+        update_from_kitsu.push_entities_with_relink,
+        fake_push,
+    )
+
+    official = {
+        "id": "concept-list-id",
+        "name": "UI Title From List API",
+        "type": "Concept",
+        "project_id": PROJECT_ID,
+        "parent_id": None,
+    }
+
+    def fake_client_get(path, json_response=True, params=None, client=None):
+        if path == "data/concepts" and params and params.get("project_id") == PROJECT_ID:
+            return [official]
+        raise AssertionError(f"unexpected gazu.client.get {path!r} {params!r}")
+
+    monkeypatch.setattr(gazu.client, "get", fake_client_get)
+    monkeypatch.setattr(
+        gazu.concept,
+        "get_concept",
+        lambda cid: {
+            "id": cid,
+            "name": "single_fetch_wrong_name",
+            "type": "Concept",
+            "project_id": PROJECT_ID,
+        },
+    )
+
+    update_from_kitsu.create_or_update_concept(
+        processor,
+        {"concept_id": "concept-list-id", "project_id": PROJECT_ID},
+    )
+    assert captured["entities"][0]["name"] == "UI Title From List API"

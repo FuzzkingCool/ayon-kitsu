@@ -25,6 +25,7 @@ def _bootstrap():
             "PASSWORD" in key.upper()
             or "SECRET" in key.upper()
             or "KEY" in key.upper()
+            or key.upper().endswith("_PWD")
         ):
             value = "***REDACTED***"
         else:

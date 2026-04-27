@@ -1,3 +1,10 @@
 AYON_SERVER_URL=http://10.0.0.60:5000
 AYON_API_KEY=aabbccddeeffgghhiijjzzyyxx112233
-KITSU_URL=https://studio.cg-wire.com
+
+# Deployed processor: set Kitsu Server + login secrets in AYON Studio (Kitsu addon).
+# Local docker/poetry: optional overrides — copy to repo root .env or services/processor/.env
+KITSU_SERVER=https://studio.cg-wire.com
+# KITSU_URL is an alternate env name (same role as KITSU_SERVER).
+# KITSU_URL=https://studio.cg-wire.com
+KITSU_LOGIN=admin@studio.com
+KITSU_PWD=password

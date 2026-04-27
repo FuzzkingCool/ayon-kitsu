@@ -12,8 +12,12 @@ from .content_sync import (
     sync_all_content_for_project,
     sync_pinned_checklists_for_project,
 )
-from .playlist_push_entity import sync_playlists_via_push_for_project
+from .playlist_push_entity import (
+    playlist_sync_enabled,
+    sync_playlists_via_push_for_project,
+)
 from .sync_error_format import (
+    enrich_summary_for_emit,
     format_batch_push_headline,
     format_entity_sync_headline,
     format_partial_sync_headline,
@@ -21,6 +25,7 @@ from .sync_error_format import (
 from .sync_events import emit_sync_entity_failed, emit_sync_summary, parse_http_error_detail
 from .task_relink import merge_push_response_folder_map, push_entities_with_relink
 from .utils import (
+    all_concepts_for_project_official_list,
     get_asset_types,
     get_statuses,
     get_task_types,
@@ -282,7 +287,7 @@ def project_full_sync(
     #    throw an error.
     concepts = []
     try:
-        concepts = gazu.concept.all_concepts_for_project(kitsu_project_id)
+        concepts = all_concepts_for_project_official_list(kitsu_project_id)
         logging.info(f"[fullsync] Retrieved {len(concepts)} concepts")
     except Exception as e:
         logging.debug(
@@ -304,6 +309,22 @@ def project_full_sync(
     logging.info(
         f"[fullsync] Processing {total_batches} batches of {batch_size} entities each"
     )
+
+    if playlist_sync_enabled(parent):
+        logging.info(
+            "[fullsync] Kitsu playlists → AYON lists will run after %s /push batch(es) "
+            "(%s entities). When finished, grep logs for `[fullsync] playlist` for "
+            "counts or skip. If nothing appears, confirm processor service settings "
+            "`sync_settings.playlist_sync.enabled` and that this addon build includes "
+            "playlist observability.",
+            total_batches,
+            len(entities),
+        )
+    else:
+        logging.info(
+            "[fullsync] Kitsu playlists → AYON lists are disabled "
+            "(`sync_settings.playlist_sync.enabled` false in processor settings)."
+        )
 
     # Track progress and failures
     processed_count = 0
@@ -447,6 +468,29 @@ def project_full_sync(
                         },
                         payload=eparsed,
                     )
+
+            if individual_failed == 0 and individual_success == len(batch):
+                recovery_headline = (
+                    f"{project_name} | Batch {batch_num + 1}/{total_batches} "
+                    "push failed then fully recovered via individual push"
+                )
+                recovery_summary = enrich_summary_for_emit(
+                    project_name,
+                    {
+                        "phase": "batch_push_recovered",
+                        "batchIndex": batch_num + 1,
+                        "batchTotal": total_batches,
+                        "entityTypeCounts": entity_types,
+                        "firstEntityIds": entity_ids,
+                        "originalPushError": parsed,
+                    },
+                    parsed,
+                )
+                emit_sync_summary(
+                    project_name,
+                    recovery_headline,
+                    recovery_summary,
+                )
 
             processed_count += individual_success
             logging.info(

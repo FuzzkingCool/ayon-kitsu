@@ -66,14 +66,32 @@ def _is_valid_server_url(server: str | None) -> bool:
     return not any(p in lower for p in _INVALID_SERVER_PLACEHOLDERS)
 
 
-def _server_to_api_url(server: str | None) -> str:
-    """Build Kitsu API URL from server setting; raises if invalid."""
-    if not _is_valid_server_url(server):
-        raise KitsuSettingsError(
-            "Kitsu addon 'server' is not set or is a placeholder. "
-            "Set a real Kitsu server URL in AYON addon settings (Studio)."
-        )
-    return server.rstrip("/") + "/api"
+def _resolve_kitsu_api_url(settings_server: str | None) -> str:
+    """Prefer addon settings, then KITSU_SERVER / KITSU_URL (local dev)."""
+    sources: tuple[tuple[str, str | None], ...] = (
+        ("addon settings", settings_server),
+        ("KITSU_SERVER env", os.environ.get("KITSU_SERVER")),
+        ("KITSU_URL env", os.environ.get("KITSU_URL")),
+    )
+    for label, raw in sources:
+        if not _is_valid_server_url(raw):
+            continue
+        logging.info(f"Using Kitsu server from {label}")
+        return raw.rstrip("/") + "/api"
+    raise KitsuSettingsError(
+        "Kitsu server URL is missing or a placeholder in addon settings, "
+        "and KITSU_SERVER / KITSU_URL are not set to a valid URL. "
+        "Set Server in AYON Studio (Kitsu addon), or set KITSU_SERVER for local dev."
+    )
+
+
+def _kitsu_login_from_env() -> tuple[str, str] | None:
+    """Return (email, password) from env if both are set; else None."""
+    email = (os.environ.get("KITSU_LOGIN") or os.environ.get("KITSU_EMAIL") or "").strip()
+    password = (os.environ.get("KITSU_PWD") or "").strip()
+    if email and password:
+        return email, password
+    return None
 
 
 class KitsuProcessor:
@@ -172,40 +190,54 @@ class KitsuProcessor:
         logging.info("Step 5: Loading Kitsu credentials from settings...")
         try:
             kitsu_server_setting = self.settings.get("server")
-            logging.info(f"Kitsu server setting: {kitsu_server_setting}")
+            logging.info(f"Kitsu server setting (addon): {kitsu_server_setting}")
 
-            self.kitsu_server_url = _server_to_api_url(kitsu_server_setting)
+            self.kitsu_server_url = _resolve_kitsu_api_url(kitsu_server_setting)
             logging.info(f"Kitsu API URL: {self.kitsu_server_url}")
 
-            email_secret = self.settings.get("login_email")
-            password_secret = self.settings.get("login_password")
-
-            logging.info(f"Email secret name: {email_secret}")
-            logging.info(f"Password secret name: {password_secret}")
-
-            if not email_secret:
-                raise ValueError(f"Email secret `{email_secret}` not set")
-
-            if not password_secret:
-                raise ValueError(
-                    f"Password secret `{password_secret}` not set"
+            env_creds = _kitsu_login_from_env()
+            if env_creds:
+                self.kitsu_login_email, self.kitsu_login_password = env_creds
+                logging.info(
+                    "Using Kitsu credentials from environment "
+                    "(KITSU_LOGIN or KITSU_EMAIL, plus KITSU_PWD)"
                 )
+            else:
+                email_secret = self.settings.get("login_email")
+                password_secret = self.settings.get("login_password")
 
-            logging.info("Fetching secrets from AYON...")
-            try:
-                email_data = ayon_api.get_secret(email_secret)
-                self.kitsu_login_email = email_data["value"]
-                logging.info(f"Email retrieved: {self.kitsu_login_email}")
+                logging.info(f"Email secret name: {email_secret}")
+                logging.info(f"Password secret name: {password_secret}")
 
-                password_data = ayon_api.get_secret(password_secret)
-                self.kitsu_login_password = password_data["value"]
-                logging.info("Password retrieved successfully")
-            except KeyError as e:
-                logging.error(f"Secret key error: {e}")
-                raise KitsuSettingsError(f"Secret `{e}` not found") from e
-            except Exception as e:
-                logging.error(f"Failed to retrieve secrets: {e}")
-                raise
+                if not email_secret:
+                    raise ValueError(
+                        "login_email secret is not set in addon settings. "
+                        "Configure it in AYON Studio, or set KITSU_LOGIN (or KITSU_EMAIL) "
+                        "and KITSU_PWD in the environment for local development."
+                    )
+
+                if not password_secret:
+                    raise ValueError(
+                        "login_password secret is not set in addon settings. "
+                        "Configure it in AYON Studio, or set KITSU_LOGIN (or KITSU_EMAIL) "
+                        "and KITSU_PWD in the environment for local development."
+                    )
+
+                logging.info("Fetching secrets from AYON...")
+                try:
+                    email_data = ayon_api.get_secret(email_secret)
+                    self.kitsu_login_email = email_data["value"]
+                    logging.info(f"Email retrieved: {self.kitsu_login_email}")
+
+                    password_data = ayon_api.get_secret(password_secret)
+                    self.kitsu_login_password = password_data["value"]
+                    logging.info("Password retrieved successfully")
+                except KeyError as e:
+                    logging.error(f"Secret key error: {e}")
+                    raise KitsuSettingsError(f"Secret `{e}` not found") from e
+                except Exception as e:
+                    logging.error(f"Failed to retrieve secrets: {e}")
+                    raise
 
             assert self.kitsu_login_password, "Kitsu password not set"
             assert self.kitsu_server_url, "Kitsu server not set"

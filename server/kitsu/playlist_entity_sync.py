@@ -26,6 +26,19 @@ EntityDict = dict[str, Any]
 
 log = logging.getLogger("kitsu.playlist_entity_sync")
 
+_HTTP_ERROR_BODY_MAX = 2000
+
+
+def _log_http_error(context: str, response: httpx.Response) -> None:
+    body = (response.text or "")[:_HTTP_ERROR_BODY_MAX]
+    log.error(
+        "%s: HTTP %s %s body=%r",
+        context,
+        response.status_code,
+        str(response.request.url),
+        body,
+    )
+
 
 async def _find_list_id_by_kitsu_playlist_id(
     project_name: str, kitsu_playlist_id: str
@@ -53,32 +66,66 @@ async def _find_list_id_by_kitsu_playlist_id(
     return None
 
 
-async def _default_entity_list_folder_id(
+async def _ensure_entity_list_folder_id(
+    client: httpx.AsyncClient,
+    addon: "KitsuAddon",
     ayon_user: "UserEntity",
     entity_dict: EntityDict,
     project_name: str,
+    headers: dict[str, str],
+    base: str,
 ) -> str | None:
-    session = await Session.create(ayon_user)
-    headers = {"Authorization": f"Bearer {session.token}"}
-    base = entity_dict["ayon_server_url"].rstrip("/")
+    """Return first entity-list folder id, or create one when settings allow."""
+    settings = await addon.get_studio_settings()
+    ps = getattr(settings.sync_settings, "playlist_sync", None)
+    auto_create = (
+        True if ps is None else getattr(ps, "auto_create_entity_list_folder", True)
+    )
+    folder_label = "Kitsu playlists"
+    if ps is not None:
+        folder_label = (getattr(ps, "list_folder_label", None) or folder_label).strip()
+    if not folder_label:
+        folder_label = "Kitsu playlists"
+
     url = f"{base}/api/projects/{project_name}/entityListFolders"
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.get(url, headers=headers)
+    response = await client.get(url, headers=headers)
+    if not response.is_success:
+        _log_http_error("playlist sync GET entityListFolders", response)
         response.raise_for_status()
-        folder_json = response.json()
+    folder_json = response.json()
     folders = (folder_json or {}).get("folders") or []
-    if not folders:
+    if folders:
+        return folders[0]["id"]
+
+    if not auto_create:
         log.warning(
             "playlist sync: project %s has no entity list folders; "
-            "create one in AYON before syncing Kitsu playlists",
+            "enable auto_create_entity_list_folder or create a folder in AYON",
             project_name,
         )
         return None
-    return folders[0]["id"]
+
+    create_payload = {"label": folder_label}
+    response = await client.post(
+        url,
+        content=json.dumps(create_payload),
+        headers={**headers, "Content-Type": "application/json"},
+    )
+    if not response.is_success:
+        _log_http_error("playlist sync POST entityListFolders", response)
+        response.raise_for_status()
+    created = response.json()
+    new_id = created.get("id") if isinstance(created, dict) else created
+    log.info(
+        "playlist sync: created default entity list folder %r for project %s",
+        new_id,
+        project_name,
+    )
+    return str(new_id) if new_id else None
 
 
 async def sync_playlist(
-    _addon: "KitsuAddon",
+    addon: "KitsuAddon",
     ayon_user: "UserEntity",
     project: ProjectEntity,
     entity_dict: EntityDict,
@@ -95,15 +142,17 @@ async def sync_playlist(
     base = entity_dict["ayon_server_url"].rstrip("/")
     pn = project.name
 
-    list_folder_id = await _default_entity_list_folder_id(ayon_user, entity_dict, pn)
-    if not list_folder_id:
-        return
-
     existing_id = await _find_list_id_by_kitsu_playlist_id(pn, playlist_id)
 
     items = [{"entityId": fid} for fid in folder_ids]
 
     async with httpx.AsyncClient(timeout=120.0) as client:
+        list_folder_id = await _ensure_entity_list_folder_id(
+            client, addon, ayon_user, entity_dict, pn, headers, base
+        )
+        if not list_folder_id:
+            return
+
         if existing_id:
             patch_url = f"{base}/api/projects/{pn}/lists/{existing_id}"
             patch_payload: dict[str, Any] = {"label": label}
@@ -112,7 +161,9 @@ async def sync_playlist(
                 content=json.dumps(patch_payload),
                 headers={**headers, "Content-Type": "application/json"},
             )
-            response.raise_for_status()
+            if not response.is_success:
+                _log_http_error("playlist sync PATCH list label", response)
+                response.raise_for_status()
             items_url = f"{base}/api/projects/{pn}/lists/{existing_id}/items"
             items_payload = {"items": items, "mode": "replace"}
             response = await client.patch(
@@ -120,7 +171,9 @@ async def sync_playlist(
                 content=json.dumps(items_payload),
                 headers={**headers, "Content-Type": "application/json"},
             )
-            response.raise_for_status()
+            if not response.is_success:
+                _log_http_error("playlist sync PATCH list items", response)
+                response.raise_for_status()
             log.info("Updated AYON playlist list %s (Kitsu %s)", existing_id, playlist_id)
             return
 
@@ -139,7 +192,9 @@ async def sync_playlist(
             content=json.dumps(create_payload),
             headers={**headers, "Content-Type": "application/json"},
         )
-        response.raise_for_status()
+        if not response.is_success:
+            _log_http_error("playlist sync POST list", response)
+            response.raise_for_status()
         created = response.json()
         if isinstance(created, dict):
             new_id = created.get("id")
@@ -177,5 +232,7 @@ async def delete_playlist(
         response = await client.delete(delete_url, headers=headers)
         if response.status_code == 404:
             return
+        if not response.is_success:
+            _log_http_error("playlist sync DELETE list", response)
         response.raise_for_status()
     log.info("Deleted AYON playlist list %s (Kitsu %s)", existing_id, playlist_id)

@@ -58,16 +58,24 @@ function DistributeImage {
   docker push "$IMAGE"
 }
 
-function load-env {
-  $env_path = "$($script_dir)/.env"
-  if (Test-Path $env_path) {
-    Get-Content $env_path | foreach {
-      $name, $value = $_.split("=")
-      if (-not([string]::IsNullOrWhiteSpace($name) -or $name.Contains("#"))) {
-        Set-Content env:\$name $value
-      }
-    }
+function Import-DotEnvFile {
+  param([string]$Path)
+  if (-not (Test-Path $Path)) { return }
+  Get-Content $Path | ForEach-Object {
+    $line = $_.Trim()
+    if ([string]::IsNullOrWhiteSpace($line) -or $line.StartsWith("#")) { return }
+    $eq = $line.IndexOf("=")
+    if ($eq -lt 1) { return }
+    $name = $line.Substring(0, $eq).Trim()
+    $value = $line.Substring($eq + 1).Trim()
+    if ($name) { Set-Item -Path "env:$name" -Value $value }
   }
+}
+
+function load-env {
+  $repo_root = (Get-Item $script_dir).Parent.Parent.FullName
+  Import-DotEnvFile (Join-Path $repo_root ".env")
+  Import-DotEnvFile (Join-Path $script_dir ".env")
 }
 
 function RunDocker {
@@ -79,6 +87,11 @@ function RunDocker {
   	--env AYON_SERVER_URL=$env:AYON_SERVER_URL `
   	--env AYON_ADDON_NAME=$AYON_ADDON_NAME `
   	--env AYON_ADDON_VERSION=$AYON_ADDON_VERSION `
+  	--env KITSU_SERVER=$env:KITSU_SERVER `
+  	--env KITSU_URL=$env:KITSU_URL `
+  	--env KITSU_LOGIN=$env:KITSU_LOGIN `
+  	--env KITSU_EMAIL=$env:KITSU_EMAIL `
+  	--env KITSU_PWD=$env:KITSU_PWD `
   	"$IMAGE" python -m processor
 }
 

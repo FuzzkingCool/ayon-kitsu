@@ -2,10 +2,11 @@
 
 import re
 import threading
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional, cast
 
 import ayon_api
 import gazu
+from nxtools import logging
 
 # Thread-local Kitsu API URL so gazu uses the correct host in every thread
 # (gazu default is http://gazu.change.serverhost/api; event handlers run in listener thread)
@@ -131,6 +132,104 @@ def preprocess_task(
     )
 
     return task
+
+
+def _concepts_rows_from_get_response(body: Any) -> List[Dict[str, Any]]:
+    """Normalize GET /data/concepts JSON body to a list of concept dicts."""
+    if isinstance(body, list):
+        return [cast(Dict[str, Any], x) for x in body if isinstance(x, dict)]
+    if isinstance(body, dict):
+        inner = body.get("data")
+        if isinstance(inner, list):
+            return [cast(Dict[str, Any], x) for x in inner if isinstance(x, dict)]
+        if body.get("id"):
+            return [cast(Dict[str, Any], body)]
+    return []
+
+
+def fetch_concepts_list_via_data_endpoint(
+    project_id: str,
+    parent_id: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
+    """GET /data/concepts?project_id=…&parent_id=… (official Zou list API).
+
+    Returns ``None`` on request failure; may return an empty list when the API
+    responds successfully but has no rows.
+    """
+    _ensure_gazu_host()
+    params: Dict[str, str] = {"project_id": str(project_id)}
+    if parent_id is not None and str(parent_id) != "":
+        params["parent_id"] = str(parent_id)
+    try:
+        body = gazu.client.get("data/concepts", params=params)
+        return _concepts_rows_from_get_response(body)
+    except Exception:
+        logging.debug(
+            "[kitsu] GET data/concepts failed project_id=%r parent_id=%r",
+            project_id,
+            parent_id,
+            exc_info=True,
+        )
+        return None
+
+
+def load_concept_entity_for_sync(
+    project_id: str,
+    concept_id: str,
+    parent_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Load one concept for AYON push, preferring official ``GET /data/concepts``.
+
+    Tries project-wide list first, then filtered by ``parent_id`` when given,
+    then ``gazu.concept.get_concept`` as fallback.
+    """
+    _ensure_gazu_host()
+    cid = str(concept_id)
+    pid = str(project_id)
+
+    def _pick(rows: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        for row in rows:
+            if str(row.get("id")) == cid:
+                merged = dict(row)
+                merged.setdefault("type", "Concept")
+                return merged
+        return None
+
+    lst = fetch_concepts_list_via_data_endpoint(pid, None)
+    if lst is not None:
+        hit = _pick(lst)
+        if hit is not None:
+            return hit
+
+    if parent_id is not None and str(parent_id) != "":
+        lst2 = fetch_concepts_list_via_data_endpoint(pid, str(parent_id))
+        if lst2 is not None:
+            hit = _pick(lst2)
+            if hit is not None:
+                return hit
+
+    return gazu.concept.get_concept(concept_id)
+
+
+def all_concepts_for_project_official_list(project: Any) -> List[Dict[str, Any]]:
+    """All concepts for fullsync: prefer ``GET /data/concepts?project_id=``.
+
+    Falls back to ``gazu.concept.all_concepts_for_project`` if the list route
+    fails or returns no rows.
+    """
+    _ensure_gazu_host()
+    if isinstance(project, dict):
+        pid = str(project.get("id", ""))
+    else:
+        pid = str(project)
+    if not pid:
+        return gazu.concept.all_concepts_for_project(project)
+    rows = fetch_concepts_list_via_data_endpoint(pid, None)
+    if rows is None:
+        return gazu.concept.all_concepts_for_project(project)
+    for c in rows:
+        c.setdefault("type", "Concept")
+    return rows
 
 
 def format_kitsu_task_display(value: Any) -> str:

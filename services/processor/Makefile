@@ -1,4 +1,5 @@
-include .env
+-include $(CURDIR)/../../.env
+-include $(CURDIR)/.env
 
 AYON_ADDON_VERSION=$(shell python -c "import os;import sys;content={};f=open('$(CURDIR)/../../package.py');exec(f.read(),content);f.close();print(content['version'])")
 AYON_ADDON_NAME=kitsu
@@ -29,6 +30,11 @@ export AYON_ADDON_VERSION
 export AYON_ADDON_NAME
 export AYON_API_KEY
 export AYON_SERVER_URL
+export KITSU_SERVER
+export KITSU_URL
+export KITSU_LOGIN
+export KITSU_EMAIL
+export KITSU_PWD
 
 
 run:
@@ -60,4 +66,9 @@ dev: build
 		--env AYON_SERVER_URL=${AYON_SERVER_URL} \
 		--env AYON_ADDON_NAME=${AYON_ADDON_NAME} \
 		--env AYON_ADDON_VERSION=$(AYON_ADDON_VERSION) \
+		--env KITSU_SERVER=${KITSU_SERVER} \
+		--env KITSU_URL=${KITSU_URL} \
+		--env KITSU_LOGIN=${KITSU_LOGIN} \
+		--env KITSU_EMAIL=${KITSU_EMAIL} \
+		--env KITSU_PWD=${KITSU_PWD} \
 		$(IMAGE) python -m processor
