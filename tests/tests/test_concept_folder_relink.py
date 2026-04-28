@@ -52,9 +52,31 @@ def test_try_relink_orphan_concept_folder_sets_kitsu_id():
         mock_folder.save.assert_called_once()
         m_fetch.assert_awaited_once()
         assert m_fetch.await_args.args[1] == "concepts-root-id"
-        assert legacy_slug in m_fetch.await_args.args[2]
+        any_candidates = m_fetch.await_args.args[2]
+        assert legacy_slug in any_candidates
+        base = push.concept_folder_base_slug(
+            push.concept_folder_display_name(raw, sanitize=True)
+        )
+        assert base in any_candidates
+        assert f"{base}_2" in any_candidates
 
     asyncio.run(_body())
+
+
+def test_relink_slug_candidates_include_name_and_code_when_both_differ():
+    entity = {
+        "type": "Concept",
+        "id": "c1",
+        "name": "ART_Hero",
+        "code": "610197433-sheriff_concepts",
+        "parent_id": None,
+    }
+    cands = push._concept_relink_folder_name_slugs(
+        entity,
+        sanitize_folder_display=True,
+    )
+    assert push.slugify("ART_Hero", separator="_") in cands
+    assert push.slugify("610197433-sheriff_concepts", separator="_") in cands
 
 
 def test_try_relink_skips_when_kitsu_parent_not_none():

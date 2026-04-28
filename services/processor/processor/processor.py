@@ -17,6 +17,10 @@ from .content_sync import (
     update_comment_on_ayon,
 )
 from .fullsync import project_full_sync
+from .pairing_fallback import (
+    pairing_http_error_is_kitsu_login,
+    pairing_list_from_processor_session,
+)
 from .update_from_kitsu import (
     create_or_update_asset,
     create_or_update_concept,
@@ -94,8 +98,17 @@ def _kitsu_login_from_env() -> tuple[str, str] | None:
     return None
 
 
+class _DisabledProcessorListenerThread:
+    """Placeholder when Kitsu Socket.IO / AYON event threads are not started."""
+
+    __slots__ = ()
+
+    def is_alive(self) -> bool:
+        return False
+
+
 class KitsuProcessor:
-    def __init__(self):
+    def __init__(self, *, start_listener_threads: bool = True):
         logging.info("=" * 60)
         logging.info("KitsuProcessor.__init__ starting")
         logging.info("=" * 60)
@@ -177,17 +190,9 @@ class KitsuProcessor:
         )
 
         #
-        # Get list of projects that have been paired
-        #
-        logging.info("Step 4: Fetching project pairing list...")
-        self.pairing_list = self.get_pairing_list()
-        logging.info(f"Found {len(self.pairing_list)} paired projects")
-        logging.debug(f"Pairing list: {self.pairing_list!r}")
-
-        #
         # Get Kitsu server credentials from settings
         #
-        logging.info("Step 5: Loading Kitsu credentials from settings...")
+        logging.info("Step 4: Loading Kitsu credentials from settings...")
         try:
             kitsu_server_setting = self.settings.get("server")
             logging.info(f"Kitsu server setting (addon): {kitsu_server_setting}")
@@ -198,11 +203,13 @@ class KitsuProcessor:
             env_creds = _kitsu_login_from_env()
             if env_creds:
                 self.kitsu_login_email, self.kitsu_login_password = env_creds
+                self._kitsu_credentials_source = "environment"
                 logging.info(
                     "Using Kitsu credentials from environment "
                     "(KITSU_LOGIN or KITSU_EMAIL, plus KITSU_PWD)"
                 )
             else:
+                self._kitsu_credentials_source = "addon_secrets"
                 email_secret = self.settings.get("login_email")
                 password_secret = self.settings.get("login_password")
 
@@ -231,7 +238,10 @@ class KitsuProcessor:
 
                     password_data = ayon_api.get_secret(password_secret)
                     self.kitsu_login_password = password_data["value"]
-                    logging.info("Password retrieved successfully")
+                    logging.info(
+                        "Using Kitsu credentials from AYON Studio secrets "
+                        "(login_email / login_password); set KITSU_* env to override locally."
+                    )
                 except KeyError as e:
                     logging.error(f"Secret key error: {e}")
                     raise KitsuSettingsError(f"Secret `{e}` not found") from e
@@ -276,62 +286,101 @@ class KitsuProcessor:
             )
         except gazu.exception.AuthFailedException as e:
             logging.error(f"Kitsu authentication failed: {e}")
+            src = getattr(self, "_kitsu_credentials_source", "unknown")
+            if src == "environment":
+                hint = (
+                    "Verify KITSU_PWD for this email, KITSU_SERVER / addon server URL, "
+                    "and that the local driver merged the intended .env (see test_processor_image)."
+                )
+            else:
+                hint = (
+                    "Verify AYON Studio secrets for login_email / login_password, "
+                    "or set KITSU_LOGIN (or KITSU_EMAIL) and KITSU_PWD to override for local runs."
+                )
             raise KitsuServerError(
                 f"Kitsu login failed for {self.kitsu_login_email}. "
-                "Check credentials in AYON addon settings."
+                f"Credential source: {src}. {hint}"
             ) from e
         except Exception as e:
             logging.error(f"Unexpected error during Kitsu login: {e}")
             raise KitsuServerError(f"Kitsu login error: {e}") from e
 
-        # init event client
-        self.kitsu_events_url = self.kitsu_server_url.replace(
-            "api", "socket.io"
-        )
-        logging.info(
-            f"Initializing Kitsu event client: {self.kitsu_events_url}"
-        )
-        gazu.set_event_host(self.kitsu_events_url)
+        self.start_listener_threads = start_listener_threads
+        self.kitsu_events_url = None
+        self.event_client = None
 
-        try:
-            self.event_client = gazu.events.init()
-            logging.info("Kitsu event client initialized successfully")
-        except Exception as e:
-            logging.error(f"Failed to initialize Kitsu event client: {e}")
-            raise KitsuServerError(
-                f"Cannot initialize Kitsu event client at {self.kitsu_events_url}. "
-                f"Error: {e}"
-            ) from e
+        if start_listener_threads:
+            # init event client (Socket.IO); not needed for one-shot fullsync drivers.
+            self.kitsu_events_url = self.kitsu_server_url.replace(
+                "api", "socket.io"
+            )
+            logging.info(
+                f"Initializing Kitsu event client: {self.kitsu_events_url}"
+            )
+            gazu.set_event_host(self.kitsu_events_url)
+
+            try:
+                self.event_client = gazu.events.init()
+                logging.info("Kitsu event client initialized successfully")
+            except Exception as e:
+                logging.error(f"Failed to initialize Kitsu event client: {e}")
+                raise KitsuServerError(
+                    f"Cannot initialize Kitsu event client at {self.kitsu_events_url}. "
+                    f"Error: {e}"
+                ) from e
+        else:
+            logging.info(
+                "Kitsu Socket.IO event client skipped (start_listener_threads=False)"
+            )
 
         # Store host in thread-local storage for main thread
         logging.info("Step 7: Setting up thread-local Kitsu host...")
         processor_utils.set_kitsu_host(self.kitsu_server_url)
         logging.info("Thread-local Kitsu host configured")
 
-        # ============= Add Kitsu Event Listeners ==============
-        logging.info("Step 8: Starting Kitsu event listener thread...")
-        self.gazu_listener_thread = threading.Thread(
-            target=self.run_gazu_listeners,
-            name="KitsuEventListener",
-            daemon=False,
-        )
-        self.gazu_listener_thread.start()
         logging.info(
-            f"Kitsu event listener thread started (alive: {self.gazu_listener_thread.is_alive()})"
+            "Fetching project pairing list (GET /pairing on AYON uses Studio "
+            "Kitsu secrets; see pairing_fallback if that login fails)."
         )
+        self.pairing_list = self.get_pairing_list()
+        logging.info(f"Found {len(self.pairing_list)} rows in pairing list")
+        logging.debug(f"Pairing list: {self.pairing_list!r}")
 
-        # ============= AYON event enrollment thread ==============
-        logging.info("Step 9: Starting AYON event loop thread...")
-        self.ayon_event_thread = threading.Thread(
-            target=run_ayon_event_loop,
-            args=(self,),
-            name="AyonEventLoop",
-            daemon=False,
-        )
-        self.ayon_event_thread.start()
-        logging.info(
-            f"AYON event loop thread started (alive: {self.ayon_event_thread.is_alive()})"
-        )
+        if start_listener_threads:
+            # ============= Add Kitsu Event Listeners ==============
+            logging.info("Step 8: Starting Kitsu event listener thread...")
+            self.gazu_listener_thread = threading.Thread(
+                target=self.run_gazu_listeners,
+                name="KitsuEventListener",
+                daemon=False,
+            )
+            self.gazu_listener_thread.start()
+            logging.info(
+                "Kitsu event listener thread started "
+                f"(alive: {self.gazu_listener_thread.is_alive()})"
+            )
+
+            # ============= AYON event enrollment thread ==============
+            logging.info("Step 9: Starting AYON event loop thread...")
+            self.ayon_event_thread = threading.Thread(
+                target=run_ayon_event_loop,
+                args=(self,),
+                name="AyonEventLoop",
+                daemon=False,
+            )
+            self.ayon_event_thread.start()
+            logging.info(
+                "AYON event loop thread started "
+                f"(alive: {self.ayon_event_thread.is_alive()})"
+            )
+        else:
+            logging.info(
+                "Steps 8-9: Kitsu listener and AYON event threads not started "
+                "(start_listener_threads=False; do not call start_processing)"
+            )
+            disabled = _DisabledProcessorListenerThread()
+            self.gazu_listener_thread = disabled
+            self.ayon_event_thread = disabled
 
         logging.info("=" * 60)
         logging.info("KitsuProcessor initialization complete!")
@@ -583,16 +632,43 @@ class KitsuProcessor:
         res = ayon_api.get(f"{self.entrypoint}/pairing")
 
         if res.status_code != 200:
+            detail = str(getattr(res, "detail", "") or "")
             logging.error(
                 f"Failed to fetch pairing list from {self.entrypoint}/pairing. "
-                f"Status: {res.status_code}, Detail: {res.detail}"
+                f"Status: {res.status_code}, Detail: {detail}"
             )
-            logging.error(
-                f"This likely means addon version {self.addon_version} is not deployed "
-                "in the current bundle. Check AYON_ADDON_NAME and AYON_ADDON_VERSION "
-                "environment variables match the deployed addon version."
-            )
-            # Try to get available addon versions for diagnostics
+            if pairing_http_error_is_kitsu_login(detail):
+                logging.error(
+                    "AYON server Kitsu login failed for GET /pairing. The addon uses "
+                    "Studio settings secrets (login_email / login_password), not "
+                    "this container's KITSU_LOGIN / KITSU_PWD. Update those secrets in "
+                    "AYON Studio to match a valid Kitsu user, or ensure local fallback "
+                    "can run (processor must be logged into Kitsu already)."
+                )
+                local = pairing_list_from_processor_session()
+                if local:
+                    logging.info(
+                        "[pairing] Using locally built pairing list (processor Kitsu "
+                        "session + GET /api/projects) because server /pairing Kitsu "
+                        "login failed."
+                    )
+                    return local
+                raise KitsuSettingsError(
+                    "Pairing endpoint failed: Kitsu invalid credentials on the AYON "
+                    "server (Studio secrets for the Kitsu addon). "
+                    "Local pairing fallback also failed or returned no data."
+                )
+            if res.status_code == 404:
+                logging.error(
+                    f"Pairing endpoint returned 404. Addon {self.addon_name}/"
+                    f"{self.addon_version} may not be deployed in this bundle."
+                )
+            else:
+                logging.error(
+                    f"If this is not a credentials issue, addon "
+                    f"{self.addon_name}/{self.addon_version} may be missing from the "
+                    "bundle or AYON_ADDON_NAME / AYON_ADDON_VERSION may be wrong."
+                )
             try:
                 addons_res = ayon_api.get("/api/addons")
                 if addons_res.status_code == 200:
@@ -612,7 +688,8 @@ class KitsuProcessor:
 
             raise KitsuSettingsError(
                 f"Pairing endpoint failed with status {res.status_code}. "
-                f"Ensure addon {self.addon_name}/{self.addon_version} is deployed."
+                f"Ensure addon {self.addon_name}/{self.addon_version} is deployed "
+                "and Studio Kitsu secrets are valid."
             )
 
         logging.debug(f"Pairing list response data: {res.data!r}")

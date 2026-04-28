@@ -42,10 +42,56 @@ def create_name_and_label(kitsu_name: str) -> dict[str, str]:
     return {"name": name_slug, "label": kitsu_name}
 
 
+async def allocate_unique_concept_folder_name_label(
+    project_name: str,
+    parent_id: str,
+    display_label: str,
+    kitsu_concept_id: str,
+) -> dict[str, str]:
+    """Human ``label`` + sibling-unique folder ``name`` slug under ``parent_id``.
+
+    Uses ``slugify(label)``, then ``slugify(label)_2``, ``_3``, … until a name is
+    free or already owned by this Kitsu concept (``data.kitsuId``). No UUIDs in
+    folder names.
+    """
+    label = (display_label or "").strip() or "concept"
+    base = slugify(label, separator="_") or "concept"
+    kid = str(kitsu_concept_id or "").strip()
+
+    for i in range(1, 500):
+        candidate = base if i == 1 else f"{base}_{i}"
+        res = await Postgres.fetch(
+            f"""
+            SELECT id, COALESCE(data->>'kitsuId', '') AS kid
+            FROM project_{project_name}.folders
+            WHERE parent_id = $1 AND name = $2
+            LIMIT 3
+            """,
+            parent_id,
+            candidate,
+        )
+        if not res:
+            return {"name": candidate, "label": label}
+        if len(res) == 1:
+            row_kid = str(res[0].get("kid") or "")
+            if row_kid == kid:
+                return {"name": candidate, "label": label}
+    raise RuntimeError(
+        f"Could not allocate a unique Concept folder slug for base {base!r} "
+        f"under parent {parent_id!r} (project {project_name!r})"
+    )
+
+
 def is_task_folder_name_unique_violation(exc: BaseException) -> bool:
     """True when DB rejects create_task because that folder already has this task name/type."""
     msg = str(exc).lower()
     return "already exists" in msg and "task" in msg
+
+
+def is_folder_parent_name_unique_violation(exc: BaseException) -> bool:
+    """True when DB rejects create_folder (duplicate name under same parent)."""
+    msg = str(exc).lower()
+    return "folder" in msg and "already exists" in msg
 
 
 async def find_task_id_by_folder_name_type(
@@ -136,7 +182,9 @@ async def get_task_by_kitsu_id(
 
 async def create_folder(
     project_name: str,
-    name: str,
+    name: str | None = None,
+    *,
+    name_and_label: dict[str, str] | None = None,
     **kwargs,
 ) -> FolderEntity:
     """
@@ -144,7 +192,12 @@ async def create_folder(
     require background tasks. Maybe just use the similar function from
     api.folders.folders.py?
     """
-    payload = {**kwargs, **create_name_and_label(name)}
+    if name_and_label is not None:
+        payload = {**kwargs, **name_and_label}
+    else:
+        if not name:
+            raise ValueError("create_folder requires name or name_and_label=")
+        payload = {**kwargs, **create_name_and_label(name)}
 
     folder = FolderEntity(
         project_name=project_name,
@@ -165,18 +218,32 @@ async def create_folder(
 async def update_folder(
     project_name: str,
     folder_id: str,
-    name: str,
+    name: str | None = None,
+    *,
+    name_and_label: dict[str, str] | None = None,
+    update_identifiers: bool = True,
     **kwargs,
 ) -> bool:
     folder = await FolderEntity.load(project_name, folder_id)
     changed = False
 
-    payload: dict[str, Any] = {**kwargs, **create_name_and_label(name)}
-
-    for key in ["name", "label"]:
-        if key in payload and getattr(folder, key) != payload[key]:
-            setattr(folder, key, payload[key])
-            changed = True
+    if update_identifiers:
+        if name_and_label is not None:
+            payload = {**kwargs, **name_and_label}
+        else:
+            if not name:
+                raise ValueError("update_folder requires name or name_and_label=")
+            payload = {**kwargs, **create_name_and_label(name)}
+        for key in ["name", "label"]:
+            if key in payload and getattr(folder, key) != payload[key]:
+                setattr(folder, key, payload[key])
+                changed = True
+    else:
+        payload = dict(kwargs)
+        if "attrib" not in payload:
+            raise ValueError(
+                "update_folder(..., update_identifiers=False) requires attrib=..."
+            )
 
     for key, value in payload["attrib"].items():
         if getattr(folder.attrib, key) != value:

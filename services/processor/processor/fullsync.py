@@ -23,12 +23,18 @@ from .sync_error_format import (
     format_partial_sync_headline,
 )
 from .sync_events import emit_sync_entity_failed, emit_sync_summary, parse_http_error_detail
-from .task_relink import merge_push_response_folder_map, push_entities_with_relink
+from .task_relink import (
+    merge_push_response_folder_map,
+    push_batch_with_relink,
+    push_entities_with_relink,
+)
 from .utils import (
     all_concepts_for_project_official_list,
+    expand_concept_entities_for_push,
     get_asset_types,
     get_statuses,
     get_task_types,
+    normalize_concept_sync_dict,
     preprocess_asset,
     preprocess_task,
     set_kitsu_host,
@@ -286,9 +292,49 @@ def project_full_sync(
     # If the user runs an older version if Kitsu, gazu.concept will
     #    throw an error.
     concepts = []
+    _cs0 = (parent.settings.get("sync_settings") or {}).get("concept_sync")
+    _has_concept_entity_model_key = isinstance(_cs0, dict) and (
+        "concept_entity_model" in _cs0 or "conceptEntityModel" in _cs0
+    )
+    concept_sync = normalize_concept_sync_dict(
+        _cs0 if isinstance(_cs0, dict) else None,
+    )
     try:
-        concepts = all_concepts_for_project_official_list(kitsu_project_id)
-        logging.info(f"[fullsync] Retrieved {len(concepts)} concepts")
+        model = str((concept_sync or {}).get("concept_entity_model") or "").strip()
+        raw_concepts = all_concepts_for_project_official_list(
+            kitsu_project_id,
+            concept_sync=concept_sync,
+        )
+        raw_count = len(raw_concepts)
+        if raw_count > 0 and _has_concept_entity_model_key and not model:
+            logging.error(
+                "[fullsync] concept_sync defines concept_entity_model but it is empty "
+                "after normalize; per_linked expansion is disabled (duplicate folder "
+                "risk on multi-concept names). Set "
+                "sync_settings.concept_sync.concept_entity_model to per_linked_entity "
+                "in the **processor** service JSON, or set env "
+                "KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL=per_linked_entity."
+            )
+        logging.info(
+            f"[fullsync] concept_sync.concept_entity_model={model!r} "
+            f"raw_kitsu_concepts={raw_count} "
+            "(set to per_linked_entity on the **processor** settings JSON, not only "
+            "the studio addon UI, or set env KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL, "
+            "or expansion/dedupe is skipped)"
+        )
+        concepts = expand_concept_entities_for_push(
+            raw_concepts,
+            concept_sync=concept_sync,
+        )
+        per_linked_rows = sum(
+            1
+            for r in concepts
+            if isinstance(r, dict) and r.get("__conceptSyncModel") == "per_linked_entity"
+        )
+        logging.info(
+            f"[fullsync] Concept rows for push: {len(concepts)} "
+            f"(per_linked_entity expanded rows={per_linked_rows})"
+        )
     except Exception as e:
         logging.debug(
             f"[fullsync] Concepts not available (may be older Kitsu version): {e}"
@@ -312,13 +358,11 @@ def project_full_sync(
 
     if playlist_sync_enabled(parent):
         logging.info(
-            "[fullsync] Kitsu playlists → AYON lists will run after %s /push batch(es) "
-            "(%s entities). When finished, grep logs for `[fullsync] playlist` for "
-            "counts or skip. If nothing appears, confirm processor service settings "
-            "`sync_settings.playlist_sync.enabled` and that this addon build includes "
-            "playlist observability.",
-            total_batches,
-            len(entities),
+            f"[fullsync] Kitsu playlists → AYON lists will run after {total_batches} "
+            f"/push batch(es) ({len(entities)} entities). When finished, grep logs for "
+            "`[fullsync] playlist` for counts or skip. If nothing appears, confirm "
+            "processor service settings `sync_settings.playlist_sync.enabled` and that "
+            "this addon build includes playlist observability."
         )
     else:
         logging.info(
@@ -350,16 +394,19 @@ def project_full_sync(
         )
 
         try:
-            response = ayon_api.post(
-                f"{parent.entrypoint}/push",
-                project_name=project_name,
-                entities=batch,
+            response = push_batch_with_relink(
+                parent.entrypoint,
+                project_name,
+                batch,
+                kitsu_folder_map,
+                concept_sync=concept_sync,
             )
             response.raise_for_status()
             merge_push_response_folder_map(kitsu_folder_map, response.data)
             processed_count += len(batch)
             logging.info(
-                f"[fullsync] Batch {batch_num + 1} processed successfully"
+                f"[fullsync] Batch {batch_num + 1}/{total_batches} processed "
+                f"successfully ({len(batch)} entities) mix={entity_types}"
             )
         except Exception as e:
             parsed = parse_http_error_detail(e)
@@ -422,6 +469,7 @@ def project_full_sync(
                         project_name,
                         [entity],
                         kitsu_folder_map,
+                        concept_sync=concept_sync,
                     )
                     individual_success += 1
 
@@ -529,8 +577,15 @@ def project_full_sync(
 
     # Kitsu playlists → AYON entity lists (folder), after folder map is populated
     try:
-        sync_playlists_via_push_for_project(
+        playlist_stats = sync_playlists_via_push_for_project(
             parent, kitsu_project_id, project_name, kitsu_folder_map
+        )
+        logging.info(
+            f"[fullsync] playlist phase summary project={project_name} "
+            f"fetched={playlist_stats['fetched']} pushed={playlist_stats['pushed']} "
+            f"fetch_failed={playlist_stats['fetch_failed']} "
+            f"push_failed={playlist_stats['push_failed']} "
+            f"zero_member_playlists={playlist_stats['zero_members']}"
         )
     except Exception as e:
         logging.error(

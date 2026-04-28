@@ -15,9 +15,11 @@ _nxt.logging = MagicMock()
 sys.modules.setdefault("nxtools", _nxt)
 
 from processor.playlist_order import ordered_kitsu_entity_ids_from_playlist
+import processor.playlist_push_entity as ppe
 from processor.playlist_push_entity import (
     build_playlist_push_entity,
     ordered_kitsu_member_ids_for_push,
+    sync_playlists_via_push_for_project,
 )
 
 
@@ -70,3 +72,91 @@ def test_build_playlist_push_entity_resolves_and_skips_unknown():
     assert ent["name"] == "Review"
     assert ent["ayon_server_url"] == "https://ayon.test"
     assert ent["ordered_ayon_folder_ids"] == ["ayon-folder-1"]
+
+
+def test_sync_playlists_skips_post_when_no_resolved_members(monkeypatch):
+    posted: list[int] = []
+
+    class _Ok:
+        ok = True
+        status_code = 200
+        text = ""
+        url = ""
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(*_a, **_k):
+        posted.append(1)
+        return _Ok()
+
+    monkeypatch.setattr(ppe.ayon_api, "post", fake_post, raising=False)
+    monkeypatch.setattr(
+        ppe.ayon_api, "get_base_url", lambda: "https://ayon.test", raising=False,
+    )
+    monkeypatch.setattr(
+        ppe,
+        "iter_playlists_for_kitsu_project",
+        lambda _k: [{"id": "pl-empty"}],
+    )
+    monkeypatch.setattr(
+        ppe.gazu.playlist,
+        "get_playlist",
+        lambda pl_id: {"id": pl_id, "name": "No Shots", "shots": []},
+    )
+    proc = MagicMock()
+    proc.settings = {"sync_settings": {"playlist_sync": {"enabled": True}}}
+    proc.entrypoint = "https://ayon"
+    stats = sync_playlists_via_push_for_project(
+        proc, "kitsu-proj", "ayon_proj", {},
+    )
+    assert stats["fetched"] == 1
+    assert stats["pushed"] == 0
+    assert stats["zero_members"] == 1
+    assert posted == []
+
+
+def test_sync_playlists_posts_when_push_when_zero_members_true(monkeypatch):
+    posted: list[int] = []
+
+    class _Ok:
+        ok = True
+        status_code = 200
+        text = ""
+        url = ""
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(*_a, **_k):
+        posted.append(1)
+        return _Ok()
+
+    monkeypatch.setattr(ppe.ayon_api, "post", fake_post, raising=False)
+    monkeypatch.setattr(
+        ppe.ayon_api, "get_base_url", lambda: "https://ayon.test", raising=False,
+    )
+    monkeypatch.setattr(
+        ppe,
+        "iter_playlists_for_kitsu_project",
+        lambda _k: [{"id": "pl-z"}],
+    )
+    monkeypatch.setattr(
+        ppe.gazu.playlist,
+        "get_playlist",
+        lambda pl_id: {"id": pl_id, "name": "Z", "shots": []},
+    )
+    proc = MagicMock()
+    proc.settings = {
+        "sync_settings": {
+            "playlist_sync": {
+                "enabled": True,
+                "push_when_zero_members": True,
+            },
+        },
+    }
+    proc.entrypoint = "https://ayon"
+    stats = sync_playlists_via_push_for_project(proc, "kp", "ayon_proj", {})
+    assert stats["pushed"] == 1
+    assert stats["zero_members"] == 1
+    assert len(posted) == 1

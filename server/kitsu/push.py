@@ -17,6 +17,7 @@ from .constants import (
     CONSTANT_KITSU_MODELS,
 )
 from .utils import (
+    allocate_unique_concept_folder_name_label,
     calculate_end_frame,
     create_folder,
     create_task,
@@ -26,6 +27,7 @@ from .utils import (
     get_folder_by_kitsu_id,
     get_task_by_kitsu_id,
     get_user_by_kitsu_id,
+    is_folder_parent_name_unique_violation,
     is_task_folder_name_unique_violation,
     update_project,
 
@@ -35,7 +37,16 @@ from .utils import (
 
 
 from .addon_helpers import to_username, required_values
-from .concept_utils import concept_folder_display_name, concept_vizdev_surrogate_kitsu_id
+from .concept_utils import (
+    concept_entity_model_is_per_linked_entity,
+    concept_folder_base_slug,
+    concept_folder_display_name,
+    concept_primary_title_for_folder,
+    concept_vizdev_surrogate_for_linked_entity,
+    concept_vizdev_surrogate_kitsu_id,
+    concept_vizdev_surrogate_unlinked_pool,
+    normalize_entity_concept_links,
+)
 from .playlist_entity_sync import delete_playlist as delete_playlist_entity
 from .playlist_entity_sync import sync_playlist as sync_playlist_entity
 
@@ -44,6 +55,41 @@ if TYPE_CHECKING:
 
 
 EntityDict = dict[str, Any]
+
+
+async def _kitsu_fetch_linked_entity_names(
+    addon: "KitsuAddon",
+    link_ids: Any,
+) -> list[str]:
+    """GET each linked entity's ``name`` (same order as ``entity_concept_links``)."""
+    if not link_ids or not isinstance(link_ids, (list, tuple)):
+        return []
+    kitsu = addon.kitsu
+    if kitsu is None:
+        return []
+    out: list[str] = []
+    for lid in link_ids:
+        eid = str(lid).strip() if lid is not None else ""
+        if not eid:
+            continue
+        try:
+            resp = await kitsu.get(f"data/entities/{eid}")
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            logging.debug(
+                "[concept_push] GET data/entities/%s failed (linked concept title)",
+                eid,
+                exc_info=True,
+            )
+            continue
+        if not isinstance(data, dict):
+            continue
+        nm = (data.get("name") or "").strip()
+        if nm:
+            out.append(nm)
+    return out
+
 
 KitsuEntityType = Literal[
     "Asset",
@@ -124,6 +170,48 @@ async def get_root_folder_id(
     return sub_id
 
 
+def _concept_relink_folder_name_slugs(
+    entity_dict: dict[str, Any],
+    *,
+    sanitize_folder_display: bool,
+) -> list[str]:
+    """Unique slug candidates for matching orphan Concept folders (legacy naming)."""
+    out: list[str] = []
+
+    def _add_slugs_from_raw(raw: str) -> None:
+        stem = (raw or "").strip() or "folder"
+        legacy_slug = slugify(stem, separator="_")
+        display_stem = concept_folder_display_name(
+            stem,
+            sanitize=sanitize_folder_display,
+        )
+        display_slug = slugify(display_stem, separator="_")
+        for s in (legacy_slug, display_slug):
+            if s and s not in out:
+                out.append(s)
+
+    primary = (concept_primary_title_for_folder(entity_dict) or "").strip() or "folder"
+    disp = concept_folder_display_name(
+        primary,
+        sanitize=sanitize_folder_display,
+    )
+    bslug = concept_folder_base_slug(disp)
+    for n in range(1, 20):
+        cand = bslug if n == 1 else f"{bslug}_{n}"
+        if cand and cand not in out:
+            out.append(cand)
+
+    _add_slugs_from_raw(primary)
+
+    name = (entity_dict.get("name") or "").strip()
+    code = (entity_dict.get("code") or "").strip()
+    if name and code and name != code:
+        alt = code if primary == name else name
+        _add_slugs_from_raw(alt)
+
+    return out
+
+
 async def try_relink_orphan_concept_folder(
     user: "UserEntity",
     project: "ProjectEntity",
@@ -141,17 +229,9 @@ async def try_relink_orphan_concept_folder(
     if entity_dict.get("parent_id") is not None:
         return False
 
-    raw_name = (
-        (entity_dict.get("code") or entity_dict.get("name") or "").strip() or "folder"
-    )
-    legacy_slug = slugify(raw_name, separator="_")
-    display_stem = concept_folder_display_name(
-        raw_name,
-        sanitize=sanitize_folder_display,
-    )
-    display_slug = slugify(display_stem, separator="_")
-    name_candidates = list(
-        dict.fromkeys(s for s in (legacy_slug, display_slug) if s)
+    name_candidates = _concept_relink_folder_name_slugs(
+        entity_dict,
+        sanitize_folder_display=sanitize_folder_display,
     )
 
     concepts_root_id = await get_root_folder_id(
@@ -208,6 +288,365 @@ async def try_relink_orphan_concept_folder(
     }
     await dispatch_event(**event)
     return True
+
+
+async def try_relink_orphan_concept_subfolder(
+    _user: "UserEntity",
+    project: "ProjectEntity",
+    entity_dict: "EntityDict",
+    existing_folders: dict[str, Any],
+    *,
+    sanitize_folder_display: bool = True,
+) -> bool:
+    """Set ``data.kitsuId`` on a nested Concept folder (parent is not the Concepts root).
+
+    Without this, a folder with the right slug but missing ``kitsuId`` is invisible
+    to ``get_folder_by_kitsu_id``, and create_folder collides (409) on re-sync.
+    """
+    parent_kitsu = entity_dict.get("parent_id")
+    if not parent_kitsu:
+        return False
+    name_candidates = _concept_relink_folder_name_slugs(
+        entity_dict,
+        sanitize_folder_display=sanitize_folder_display,
+    )
+    if not name_candidates:
+        return False
+
+    parent_ayon = await get_folder_by_kitsu_id(
+        project.name,
+        str(parent_kitsu),
+        existing_folders,
+    )
+    if parent_ayon is None:
+        return False
+    parent_ayon_id = parent_ayon.id
+
+    res = await Postgres.fetch(
+        f"""
+        SELECT id, data FROM project_{project.name}.folders
+        WHERE parent_id = $1
+          AND folder_type = 'Concept'
+          AND name = ANY($2::text[])
+          AND (
+            data IS NULL
+            OR data->>'kitsuId' IS NULL
+            OR data->>'kitsuId' = ''
+          )
+        """,
+        parent_ayon_id,
+        name_candidates,
+    )
+    if not res:
+        return False
+    if len(res) > 1:
+        logging.warning(
+            "[concept_relink] ambiguous subfolder: %s Concept folders under %s "
+            "matching %r, skipping",
+            len(res),
+            parent_ayon_id[:8],
+            name_candidates,
+        )
+        return False
+
+    folder_id = res[0]["id"]
+    folder = await FolderEntity.load(project.name, folder_id)
+    merged = {**(folder.data or {}), "kitsuId": entity_dict["id"]}
+    folder.data = merged
+    await folder.save()
+    existing_folders[entity_dict["id"]] = folder.id
+    logging.info(
+        "[concept_relink] set kitsuId on subfolder %r (name=%r) -> concept %s",
+        folder_id,
+        folder.name,
+        entity_dict["id"],
+    )
+    event = {
+        "topic": "entity.folder.updated",
+        "description": f"Folder {folder.name} updated",
+        "summary": {"entityId": folder.id, "parentId": folder.parent_id},
+        "project": project.name,
+    }
+    await dispatch_event(**event)
+    return True
+
+
+async def try_migrate_concept_folder_from_legacy_concept_ids(
+    project: "ProjectEntity",
+    *,
+    parent_ayon_folder_id: str,
+    new_kitsu_id: str,
+    source_concept_ids: list[str],
+    existing_folders: dict[str, Any],
+) -> bool:
+    """Point ``data.kitsuId`` from a legacy Kitsu **concept** id to a linked entity id."""
+    ids = [str(x).strip() for x in source_concept_ids if str(x).strip()]
+    if not ids or not str(new_kitsu_id).strip():
+        return False
+    res = await Postgres.fetch(
+        f"""
+        SELECT id, data FROM project_{project.name}.folders
+        WHERE parent_id = $1
+          AND folder_type = 'Concept'
+          AND data->>'kitsuId' = ANY($2::text[])
+        LIMIT 5
+        """,
+        parent_ayon_folder_id,
+        ids,
+    )
+    if len(res) != 1:
+        if len(res) > 1:
+            logging.warning(
+                "[concept_migrate] ambiguous legacy Concept folders for kitsuId=%s "
+                "parent=%s (matches=%s)",
+                str(new_kitsu_id)[:8],
+                str(parent_ayon_folder_id)[:8],
+                len(res),
+            )
+        return False
+    folder_id = res[0]["id"]
+    folder = await FolderEntity.load(project.name, folder_id)
+    merged_data = dict(folder.data or {})
+    merged_data["kitsuId"] = str(new_kitsu_id)
+    prev_src = merged_data.get("kitsuSourceConceptIds")
+    combined: list[str] = []
+    if isinstance(prev_src, list):
+        combined.extend(str(x) for x in prev_src if x)
+    for x in ids:
+        if x not in combined:
+            combined.append(x)
+    merged_data["kitsuSourceConceptIds"] = combined[:50]
+    folder.data = merged_data
+    await folder.save()
+    existing_folders[str(new_kitsu_id)] = folder.id
+    logging.info(
+        "[concept_migrate] retargeted folder %s -> kitsuId prefix %s (n_sources=%s)",
+        str(folder_id)[:8],
+        str(new_kitsu_id)[:8],
+        len(ids),
+    )
+    event = {
+        "topic": "entity.folder.updated",
+        "description": f"Folder {folder.name} updated",
+        "summary": {"entityId": folder.id, "parentId": folder.parent_id},
+        "project": project.name,
+    }
+    await dispatch_event(**event)
+    return True
+
+
+def _concept_folder_push_data(entity_dict: EntityDict) -> dict[str, Any]:
+    data: dict[str, Any] = {"kitsuId": entity_dict["id"]}
+    extra = entity_dict.get("kitsuSourceConceptIds")
+    if isinstance(extra, list) and extra:
+        data["kitsuSourceConceptIds"] = [str(x) for x in extra if x][:50]
+    return data
+
+
+async def merge_concept_folder_data_kitsu_fields(
+    project_name: str,
+    folder_id: str,
+    entity_dict: EntityDict,
+) -> None:
+    """Merge ``kitsuSourceConceptIds`` / ``kitsuId`` on folder ``data`` (``update_folder`` skips ``data``)."""
+    if entity_dict.get("type") != "Concept":
+        return
+    extras = entity_dict.get("kitsuSourceConceptIds")
+    if not isinstance(extras, list) or not extras:
+        return
+    folder = await FolderEntity.load(project_name, folder_id)
+    prev = dict(folder.data or {})
+    data = dict(prev)
+    data["kitsuId"] = str(entity_dict["id"])
+    merged: list[str] = []
+    ps = data.get("kitsuSourceConceptIds")
+    if isinstance(ps, list):
+        merged.extend(str(x) for x in ps if x)
+    for x in extras:
+        sx = str(x)
+        if sx and sx not in merged:
+            merged.append(sx)
+    data["kitsuSourceConceptIds"] = merged[:50]
+    if data == prev:
+        return
+    folder.data = data
+    await folder.save()
+    event = {
+        "topic": "entity.folder.updated",
+        "description": f"Folder {folder.name} updated",
+        "summary": {"entityId": folder.id, "parentId": folder.parent_id},
+        "project": project_name,
+    }
+    await dispatch_event(**event)
+
+
+async def try_adopt_per_linked_concept_folder_on_duplicate_name(
+    project: "ProjectEntity",
+    parent_ayon_folder_id: str,
+    entity_dict: "EntityDict",
+    collision_folder_name: str,
+    existing_folders: dict[str, Any],
+    studio_settings: Any,
+) -> FolderEntity | None:
+    """When ``create_folder`` hits a name collision, merge into the existing Concept row.
+
+    Covers races (two allocates saw an empty slot), legacy ``data.kitsuId`` on a
+    sibling slug folder, and processors that omit ``__conceptSyncModel`` but studio
+    settings use ``per_linked_entity``.
+    """
+    cs = getattr(studio_settings.sync_settings, "concept_sync", None)
+    per_linked_meta = entity_dict.get("__conceptSyncModel") == "per_linked_entity"
+    per_linked_setting = concept_entity_model_is_per_linked_entity(cs)
+    if not per_linked_meta and not per_linked_setting:
+        return None
+    linked_id = str(entity_dict.get("id") or "").strip()
+    if not linked_id:
+        return None
+    links = normalize_entity_concept_links(entity_dict.get("entity_concept_links"))
+    effective_link = linked_id
+    if concept_entity_model_is_per_linked_entity(cs) and len(links) == 1:
+        only_l = str(links[0]).strip()
+        if only_l:
+            effective_link = only_l
+
+    sources = [str(x) for x in (entity_dict.get("kitsuSourceConceptIds") or []) if x]
+    if linked_id and linked_id != effective_link and linked_id not in sources:
+        sources.append(linked_id)
+
+    res = await Postgres.fetch(
+        f"""
+        SELECT id, COALESCE(data->>'kitsuId', '') AS kid
+        FROM project_{project.name}.folders
+        WHERE parent_id = $1 AND name = $2 AND folder_type = 'Concept'
+        LIMIT 2
+        """,
+        parent_ayon_folder_id,
+        collision_folder_name,
+    )
+    if len(res) != 1:
+        return None
+    folder_id = str(res[0]["id"])
+    row_kid = str(res[0].get("kid") or "").strip()
+    if row_kid and row_kid != effective_link and row_kid not in sources:
+        if not (
+            concept_entity_model_is_per_linked_entity(cs)
+            and len(links) == 1
+        ):
+            logging.debug(
+                f"[concept_adopt] name collision {collision_folder_name!r} "
+                f"under parent={str(parent_ayon_folder_id)[:8]}: existing "
+                f"kitsuId={(row_kid or '')[:12]!r} not mergeable into "
+                f"effective_link={effective_link[:12]!r} (n_sources={len(sources)})"
+            )
+            return None
+
+    folder = await FolderEntity.load(project.name, folder_id)
+    new_data = dict(folder.data or {})
+    new_data["kitsuId"] = effective_link
+    merged: list[str] = []
+    prev_src = new_data.get("kitsuSourceConceptIds")
+    if isinstance(prev_src, list):
+        merged.extend(str(x) for x in prev_src if x)
+    for s in sources:
+        if s not in merged:
+            merged.append(s)
+    if row_kid and row_kid not in merged:
+        merged.append(row_kid)
+    new_data["kitsuSourceConceptIds"] = merged[:50]
+    folder.data = new_data
+    await folder.save()
+    existing_folders[effective_link] = folder_id
+    logging.info(
+        f"[concept_adopt] merged Concept folder {str(folder_id)[:8]} "
+        f"name={collision_folder_name!r} -> kitsuId={str(effective_link)[:12]!r} "
+        f"(prev_kitsuId={(row_kid or '')[:12]!r}, n_sources={len(merged)})"
+    )
+    event = {
+        "topic": "entity.folder.updated",
+        "description": f"Folder {folder.name} updated",
+        "summary": {"entityId": folder.id, "parentId": folder.parent_id},
+        "project": project.name,
+    }
+    await dispatch_event(**event)
+    return folder
+
+
+async def try_merge_per_kitsu_concept_folder_on_duplicate_slug(
+    project: "ProjectEntity",
+    parent_ayon_folder_id: str,
+    entity_dict: "EntityDict",
+    collision_folder_name: str,
+    existing_folders: dict[str, Any],
+    studio_settings: Any,
+) -> FolderEntity | None:
+    """When ``per_kitsu_concept`` is active, several concept rows can share one slug.
+
+    The first ``create_folder`` wins; later rows collide on ``(parent_id, name)``.
+    Merge the incoming Kitsu concept id into ``data.kitsuSourceConceptIds`` and
+    register ``existing_folders`` so the push batch stays consistent.
+    """
+    cs = getattr(studio_settings.sync_settings, "concept_sync", None)
+    if concept_entity_model_is_per_linked_entity(cs):
+        return None
+    if entity_dict.get("__conceptSyncModel") == "per_linked_entity":
+        return None
+    new_id = str(entity_dict.get("id") or "").strip()
+    if not new_id:
+        return None
+
+    res = await Postgres.fetch(
+        f"""
+        SELECT id, COALESCE(data->>'kitsuId', '') AS kid
+        FROM project_{project.name}.folders
+        WHERE parent_id = $1 AND name = $2 AND folder_type = 'Concept'
+        LIMIT 2
+        """,
+        parent_ayon_folder_id,
+        collision_folder_name,
+    )
+    if len(res) != 1:
+        return None
+    folder_id = str(res[0]["id"])
+    row_kid = str(res[0].get("kid") or "").strip()
+
+    folder = await FolderEntity.load(project.name, folder_id)
+    new_data = dict(folder.data or {})
+    merged: list[str] = []
+    prev_src = new_data.get("kitsuSourceConceptIds")
+    if isinstance(prev_src, list):
+        merged.extend(str(x) for x in prev_src if x)
+    for x in entity_dict.get("kitsuSourceConceptIds") or []:
+        sx = str(x).strip()
+        if sx and sx not in merged:
+            merged.append(sx)
+    if new_id not in merged:
+        merged.append(new_id)
+    if row_kid and row_kid not in merged:
+        merged.append(row_kid)
+    new_data["kitsuSourceConceptIds"] = merged[:50]
+    if not new_data.get("kitsuId") and row_kid:
+        new_data["kitsuId"] = row_kid
+    folder.data = new_data
+    await folder.save()
+    existing_folders[new_id] = folder_id
+    if row_kid:
+        existing_folders[row_kid] = folder_id
+    logging.info(
+        "[concept_merge_per_kitsu] merged duplicate slug %r folder=%s "
+        "added_kitsu_id=%s (n_sources=%s)",
+        collision_folder_name,
+        str(folder_id)[:8],
+        new_id[:12],
+        len(merged),
+    )
+    event = {
+        "topic": "entity.folder.updated",
+        "description": f"Folder {folder.name} updated",
+        "summary": {"entityId": folder.id, "parentId": folder.parent_id},
+        "project": project.name,
+    }
+    await dispatch_event(**event)
+    return folder
 
 
 async def create_access_group(
@@ -539,10 +978,28 @@ async def sync_project(
     await update_project(project.name, **anatomy_data)
 
 
+def _adopt_vizdev_task_data(
+    task: TaskEntity,
+    *,
+    surrogate: str,
+    concept_id: str,
+    linked_entity_id: str | None = None,
+) -> None:
+    merged = dict(task.data or {})
+    merged["kitsuId"] = surrogate
+    merged["kitsuConceptId"] = concept_id
+    merged["kitsuMirrorSlot"] = "VizDev"
+    if linked_entity_id:
+        merged["kitsuLinkedEntityId"] = linked_entity_id
+    else:
+        merged.pop("kitsuLinkedEntityId", None)
+    task.data = merged
+
+
 async def ensure_concept_vizdev_task(
     addon: "KitsuAddon",
     project: "ProjectEntity",
-    concept_id: str,
+    entity_dict: "EntityDict",
     folder_id: str,
     existing_tasks: dict[str, Any],
 ) -> None:
@@ -551,7 +1008,23 @@ async def ensure_concept_vizdev_task(
     cs = getattr(settings.sync_settings, "concept_sync", None)
     if cs is None or not getattr(cs, "enabled", True):
         return
-    surrogate = concept_vizdev_surrogate_kitsu_id(concept_id)
+    sync_meta = entity_dict.get("__conceptSyncModel")
+    if sync_meta == "unlinked_hub":
+        return
+
+    linked_entity_id: str | None = None
+    if sync_meta == "per_linked_entity":
+        lid = str(entity_dict.get("id") or "")
+        surrogate = concept_vizdev_surrogate_for_linked_entity(lid)
+        linked_entity_id = lid
+        contributors = [
+            str(x) for x in (entity_dict.get("kitsuSourceConceptIds") or []) if x
+        ]
+        concept_id = contributors[0] if contributors else lid
+    else:
+        concept_id = str(entity_dict.get("id") or "")
+        surrogate = concept_vizdev_surrogate_kitsu_id(concept_id)
+
     task_type_name = getattr(cs, "vizdev_task_type_name", None) or "VizDev"
     status_name = getattr(cs, "vizdev_task_status_name", None) or "todo"
 
@@ -563,31 +1036,231 @@ async def ensure_concept_vizdev_task(
         surrogate,
         existing_tasks,
     )
-    if target_task is None:
-        logging.info(
-            "Creating VizDev surrogate task for Concept %s (kitsuId=%r)",
-            concept_id,
-            surrogate,
+    if target_task is not None:
+        existing_tasks[surrogate] = target_task.id
+        t_existing = await TaskEntity.load(project.name, target_task.id)
+        _adopt_vizdev_task_data(
+            t_existing,
+            surrogate=surrogate,
+            concept_id=concept_id,
+            linked_entity_id=linked_entity_id,
         )
+        await t_existing.save()
+        await update_task(
+            project_name=project.name,
+            task_id=target_task.id,
+            name=task_type_name,
+            status=status_name,
+            task_type=task_type_name,
+        )
+        return
+
+    adopt_id = await find_task_id_by_folder_name_type(
+        project.name,
+        folder_id,
+        task_type_name,
+        task_type_name,
+    )
+    if adopt_id is not None:
+        logging.info(
+            "Adopting existing folder task as VizDev surrogate for concept %s (task %s)",
+            concept_id,
+            adopt_id,
+        )
+        t = await TaskEntity.load(project.name, adopt_id)
+        _adopt_vizdev_task_data(
+            t,
+            surrogate=surrogate,
+            concept_id=concept_id,
+            linked_entity_id=linked_entity_id,
+        )
+        await t.save()
+        existing_tasks[surrogate] = adopt_id
+        await update_task(
+            project_name=project.name,
+            task_id=adopt_id,
+            name=task_type_name,
+            status=status_name,
+            task_type=task_type_name,
+        )
+        return
+
+    logging.info(
+        "Creating VizDev surrogate task for Concept %s (kitsuId=%r)",
+        concept_id,
+        surrogate,
+    )
+    task_data: dict[str, Any] = {
+        "kitsuId": surrogate,
+        "kitsuConceptId": concept_id,
+        "kitsuMirrorSlot": "VizDev",
+    }
+    if linked_entity_id:
+        task_data["kitsuLinkedEntityId"] = linked_entity_id
+    try:
         new_task = await create_task(
             project_name=project.name,
             folder_id=folder_id,
             status=status_name,
             task_type=task_type_name,
             name=task_type_name,
-            data={
-                "kitsuId": surrogate,
-                "kitsuConceptId": concept_id,
-                "kitsuMirrorSlot": "VizDev",
-            },
+            data=task_data,
             assignees=[],
         )
         existing_tasks[surrogate] = new_task.id
-    else:
+    except Exception as e:
+        if not is_task_folder_name_unique_violation(e):
+            raise
+        retry_id = await find_task_id_by_folder_name_type(
+            project.name,
+            folder_id,
+            task_type_name,
+            task_type_name,
+        )
+        if retry_id is None:
+            raise
+        logging.warning(
+            "VizDev create_task 409, adopting task %s for concept %s",
+            retry_id,
+            concept_id,
+        )
+        t = await TaskEntity.load(project.name, retry_id)
+        _adopt_vizdev_task_data(
+            t,
+            surrogate=surrogate,
+            concept_id=concept_id,
+            linked_entity_id=linked_entity_id,
+        )
+        await t.save()
+        existing_tasks[surrogate] = retry_id
+        await update_task(
+            project_name=project.name,
+            task_id=retry_id,
+            name=task_type_name,
+            status=status_name,
+            task_type=task_type_name,
+        )
+
+
+async def ensure_unlinked_concepts_pool_vizdev_task(
+    addon: "KitsuAddon",
+    project: "ProjectEntity",
+    folder_id: str,
+    existing_tasks: dict[str, Any],
+) -> None:
+    """Single VizDev surrogate for all unlinked Kitsu concepts under the Project anchor."""
+    settings = await addon.get_studio_settings()
+    cs = getattr(settings.sync_settings, "concept_sync", None)
+    if cs is None or not getattr(cs, "enabled", True):
+        return
+    surrogate = concept_vizdev_surrogate_unlinked_pool()
+    concept_id = "kitsu:concepts:unlinked_pool"
+    task_type_name = getattr(cs, "vizdev_task_type_name", None) or "VizDev"
+    status_name = getattr(cs, "vizdev_task_status_name", None) or "todo"
+
+    await ensure_task_status(project, status_name)
+    await ensure_task_type(project, task_type_name)
+
+    target_task = await get_task_by_kitsu_id(
+        project.name,
+        surrogate,
+        existing_tasks,
+    )
+    if target_task is not None:
         existing_tasks[surrogate] = target_task.id
+        t_existing = await TaskEntity.load(project.name, target_task.id)
+        _adopt_vizdev_task_data(
+            t_existing,
+            surrogate=surrogate,
+            concept_id=concept_id,
+            linked_entity_id=None,
+        )
+        await t_existing.save()
         await update_task(
             project_name=project.name,
             task_id=target_task.id,
+            name=task_type_name,
+            status=status_name,
+            task_type=task_type_name,
+        )
+        return
+
+    adopt_id = await find_task_id_by_folder_name_type(
+        project.name,
+        folder_id,
+        task_type_name,
+        task_type_name,
+    )
+    if adopt_id is not None:
+        logging.info(
+            "Adopting existing folder task as unlinked-pool VizDev surrogate (task %s)",
+            adopt_id,
+        )
+        t = await TaskEntity.load(project.name, adopt_id)
+        _adopt_vizdev_task_data(
+            t,
+            surrogate=surrogate,
+            concept_id=concept_id,
+            linked_entity_id=None,
+        )
+        await t.save()
+        existing_tasks[surrogate] = adopt_id
+        await update_task(
+            project_name=project.name,
+            task_id=adopt_id,
+            name=task_type_name,
+            status=status_name,
+            task_type=task_type_name,
+        )
+        return
+
+    logging.info(
+        "Creating VizDev surrogate task for unlinked concept pool (kitsuId=%r)",
+        surrogate,
+    )
+    task_data: dict[str, Any] = {
+        "kitsuId": surrogate,
+        "kitsuConceptId": concept_id,
+        "kitsuMirrorSlot": "VizDev",
+    }
+    try:
+        new_task = await create_task(
+            project_name=project.name,
+            folder_id=folder_id,
+            status=status_name,
+            task_type=task_type_name,
+            name=task_type_name,
+            data=task_data,
+            assignees=[],
+        )
+        existing_tasks[surrogate] = new_task.id
+    except Exception as e:
+        if not is_task_folder_name_unique_violation(e):
+            raise
+        retry_id = await find_task_id_by_folder_name_type(
+            project.name,
+            folder_id,
+            task_type_name,
+            task_type_name,
+        )
+        if retry_id is None:
+            raise
+        logging.warning(
+            "VizDev create_task 409 for unlinked pool, adopting task %s",
+            retry_id,
+        )
+        t = await TaskEntity.load(project.name, retry_id)
+        _adopt_vizdev_task_data(
+            t,
+            surrogate=surrogate,
+            concept_id=concept_id,
+            linked_entity_id=None,
+        )
+        await t.save()
+        existing_tasks[surrogate] = retry_id
+        await update_task(
+            project_name=project.name,
+            task_id=retry_id,
             name=task_type_name,
             status=status_name,
             task_type=task_type_name,
@@ -626,16 +1299,37 @@ async def sync_folder(
     )
 
     studio_settings = await addon.get_studio_settings()
-    # Concepts: prefer ``code`` when Kitsu keeps the long auto string in ``name``.
+    concept_sanitize = True
+    concept_title_src: EntityDict = entity_dict
+    concept_ayon_ident: dict[str, str] | None = None
+
+    # Concepts: title = linked entity names when enabled (Kitsu grid), else name/code.
     if entity_dict["type"] == "Concept":
         cs_name = getattr(studio_settings.sync_settings, "concept_sync", None)
         concept_sanitize = (
             cs_name is None
             or getattr(cs_name, "sanitize_kitsu_auto_naming", True)
         )
-        concept_kitsu_title = (
-            (entity_dict.get("code") or entity_dict.get("name") or "").strip()
+        prefer_linked = (
+            cs_name is None
+            or getattr(cs_name, "prefer_linked_asset_names", True)
         )
+        concept_title_src = dict(entity_dict)
+        raw_ln = concept_title_src.get("linked_entity_names")
+        has_prefetched = isinstance(raw_ln, list) and any(
+            str(x).strip() for x in raw_ln if x is not None
+        )
+        if (
+            prefer_linked
+            and concept_title_src.get("entity_concept_links")
+            and not has_prefetched
+        ):
+            fetched = await _kitsu_fetch_linked_entity_names(
+                addon, concept_title_src["entity_concept_links"]
+            )
+            if fetched:
+                concept_title_src["linked_entity_names"] = fetched
+        concept_kitsu_title = concept_primary_title_for_folder(concept_title_src)
         folder_label = concept_folder_display_name(
             concept_kitsu_title,
             sanitize=concept_sanitize,
@@ -652,7 +1346,7 @@ async def sync_folder(
         relinked = await try_relink_orphan_concept_folder(
             user=user,
             project=project,
-            entity_dict=entity_dict,
+            entity_dict=concept_title_src,
             existing_folders=existing_folders,
             sanitize_folder_display=concept_sanitize,
         )
@@ -662,6 +1356,62 @@ async def sync_folder(
                 entity_dict["id"],
                 existing_folders,
             )
+
+    if (
+        entity_dict["type"] == "Concept"
+        and target_folder is None
+        and entity_dict.get("parent_id") is not None
+    ):
+        sub_relinked = await try_relink_orphan_concept_subfolder(
+            user=user,
+            project=project,
+            entity_dict=concept_title_src,
+            existing_folders=existing_folders,
+            sanitize_folder_display=concept_sanitize,
+        )
+        if sub_relinked:
+            target_folder = await get_folder_by_kitsu_id(
+                project.name,
+                entity_dict["id"],
+                existing_folders,
+            )
+
+    if (
+        entity_dict["type"] == "Concept"
+        and target_folder is None
+        and entity_dict.get("__conceptSyncModel") == "per_linked_entity"
+    ):
+        cs_migrate = getattr(studio_settings.sync_settings, "concept_sync", None)
+        if concept_entity_model_is_per_linked_entity(cs_migrate):
+            src_ids = list(entity_dict.get("kitsuSourceConceptIds") or [])
+            if src_ids:
+                parent_kitsu_m = entity_dict.get("parent_id")
+                if parent_kitsu_m:
+                    pfol_m = await get_folder_by_kitsu_id(
+                        project.name,
+                        str(parent_kitsu_m),
+                        existing_folders,
+                    )
+                    parent_ayon_m = str(pfol_m.id) if pfol_m else ""
+                else:
+                    parent_ayon_m = await get_root_folder_id(
+                        user=user,
+                        project_name=project.name,
+                        kitsu_type="Concepts",
+                        kitsu_type_id="concept",
+                    )
+                if parent_ayon_m and await try_migrate_concept_folder_from_legacy_concept_ids(
+                    project=project,
+                    parent_ayon_folder_id=parent_ayon_m,
+                    new_kitsu_id=str(entity_dict["id"]),
+                    source_concept_ids=src_ids,
+                    existing_folders=existing_folders,
+                ):
+                    target_folder = await get_folder_by_kitsu_id(
+                        project.name,
+                        entity_dict["id"],
+                        existing_folders,
+                    )
 
     # Add description to attrib data
     data: dict[str, str | int | None] | None = entity_dict.get("data", {})
@@ -726,45 +1476,196 @@ async def sync_folder(
             )
             await project.save()
 
-        logging.info(f"Creating {entity_dict['type']} {folder_label}")
+        if entity_dict["type"] == "Concept":
+            _cem = getattr(
+                getattr(studio_settings.sync_settings, "concept_sync", None),
+                "concept_entity_model",
+                None,
+            )
+            logging.info(
+                "Concept sync create project=%s kitsu_id=%s label=%r parent_id=%s "
+                "__conceptSyncModel=%r studio.concept_entity_model=%r",
+                project.name,
+                str(entity_dict["id"]),
+                folder_label,
+                str(parent_id),
+                entity_dict.get("__conceptSyncModel"),
+                str(_cem) if _cem is not None else None,
+            )
+        else:
+            logging.info(f"Creating {entity_dict['type']} {folder_label}")
         if not parent_folder:
             parent_folder = await FolderEntity.load(project.name, parent_id)
         # Calculate the end-frame
         data["frame_out"] = calculate_end_frame(entity_dict, parent_folder)
 
-        target_folder = await create_folder(
-            project_name=project.name,
-            attrib=parse_attrib(data),
-            name=folder_label,
-            folder_type=entity_dict["type"],
-            parent_id=parent_id,
-            data={"kitsuId": entity_dict["id"]},
-        )
+        if entity_dict["type"] == "Concept":
+            concept_ayon_ident = await allocate_unique_concept_folder_name_label(
+                project.name,
+                str(parent_id),
+                folder_label,
+                str(entity_dict["id"]),
+            )
+
+        try:
+            if entity_dict["type"] == "Concept" and concept_ayon_ident is not None:
+                target_folder = await create_folder(
+                    project_name=project.name,
+                    attrib=parse_attrib(data),
+                    name_and_label=concept_ayon_ident,
+                    folder_type=entity_dict["type"],
+                    parent_id=parent_id,
+                    data=_concept_folder_push_data(entity_dict),
+                )
+            else:
+                target_folder = await create_folder(
+                    project_name=project.name,
+                    attrib=parse_attrib(data),
+                    name=folder_label,
+                    folder_type=entity_dict["type"],
+                    parent_id=parent_id,
+                    data=(
+                        _concept_folder_push_data(entity_dict)
+                        if entity_dict["type"] == "Concept"
+                        else {"kitsuId": entity_dict["id"]}
+                    ),
+                )
+        except Exception as exc:
+            if (
+                entity_dict["type"] != "Concept"
+                or not is_folder_parent_name_unique_violation(exc)
+            ):
+                raise
+            target_folder = None
+            rel2 = False
+            if entity_dict.get("parent_id") is None:
+                rel2 = await try_relink_orphan_concept_folder(
+                    user=user,
+                    project=project,
+                    entity_dict=concept_title_src,
+                    existing_folders=existing_folders,
+                    sanitize_folder_display=concept_sanitize,
+                )
+            else:
+                rel2 = await try_relink_orphan_concept_subfolder(
+                    user=user,
+                    project=project,
+                    entity_dict=concept_title_src,
+                    existing_folders=existing_folders,
+                    sanitize_folder_display=concept_sanitize,
+                )
+            if rel2:
+                target_folder = await get_folder_by_kitsu_id(
+                    project.name,
+                    entity_dict["id"],
+                    existing_folders,
+                )
+            if (
+                target_folder is None
+                and concept_ayon_ident is not None
+                and entity_dict["type"] == "Concept"
+            ):
+                target_folder = await try_adopt_per_linked_concept_folder_on_duplicate_name(
+                    project,
+                    str(parent_id),
+                    entity_dict,
+                    str(concept_ayon_ident["name"]),
+                    existing_folders,
+                    studio_settings,
+                )
+            if target_folder is None and concept_ayon_ident is not None:
+                target_folder = await try_merge_per_kitsu_concept_folder_on_duplicate_slug(
+                    project,
+                    str(parent_id),
+                    entity_dict,
+                    str(concept_ayon_ident["name"]),
+                    existing_folders,
+                    studio_settings,
+                )
+            if target_folder is None and concept_ayon_ident is not None:
+                concept_ayon_ident = await allocate_unique_concept_folder_name_label(
+                    project.name,
+                    str(parent_id),
+                    folder_label,
+                    str(entity_dict["id"]),
+                )
+                target_folder = await create_folder(
+                    project_name=project.name,
+                    attrib=parse_attrib(data),
+                    name_and_label=concept_ayon_ident,
+                    folder_type=entity_dict["type"],
+                    parent_id=parent_id,
+                    data=_concept_folder_push_data(entity_dict),
+                )
+            if target_folder is None:
+                raise
         existing_folders[entity_dict["id"]] = target_folder.id
 
     else:
         # Calculate the end-frame
         data["frame_out"] = calculate_end_frame(entity_dict, target_folder)
 
-        changed = await update_folder(
-            project_name=project.name,
-            folder_id=target_folder.id,
-            attrib=parse_attrib(data),
-            name=folder_label,
-            folder_type=entity_dict["type"],
-        )
-        if changed:
-            logging.info(
-                f"Updating {entity_dict['type']} '{folder_label}'"
+        if entity_dict["type"] == "Concept":
+            changed = await update_folder(
+                project_name=project.name,
+                folder_id=target_folder.id,
+                attrib=parse_attrib(data),
+                update_identifiers=False,
+                folder_type=entity_dict["type"],
             )
+            if changed:
+                logging.info(
+                    "Concept sync update attrib project=%s kitsu_id=%s "
+                    "ayon_folder_id=%s",
+                    project.name,
+                    str(entity_dict["id"]),
+                    str(target_folder.id),
+                )
+        else:
+            changed = await update_folder(
+                project_name=project.name,
+                folder_id=target_folder.id,
+                attrib=parse_attrib(data),
+                name=folder_label,
+                folder_type=entity_dict["type"],
+            )
+            if changed:
+                logging.info(
+                    f"Updating {entity_dict['type']} '{folder_label}'"
+                )
+        if changed:
             existing_folders[entity_dict["id"]] = target_folder.id
 
-    if entity_dict["type"] == "Concept" and existing_tasks is not None:
+    if entity_dict["type"] == "Concept" and target_folder is not None:
+        await merge_concept_folder_data_kitsu_fields(
+            project.name,
+            str(target_folder.id),
+            entity_dict,
+        )
+
+    if (
+        entity_dict["type"] == "Concept"
+        and existing_tasks is not None
+        and target_folder is not None
+    ):
         await ensure_concept_vizdev_task(
             addon,
             project,
-            entity_dict["id"],
+            entity_dict,
             target_folder.id,
+            existing_tasks,
+        )
+
+    if (
+        entity_dict.get("__conceptSyncModel") == "unlinked_project_anchor"
+        and entity_dict["type"] == "Project"
+        and existing_tasks is not None
+        and target_folder is not None
+    ):
+        await ensure_unlinked_concepts_pool_vizdev_task(
+            addon,
+            project,
+            str(target_folder.id),
             existing_tasks,
         )
 
@@ -1003,6 +1904,13 @@ async def push_entities(
                 playlist_settings, "enabled", False
             ):
                 await sync_playlist_entity(addon, user, project, entity_dict)
+            else:
+                pl_id = entity_dict.get("id")
+                pl_name = entity_dict.get("name")
+                logging.warning(
+                    f"push_entities: Playlist entity id={pl_id} name={pl_name!r} "
+                    f"ignored — sync_settings.playlist_sync.enabled is false"
+                )
         elif entity_dict["type"] != "Task":
             await sync_folder(
                 addon,
@@ -1080,6 +1988,13 @@ async def remove_entities(
                 playlist_settings, "enabled", False
             ):
                 await delete_playlist_entity(addon, user, project, entity_dict)
+            else:
+                pl_id = entity_dict.get("id")
+                pl_name = entity_dict.get("name")
+                logging.warning(
+                    f"remove_entities: Playlist entity id={pl_id} name={pl_name!r} "
+                    f"ignored — sync_settings.playlist_sync.enabled is false"
+                )
 
         elif entity_dict["type"] == "Task":
             task = await get_task_by_kitsu_id(

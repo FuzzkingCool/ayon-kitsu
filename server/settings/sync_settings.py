@@ -196,13 +196,36 @@ class PlaylistSyncSettings(BaseSettingsModel):
         title="Label for auto-created entity list folder",
         description="Used only when ``auto_create_entity_list_folder`` creates the folder.",
     )
+    push_when_zero_members: bool = SettingsField(
+        False,
+        title="POST playlists with no resolved AYON folder members",
+        description=(
+            "When false (default), the processor skips ``POST .../push`` for playlists "
+            "whose members could not be resolved to AYON folder ids (avoids server "
+            "errors on empty list payloads). Enable only for legacy behavior."
+        ),
+    )
+
+
+def _concept_entity_model_enum():
+    return [
+        {
+            "value": "per_kitsu_concept",
+            "label": "One AYON folder per Kitsu concept (legacy)",
+        },
+        {
+            "value": "per_linked_entity",
+            "label": "One AYON folder per linked Kitsu entity (merge concepts sharing a link)",
+        },
+    ]
 
 
 class ConceptSyncSettings(BaseSettingsModel):
     """Kitsu Concept entities: folder display naming and a default AYON task for reviews.
 
     Kitsu often names concepts as ``filename-<uuid>``. The surrogate task id
-    ``kitsu:concept:{concept_id}:vizdev`` is stored on ``data.kitsuId`` so
+    ``kitsu:concept:{concept_id}:vizdev`` (legacy) or ``kitsu:link:{entity_id}:vizdev``
+    (per-linked-entity mode) is stored on the VizDev task ``data.kitsuId`` so
     pipeline tools (e.g. ``ayon_push``) can match exports that use the same id.
     """
 
@@ -226,9 +249,72 @@ class ConceptSyncSettings(BaseSettingsModel):
         True,
         title="Sanitize Concept folder name",
         description=(
-            "If the Kitsu name looks like ``file.ext-<uuid>``, use the stem before "
-            "the extension as the AYON folder display name; data.kitsuId stays the "
-            "real Kitsu concept id."
+            "If the Kitsu title looks like ``file.ext-<uuid>`` or a long numeric "
+            "prefix before a hyphen (e.g. ``610197433-slug``), strip to a readable "
+            "stem for the AYON folder display name; data.kitsuId stays the real "
+            "Kitsu concept id."
+        ),
+    )
+    prefer_linked_asset_names: bool = SettingsField(
+        True,
+        title="Prefer linked entity names for Concept folders",
+        description=(
+            "Kitsu's concept grid shows each linked entity's ``name`` (cgwire/kitsu "
+            "ConceptCard), not the concept row's internal ``name``. When enabled, "
+            "resolve ``entity_concept_links`` and use those names for the AYON folder "
+            "label when non-empty; otherwise fall back to ``name`` / ``code``. "
+            "Slugs and collision handling stay separate from this display title."
+        ),
+    )
+    concept_entity_model: str = SettingsField(
+        "per_linked_entity",
+        enum_resolver=_concept_entity_model_enum,
+        title="Concept folder identity",
+        description=(
+            "Legacy mode keeps one AYON Concept folder per Kitsu concept row "
+            "(``data.kitsuId`` = concept id). Per-linked-entity mode creates one folder "
+            "per distinct ``entity_concept_links`` target (typically an asset); "
+            "several Kitsu concepts pointing at the same entity share one folder. "
+            "Unlinked concepts (no links) stay one folder per concept; those with no "
+            "Kitsu parent nest under **Unlinked concepts hub** below."
+        ),
+    )
+    unlinked_concepts_folder_label: str = SettingsField(
+        "Unlinked concepts",
+        title="Label for the unlinked-concepts hub folder",
+        description=(
+            "Used in **per_linked_entity** mode only. Concepts with no "
+            "``entity_concept_links`` and no ``parent_id`` in Kitsu are synced as "
+            "children of this hub folder under the project Concepts root."
+        ),
+    )
+    unlinked_concepts_hub_kitsu_id: str = SettingsField(
+        "kitsu:concepts:unlinked_hub",
+        title="Synthetic kitsuId for the unlinked-concepts hub",
+        description=(
+            "Stable string stored on the hub folder's ``data.kitsuId`` (not a Kitsu "
+            "UUID). Change only if it collides with another integration id."
+        ),
+    )
+    unlinked_concepts_anchor: str = SettingsField(
+        "concept_hub",
+        title="Where to put Kitsu concepts with no entity_concept_links",
+        description=(
+            "**concept_hub** (default): create an **Unlinked concepts** Concept hub and "
+            "one Concept child per orphan. **project**: one **Project** folder under "
+            "the Projects root; previews and VizDev reviewables attach there (no "
+            "orphan Concept folders)."
+        ),
+    )
+    unlinked_concepts_project_folder_label: str = SettingsField(
+        "Project",
+        title="Label for the Project anchor folder (unlinked_concepts_anchor=project)",
+    )
+    unlinked_concepts_project_kitsu_id: str = SettingsField(
+        "kitsu:concepts:unlinked_project",
+        title="Synthetic kitsuId for the Project anchor folder",
+        description=(
+            "Stored on the anchor folder's ``data.kitsuId``. Not a Kitsu UUID."
         ),
     )
 
@@ -286,12 +372,20 @@ CONCEPT_SYNC_DEFAULT_VALUES = {
     "vizdev_task_type_name": "VizDev",
     "vizdev_task_status_name": "todo",
     "sanitize_kitsu_auto_naming": True,
+    "prefer_linked_asset_names": True,
+    "concept_entity_model": "per_linked_entity",
+    "unlinked_concepts_folder_label": "Unlinked concepts",
+    "unlinked_concepts_hub_kitsu_id": "kitsu:concepts:unlinked_hub",
+    "unlinked_concepts_anchor": "concept_hub",
+    "unlinked_concepts_project_folder_label": "Project",
+    "unlinked_concepts_project_kitsu_id": "kitsu:concepts:unlinked_project",
 }
 
 PLAYLIST_SYNC_DEFAULT_VALUES = {
     "enabled": False,
     "auto_create_entity_list_folder": True,
     "list_folder_label": "Kitsu playlists",
+    "push_when_zero_members": False,
 }
 
 SYNC_DEFAULT_VALUES = {

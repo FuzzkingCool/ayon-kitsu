@@ -31,13 +31,45 @@ _HTTP_ERROR_BODY_MAX = 2000
 
 def _log_http_error(context: str, response: httpx.Response) -> None:
     body = (response.text or "")[:_HTTP_ERROR_BODY_MAX]
+    detail_note = ""
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict):
+            detail = parsed.get("detail")
+            if detail is not None and detail != parsed:
+                detail_note = f" detail={detail!r}"
+    except Exception:
+        pass
     log.error(
-        "%s: HTTP %s %s body=%r",
+        "%s: HTTP %s %s body=%r%s",
         context,
         response.status_code,
         str(response.request.url),
         body,
+        detail_note,
     )
+
+
+def _rest_uuid32(raw_id: str | None) -> str | None:
+    """32 lowercase hex (no hyphens) for AYON REST list paths and entity IDs.
+
+    OpenAPI commonly expects this shape; Postgres ``id::text`` is often dashed.
+    """
+    if raw_id is None:
+        return None
+    s = str(raw_id).strip().lower().replace("-", "")
+    if len(s) == 32 and all(c in "0123456789abcdef" for c in s):
+        return s
+    return str(raw_id).strip()
+
+
+def _list_item_rows_from_folder_ids(folder_ids: list[str]) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for fid in folder_ids:
+        nid = _rest_uuid32(fid) or str(fid).strip()
+        if nid:
+            rows.append({"entityId": nid})
+    return rows
 
 
 async def _find_list_id_by_kitsu_playlist_id(
@@ -144,7 +176,16 @@ async def sync_playlist(
 
     existing_id = await _find_list_id_by_kitsu_playlist_id(pn, playlist_id)
 
-    items = [{"entityId": fid} for fid in folder_ids]
+    items = _list_item_rows_from_folder_ids(folder_ids)
+
+    if not existing_id and not items:
+        log.info(
+            "playlist sync: skip create for Kitsu playlist %s (%r): "
+            "no resolved AYON folder members (empty ordered_ayon_folder_ids)",
+            playlist_id,
+            label[:80],
+        )
+        return
 
     async with httpx.AsyncClient(timeout=120.0) as client:
         list_folder_id = await _ensure_entity_list_folder_id(
@@ -154,33 +195,69 @@ async def sync_playlist(
             return
 
         if existing_id:
-            patch_url = f"{base}/api/projects/{pn}/lists/{existing_id}"
-            patch_payload: dict[str, Any] = {"label": label}
-            response = await client.patch(
-                patch_url,
-                content=json.dumps(patch_payload),
-                headers={**headers, "Content-Type": "application/json"},
+            list_rest_id = _rest_uuid32(existing_id)
+            if not list_rest_id:
+                log.warning(
+                    "playlist sync: invalid list id from DB for Kitsu %s, skipping update",
+                    playlist_id,
+                )
+                return
+            patch_url = f"{base}/api/projects/{pn}/lists/{list_rest_id}"
+            meta_url = patch_url
+            get_resp = await client.get(
+                meta_url,
+                headers=headers,
+                params={"metadata_only": "true"},
             )
-            if not response.is_success:
-                _log_http_error("playlist sync PATCH list label", response)
-                response.raise_for_status()
-            items_url = f"{base}/api/projects/{pn}/lists/{existing_id}/items"
-            items_payload = {"items": items, "mode": "replace"}
-            response = await client.patch(
-                items_url,
-                content=json.dumps(items_payload),
-                headers={**headers, "Content-Type": "application/json"},
+            current_label: str | None = None
+            if get_resp.is_success:
+                meta_body = get_resp.json()
+                if isinstance(meta_body, dict):
+                    cur = meta_body.get("label")
+                    current_label = cur if isinstance(cur, str) else None
+
+            if current_label != label:
+                patch_payload: dict[str, Any] = {"label": label}
+                response = await client.patch(
+                    patch_url,
+                    content=json.dumps(patch_payload),
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+                if not response.is_success:
+                    _log_http_error("playlist sync PATCH list label", response)
+                    log.warning(
+                        "playlist sync: label PATCH failed for list %s (Kitsu %s); "
+                        "continuing with items PATCH",
+                        list_rest_id,
+                        playlist_id,
+                    )
+            items_url = f"{base}/api/projects/{pn}/lists/{list_rest_id}/items"
+            if items:
+                items_payload = {"items": items, "mode": "replace"}
+                response = await client.patch(
+                    items_url,
+                    content=json.dumps(items_payload),
+                    headers={**headers, "Content-Type": "application/json"},
+                )
+                if not response.is_success:
+                    _log_http_error("playlist sync PATCH list items", response)
+                    response.raise_for_status()
+            else:
+                log.debug(
+                    "playlist sync: skip PATCH list items (empty) list=%s Kitsu=%s",
+                    list_rest_id,
+                    playlist_id,
+                )
+            log.info(
+                "Updated AYON playlist list %s (Kitsu %s)", list_rest_id, playlist_id
             )
-            if not response.is_success:
-                _log_http_error("playlist sync PATCH list items", response)
-                response.raise_for_status()
-            log.info("Updated AYON playlist list %s (Kitsu %s)", existing_id, playlist_id)
             return
 
         create_url = f"{base}/api/projects/{pn}/lists"
+        folder_rest = _rest_uuid32(list_folder_id) or list_folder_id
         create_payload: dict[str, Any] = {
             "entityListType": "generic",
-            "entityListFolderId": list_folder_id,
+            "entityListFolderId": folder_rest,
             "entityType": "folder",
             "label": label,
             "data": {"kitsuId": playlist_id, "kitsuSource": "playlist"},
@@ -226,13 +303,20 @@ async def delete_playlist(
     if not existing_id:
         log.debug("playlist delete: no AYON list for Kitsu playlist %s", playlist_id)
         return
+    list_rest_id = _rest_uuid32(existing_id)
+    if not list_rest_id:
+        log.warning(
+            "playlist delete: invalid list id for Kitsu playlist %s, skipping",
+            playlist_id,
+        )
+        return
 
     async with httpx.AsyncClient(timeout=60.0) as client:
-        delete_url = f"{base}/api/projects/{pn}/lists/{existing_id}"
+        delete_url = f"{base}/api/projects/{pn}/lists/{list_rest_id}"
         response = await client.delete(delete_url, headers=headers)
         if response.status_code == 404:
             return
         if not response.is_success:
             _log_http_error("playlist sync DELETE list", response)
         response.raise_for_status()
-    log.info("Deleted AYON playlist list %s (Kitsu %s)", existing_id, playlist_id)
+    log.info("Deleted AYON playlist list %s (Kitsu %s)", list_rest_id, playlist_id)

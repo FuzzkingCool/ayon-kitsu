@@ -1,5 +1,7 @@
 """utils shared between fullsync.py and update_from_kitsu.py"""
 
+from __future__ import annotations
+
 import re
 import threading
 from typing import Any, Dict, List, Optional, cast
@@ -7,6 +9,8 @@ from typing import Any, Dict, List, Optional, cast
 import ayon_api
 import gazu
 from nxtools import logging
+
+from .concept_naming import apply_concept_title_for_ayon_push
 
 # Thread-local Kitsu API URL so gazu uses the correct host in every thread
 # (gazu default is http://gazu.change.serverhost/api; event handlers run in listener thread)
@@ -147,6 +151,97 @@ def _concepts_rows_from_get_response(body: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _concept_sync_prefer_linked_names(
+    concept_sync: Optional[Dict[str, Any]],
+) -> bool:
+    """Studio ``sync_settings.concept_sync.prefer_linked_asset_names`` (default True)."""
+    if not concept_sync:
+        return True
+    return bool(concept_sync.get("prefer_linked_asset_names", True))
+
+
+def _fetch_linked_entity_names_for_concept(concept: Dict[str, Any]) -> List[str]:
+    """Resolve ``entity_concept_links`` to entity ``name`` strings (Kitsu ConceptCard order)."""
+    links = concept.get("entity_concept_links")
+    if not links or not isinstance(links, (list, tuple)):
+        return []
+    _ensure_gazu_host()
+    out: List[str] = []
+    for lid in links:
+        eid = str(lid).strip() if lid is not None else ""
+        if not eid:
+            continue
+        try:
+            ent = gazu.entity.get_entity(eid)
+        except Exception:
+            logging.debug(
+                "[kitsu] get_entity failed for concept link entity_id=%r",
+                eid,
+                exc_info=True,
+            )
+            continue
+        if not isinstance(ent, dict):
+            continue
+        nm = (ent.get("name") or "").strip()
+        if nm:
+            out.append(nm)
+    return out
+
+
+def _enrich_concept_with_linked_names(
+    concept: Dict[str, Any],
+    *,
+    concept_sync: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    if not _concept_sync_prefer_linked_names(concept_sync):
+        return concept
+    names = _fetch_linked_entity_names_for_concept(concept)
+    if not names:
+        return concept
+    merged = dict(concept)
+    merged["linked_entity_names"] = names
+    return merged
+
+
+def _merge_concept_list_row_with_canonical(
+    row: Dict[str, Any],
+    concept_id: str,
+    concept_sync: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Overlay ``gazu.concept.get_concept`` on a ``GET /data/concepts`` row.
+
+    List responses can lag or omit fields; canonical fetch drives renames,
+    descriptions, and ``preview_file_id`` for sync payloads.
+    """
+    _ensure_gazu_host()
+    base = dict(row)
+    base.setdefault("type", "Concept")
+    try:
+        canonical = gazu.concept.get_concept(concept_id)
+    except Exception:
+        logging.debug(
+            "[kitsu] get_concept failed during merge concept_id=%r",
+            concept_id,
+            exc_info=True,
+        )
+        return apply_concept_title_for_ayon_push(
+            _enrich_concept_with_linked_names(base, concept_sync=concept_sync)
+        )
+    if not isinstance(canonical, dict):
+        return apply_concept_title_for_ayon_push(
+            _enrich_concept_with_linked_names(base, concept_sync=concept_sync)
+        )
+    # Do not let canonical nulls wipe list-row fields (Zou often omits keys but
+    # still sends JSON nulls for unused columns, which would drop a good code).
+    merged = dict(base)
+    for key, value in canonical.items():
+        if value is not None:
+            merged[key] = value
+    merged.setdefault("type", "Concept")
+    merged = _enrich_concept_with_linked_names(merged, concept_sync=concept_sync)
+    return apply_concept_title_for_ayon_push(merged)
+
+
 def fetch_concepts_list_via_data_endpoint(
     project_id: str,
     parent_id: Optional[str] = None,
@@ -177,6 +272,7 @@ def load_concept_entity_for_sync(
     project_id: str,
     concept_id: str,
     parent_id: Optional[str] = None,
+    concept_sync: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Load one concept for AYON push, preferring official ``GET /data/concepts``.
 
@@ -199,23 +295,43 @@ def load_concept_entity_for_sync(
     if lst is not None:
         hit = _pick(lst)
         if hit is not None:
-            return hit
+            return _merge_concept_list_row_with_canonical(
+                hit, cid, concept_sync=concept_sync
+            )
 
     if parent_id is not None and str(parent_id) != "":
         lst2 = fetch_concepts_list_via_data_endpoint(pid, str(parent_id))
         if lst2 is not None:
             hit = _pick(lst2)
             if hit is not None:
-                return hit
+                return _merge_concept_list_row_with_canonical(
+                    hit, cid, concept_sync=concept_sync
+                )
 
-    return gazu.concept.get_concept(concept_id)
+    raw = gazu.concept.get_concept(concept_id)
+    if raw is None or not isinstance(raw, dict):
+        return raw
+    enriched = _enrich_concept_with_linked_names(
+        dict(raw), concept_sync=concept_sync
+    )
+    return apply_concept_title_for_ayon_push(enriched)
 
 
-def all_concepts_for_project_official_list(project: Any) -> List[Dict[str, Any]]:
+def all_concepts_for_project_official_list(
+    project: Any,
+    concept_sync: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
     """All concepts for fullsync: prefer ``GET /data/concepts?project_id=``.
 
     Falls back to ``gazu.concept.all_concepts_for_project`` if the list route
     fails or returns no rows.
+
+    Each list row is merged with ``gazu.concept.get_concept`` so pushes carry
+    fresh names and preview ids (list-only payloads can be stale).
+
+    **Repair:** after deploying this merge behavior, run a project **fullsync**
+    once so AYON Concept folder labels catch up with Kitsu via normal
+    ``sync_folder`` updates; no separate DB migration is required for renames.
     """
     _ensure_gazu_host()
     if isinstance(project, dict):
@@ -223,13 +339,62 @@ def all_concepts_for_project_official_list(project: Any) -> List[Dict[str, Any]]
     else:
         pid = str(project)
     if not pid:
-        return gazu.concept.all_concepts_for_project(project)
+        return _normalize_concept_rows_for_ayon(
+            gazu.concept.all_concepts_for_project(project),
+            concept_sync=concept_sync,
+        )
     rows = fetch_concepts_list_via_data_endpoint(pid, None)
     if rows is None:
-        return gazu.concept.all_concepts_for_project(project)
+        return _normalize_concept_rows_for_ayon(
+            gazu.concept.all_concepts_for_project(project),
+            concept_sync=concept_sync,
+        )
+    merged: List[Dict[str, Any]] = []
+    for row in rows:
+        cid = row.get("id")
+        if cid:
+            merged.append(
+                _merge_concept_list_row_with_canonical(
+                    row, str(cid), concept_sync=concept_sync
+                )
+            )
+        else:
+            r = dict(row)
+            r.setdefault("type", "Concept")
+            merged.append(
+                apply_concept_title_for_ayon_push(
+                    _enrich_concept_with_linked_names(r, concept_sync=concept_sync)
+                )
+            )
+    return merged
+
+
+def _normalize_concept_rows_for_ayon(
+    rows: List[Dict[str, Any]] | None,
+    concept_sync: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    if not rows:
+        return []
+    out: List[Dict[str, Any]] = []
     for c in rows:
-        c.setdefault("type", "Concept")
-    return rows
+        if not isinstance(c, dict):
+            continue
+        cid = c.get("id")
+        if cid:
+            out.append(
+                _merge_concept_list_row_with_canonical(
+                    dict(c), str(cid), concept_sync=concept_sync
+                )
+            )
+        else:
+            r = dict(c)
+            r.setdefault("type", "Concept")
+            out.append(
+                apply_concept_title_for_ayon_push(
+                    _enrich_concept_with_linked_names(r, concept_sync=concept_sync)
+                )
+            )
+    return out
 
 
 def format_kitsu_task_display(value: Any) -> str:
@@ -307,3 +472,14 @@ def render_kitsu_comment(
     if unique_sprites not in (None, "", 0, "0"):
         result += f"\nuniqueSprites\t{unique_sprites}"
     return result
+
+
+from .concept_expand import (  # noqa: E402 — re-export after package init
+    DEFAULT_UNLINKED_PROJECT_KITSU_ID,
+    concept_entity_model_is_per_linked_dict,
+    expand_concept_entities_for_push,
+    expand_single_concept_entity_for_push,
+    normalize_concept_sync_dict,
+    normalize_concept_link_ids,
+    unlinked_concepts_anchor_is_project,
+)

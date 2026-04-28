@@ -7,6 +7,11 @@ from typing import Any
 import ayon_api
 from nxtools import logging, slugify
 
+from .concept_expand import (
+    per_linked_effective_linked_id_for_relink,
+    should_attempt_per_linked_concept_relink,
+)
+
 
 def merge_push_response_folder_map(
     folder_map: dict[str, str], response_data: dict[str, Any] | None
@@ -94,6 +99,102 @@ def is_folder_unique_violation(exc: BaseException) -> bool:
 def _ayon_asset_folder_name(kitsu_name: str) -> str:
     """Match server/kitsu/utils.create_name_and_label slug for folder.name."""
     return slugify(kitsu_name, separator="_")
+
+
+def try_relink_per_linked_concept_folder_on_unique_violation(
+    project_name: str,
+    concept_entity: dict[str, Any],
+    folder_map: dict[str, str],
+    concept_sync: dict[str, Any] | None = None,
+) -> bool:
+    """After a 409 on Concept create, adopt a sibling slug folder for ``per_linked_entity``.
+
+    Typical cause: duplicate push rows for the same linked id created a folder on
+    the first attempt; a later attempt collides on ``(parent_id, name)``. Another
+    case: a legacy folder still uses a Kitsu **concept** id as ``data.kitsuId`` but
+    the slug already matches this linked entity's title.
+    """
+    linked_id = per_linked_effective_linked_id_for_relink(concept_entity, concept_sync)
+    if not linked_id:
+        return False
+    if folder_map.get(linked_id):
+        return True
+
+    from . import concept_naming
+
+    parent_kitsu = concept_entity.get("parent_id")
+    if parent_kitsu:
+        parent_ayon = find_folder_id_for_kitsu_entity(
+            project_name,
+            str(parent_kitsu),
+            folder_map,
+        )
+    else:
+        parent_ayon = find_folder_id_for_kitsu_entity(
+            project_name,
+            "concept",
+            folder_map,
+        )
+    if not parent_ayon:
+        logging.warning(
+            "[concept_relink] No AYON parent for per-linked Concept "
+            f"(linked_id={linked_id[:8]}… parent_kitsu={parent_kitsu!r})"
+        )
+        return False
+
+    title = concept_naming.concept_primary_title_for_folder(concept_entity)
+    expected_name = slugify((title or "").strip() or "concept", separator="_") or (
+        "concept"
+    )
+
+    candidate = None
+    for folder in ayon_api.get_folders(project_name, active=True):
+        if str(folder.get("parentId") or "") != str(parent_ayon):
+            continue
+        if folder.get("folderType") != "Concept":
+            continue
+        if folder.get("name") != expected_name:
+            continue
+        candidate = folder
+        break
+
+    if not candidate:
+        return False
+
+    current = (candidate.get("data") or {}).get("kitsuId")
+    cur_s = str(current or "").strip()
+    sources = [
+        str(x) for x in (concept_entity.get("kitsuSourceConceptIds") or []) if x
+    ]
+    row_cid = str(concept_entity.get("id") or "").strip()
+    if row_cid and row_cid != linked_id and row_cid not in sources:
+        sources.insert(0, row_cid)
+    if cur_s and cur_s != linked_id:
+        if sources and cur_s not in sources:
+            return False
+
+    new_data = dict(candidate.get("data") or {})
+    new_data["kitsuId"] = linked_id
+    merged: list[str] = []
+    prev_src = new_data.get("kitsuSourceConceptIds")
+    if isinstance(prev_src, list):
+        merged.extend(str(x) for x in prev_src if x)
+    for s in sources:
+        if s not in merged:
+            merged.append(s)
+    new_data["kitsuSourceConceptIds"] = merged[:50]
+    ayon_api.update_folder(
+        project_name,
+        str(candidate["id"]),
+        data=new_data,
+    )
+    folder_map[linked_id] = str(candidate["id"])
+    logging.info(
+        f"[concept_relink] Retargeted AYON Concept folder "
+        f"{str(candidate['id'])[:8]}… -> kitsuId={linked_id[:8]}… "
+        f"(was {(cur_s or '')[:8]}…, slug={expected_name!r})"
+    )
+    return True
 
 
 def try_relink_stale_kitsu_asset_folder(
@@ -227,6 +328,7 @@ def push_entities_with_relink(
     project_name: str,
     entities: list[dict[str, Any]],
     folder_map: dict[str, str],
+    concept_sync: dict[str, Any] | None = None,
 ):
     """POST /push; relink stale kitsuId once on task or asset folder unique violation."""
     response = ayon_api.post(
@@ -270,4 +372,75 @@ def push_entities_with_relink(
             response2.raise_for_status()
             merge_push_response_folder_map(folder_map, response2.data)
             return response2
+        if (
+            entity.get("type") == "Concept"
+            and is_folder_unique_violation(e)
+            and should_attempt_per_linked_concept_relink(entity, concept_sync)
+            and try_relink_per_linked_concept_folder_on_unique_violation(
+                project_name, entity, folder_map, concept_sync=concept_sync,
+            )
+        ):
+            folder_map.update(kitsu_folder_map_from_ayon_project(project_name))
+            response2 = ayon_api.post(
+                f"{entrypoint}/push",
+                project_name=project_name,
+                entities=entities,
+            )
+            response2.raise_for_status()
+            merge_push_response_folder_map(folder_map, response2.data)
+            return response2
         raise
+
+
+def push_batch_with_relink(
+    entrypoint: str,
+    project_name: str,
+    entities: list[dict[str, Any]],
+    folder_map: dict[str, str],
+    concept_sync: dict[str, Any] | None = None,
+):
+    """POST /push for a batch; on folder unique-violation, relink per-linked Concepts once.
+
+    Fullsync sends large batches; the server may reject with a folder collision before
+    ``push_entities_with_relink``'s single-entity relink runs. After a batch failure,
+    try ``try_relink_per_linked_concept_folder_on_unique_violation`` for every
+    ``per_linked_entity`` Concept in the batch, refresh ``folder_map``, then retry
+    the same batch once.
+    """
+    response = ayon_api.post(
+        f"{entrypoint}/push",
+        project_name=project_name,
+        entities=entities,
+    )
+    try:
+        response.raise_for_status()
+        merge_push_response_folder_map(folder_map, response.data)
+        return response
+    except Exception as e:
+        if len(entities) <= 1:
+            raise
+        if not is_folder_unique_violation(e):
+            raise
+        touched = False
+        for ent in entities:
+            if not isinstance(ent, dict):
+                continue
+            if (
+                ent.get("type") == "Concept"
+                and should_attempt_per_linked_concept_relink(ent, concept_sync)
+                and try_relink_per_linked_concept_folder_on_unique_violation(
+                    project_name, ent, folder_map, concept_sync=concept_sync,
+                )
+            ):
+                touched = True
+        if not touched:
+            raise
+        folder_map.update(kitsu_folder_map_from_ayon_project(project_name))
+        response2 = ayon_api.post(
+            f"{entrypoint}/push",
+            project_name=project_name,
+            entities=entities,
+        )
+        response2.raise_for_status()
+        merge_push_response_folder_map(folder_map, response2.data)
+        return response2

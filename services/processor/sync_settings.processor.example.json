@@ -1,0 +1,17 @@
+{
+  "sync_settings": {
+    "concept_sync": {
+      "concept_entity_model": "per_linked_entity",
+      "unlinked_concepts_anchor": "project",
+      "unlinked_concepts_project_folder_label": "Project",
+      "unlinked_concepts_project_kitsu_id": "kitsu:concepts:unlinked_project",
+      "prefer_linked_asset_names": true
+    },
+    "content_sync": {
+      "enabled": true,
+      "sync_thumbnails": true,
+      "sync_comments": true,
+      "sync_previews": true
+    }
+  }
+}

@@ -4,7 +4,7 @@ import ayon_api
 import gazu
 from nxtools import log_traceback, logging
 
-from . import utils
+from . import content_sync, utils
 from .playlist_push_entity import (
     build_playlist_push_entity,
     playlist_sync_enabled,
@@ -385,20 +385,142 @@ def create_or_update_concept(parent: "KitsuProcessor", data: dict[str, str]):
         return
     utils.set_kitsu_host(parent.kitsu_server_url)
     try:
+        _cs = (parent.settings.get("sync_settings") or {}).get("concept_sync")
+        concept_sync = utils.normalize_concept_sync_dict(
+            _cs if isinstance(_cs, dict) else None,
+        )
         entity = utils.load_concept_entity_for_sync(
             str(data["project_id"]),
             str(data["concept_id"]),
             data.get("parent_id"),
+            concept_sync=concept_sync,
         )
         entity["ayon_server_url"] = ayon_api.get_base_url()
 
+        rows = utils.expand_single_concept_entity_for_push(
+            entity,
+            concept_sync=concept_sync,
+        )
         folder_map: dict[str, str] = {}
         push_entities_with_relink(
             parent.entrypoint,
             project_name,
-            [entity],
+            rows,
             folder_map,
+            concept_sync=concept_sync,
         )
+        cid = str(data["concept_id"])
+        pid = str(data["project_id"])
+        source_concept_for_preview = cid
+        links0 = entity.get("entity_concept_links") or []
+        has_concept_links = isinstance(links0, (list, tuple)) and any(
+            str(x).strip() for x in links0 if x is not None
+        )
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("__conceptSyncModel") in (
+                "unlinked_hub",
+                "unlinked_project_anchor",
+            ):
+                continue
+            pf = row.get("preview_file_id")
+            if not pf:
+                continue
+            sync_m = row.get("__conceptSyncModel")
+            if sync_m == "per_linked_entity":
+                lid = str(row.get("id") or "")
+                if lid:
+                    surrogate = content_sync.concept_vizdev_surrogate_for_linked_entity(
+                        lid,
+                    )
+                    try:
+                        content_sync.sync_preview_to_ayon(
+                            parent,
+                            str(pf),
+                            surrogate,
+                            pid,
+                            source_kitsu_concept_id=source_concept_for_preview,
+                        )
+                    except Exception as sync_exc:
+                        logging.warning(
+                            "[update_from_kitsu] concept preview sync failed "
+                            "linked_entity=%s: %s",
+                            lid[:8],
+                            sync_exc,
+                        )
+            else:
+                preview_cid = str(row.get("id") or cid)
+                surrogate = content_sync.concept_vizdev_surrogate_kitsu_id(preview_cid)
+                try:
+                    content_sync.sync_preview_to_ayon(
+                        parent, str(pf), surrogate, pid,
+                    )
+                except Exception as sync_exc:
+                    logging.warning(
+                        "[update_from_kitsu] concept preview sync failed concept=%s: %s",
+                        preview_cid,
+                        sync_exc,
+                    )
+        if (
+            utils.unlinked_concepts_anchor_is_project(concept_sync)
+            and utils.concept_entity_model_is_per_linked_dict(concept_sync)
+            and not has_concept_links
+            and entity.get("preview_file_id")
+        ):
+            pool_sur = content_sync.concept_vizdev_surrogate_unlinked_pool()
+            try:
+                content_sync.sync_preview_to_ayon(
+                    parent,
+                    str(entity["preview_file_id"]),
+                    pool_sur,
+                    pid,
+                    source_kitsu_concept_id=cid,
+                )
+            except Exception as sync_exc:
+                logging.warning(
+                    "[update_from_kitsu] concept preview sync failed "
+                    "unlinked_pool: %s",
+                    sync_exc,
+                )
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if row.get("__conceptSyncModel") in (
+                "unlinked_hub",
+                "unlinked_project_anchor",
+            ):
+                continue
+            try:
+                content_sync.sync_thumbnail_to_ayon(parent, row, project_name)
+            except Exception as thumb_exc:
+                logging.warning(
+                    "[update_from_kitsu] concept thumbnail sync failed entity=%s: %s",
+                    row.get("id"),
+                    thumb_exc,
+                )
+        if (
+            utils.unlinked_concepts_anchor_is_project(concept_sync)
+            and utils.concept_entity_model_is_per_linked_dict(concept_sync)
+            and not has_concept_links
+            and entity.get("preview_file_id")
+        ):
+            anchor = (
+                (concept_sync or {}).get("unlinked_concepts_project_kitsu_id")
+                or utils.DEFAULT_UNLINKED_PROJECT_KITSU_ID
+            )
+            thumb_row = {
+                "id": str(anchor),
+                "preview_file_id": entity["preview_file_id"],
+            }
+            try:
+                content_sync.sync_thumbnail_to_ayon(parent, thumb_row, project_name)
+            except Exception as thumb_exc:
+                logging.warning(
+                    "[update_from_kitsu] concept thumbnail sync failed "
+                    "unlinked_project anchor: %s",
+                    thumb_exc,
+                )
         logging.info(f"[update_from_kitsu] Successfully updated concept {data.get('concept_id')} in {project_name}")
     except Exception as e:
         logging.error(f"[update_from_kitsu] Failed to update concept {data.get('concept_id')} in {project_name}: {e}")

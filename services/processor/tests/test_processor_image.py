@@ -1,254 +1,320 @@
-#!/usr/bin/env python3
-"""Build and run the Kitsu processor Docker image for testing.
+"""Local-only driver: one-shot Kitsu to AYON full sync without running the service loop.
 
-This script:
-1. Reads version from package.py
-2. Loads environment variables from the repo-root ``.env``, then
-   ``services/processor/.env`` (later file overrides keys from the former)
-3. Builds the Docker image
-4. Runs the container with the environment variables
+Run from repo root with the **same env vars as the Kitsu processor service** (at
+minimum ``AYON_SERVER_URL``, ``AYON_API_KEY``, ``AYON_ADDON_NAME``,
+``AYON_ADDON_VERSION``), for example:
 
-Poetry in ``pyproject.toml`` may use a PEP 440 *local* segment with ``+`` (e.g.
-``1.0.0+build.1``) because that validates for ``poetry install`` in the image.
-OCI/Docker image tags must not contain ``+``, so repo ``package.py`` uses
-hyphens for the same logical release (e.g. ``1.0.0-build.1``) and we normalize
-defensively when tagging (see ``oci_image_tag``).
+    python services/processor/tests/test_processor_image.py
+    python services/processor/tests/test_processor_image.py --project MyAyonProject
+
+PowerShell (session only), then run the script from any cwd:
+
+    $env:AYON_SERVER_URL="https://your-studio.ayon.app"
+    $env:AYON_API_KEY="your-service-api-key"
+    $env:AYON_ADDON_NAME="kitsu"
+    $env:AYON_ADDON_VERSION="1.2.3"
+
+Optional: ``KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL=per_linked_entity`` matches the
+recommended studio setting for ``sync_settings.concept_sync.concept_entity_model``
+(one AYON Concept folder per linked Kitsu entity, avoiding slug collisions when
+many concept rows share one asset).
+
+Before checking env vars, the script loads ``.env`` from (1) the **ayon-kitsu**
+repo root, then (2) **``Path.cwd()``**. For each key, a **non-empty** value from
+the cwd file wins over the repo file; an **empty** value in cwd does **not**
+erase a non-empty value from repo (so a stray ``KITSU_PWD=`` in another repo's
+``.env`` cannot wipe ``KITSU_PWD`` from ayon-kitsu's ``.env``).
+
+For **AYON_*** and other keys, values already set in the process environment are
+not overwritten. For **Kitsu** login (``KITSU_LOGIN``, ``KITSU_EMAIL``, ``KITSU_PWD``,
+and ``KITSU_PASSWORD`` as an alias for the password), non-empty merged ``.env``
+values **always** override the shell so a partial IDE/shell env cannot block the
+repo ``.env``.
+
+If ``nxtools`` is not installed in that interpreter, a tiny in-process stub is
+registered so the script still runs (use the real ``nxtools`` in production).
+
+Not intended for CI. Uses ``KitsuProcessor(start_listener_threads=False)`` so
+Socket.IO / AYON event threads do not run during the one-shot fullsync (less
+AYON contention). Uses ``os._exit`` after sync so the process exits despite
+any remaining non-daemon state.
 """
 
+from __future__ import annotations
+
+import argparse
+import importlib.util
 import os
-import subprocess
+import re
 import sys
+import traceback
+import types
+import unicodedata
 from pathlib import Path
 
 
-def get_version():
-    """Get the addon version from package.py."""
-    script_dir = Path(__file__).parent
-    package_py = script_dir.parent.parent.parent / "package.py"
-
-    if not package_py.exists():
-        raise FileNotFoundError(f"package.py not found at {package_py}")
-
-    # Read and execute package.py to get version
-    with open(package_py, "r") as f:
-        content = {}
-        exec(f.read(), content)
-        return content.get("version", "latest")
-
-
-def get_poetry_version(processor_dir: Path) -> str:
-    """Version from ``services/processor/pyproject.toml`` (Poetry / PEP 440).
-
-    Parsed without ``tomllib`` so this script runs on Python < 3.11.
-    """
-    pyproject = processor_dir / "pyproject.toml"
-    if not pyproject.is_file():
-        raise FileNotFoundError(f"pyproject.toml not found at {pyproject}")
-    in_poetry = False
-    with pyproject.open("r", encoding="utf-8") as f:
-        for raw in f:
-            stripped = raw.split("#", 1)[0].strip()
-            if stripped.startswith("[") and stripped.endswith("]"):
-                header = stripped[1:-1].strip()
-                in_poetry = header == "tool.poetry"
-                continue
-            if not in_poetry or not stripped.startswith("version"):
-                continue
-            if "=" not in stripped:
-                continue
-            _, rhs = stripped.split("=", 1)
-            val = rhs.strip()
-            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-                return val[1:-1]
-    raise RuntimeError("pyproject.toml has no [tool.poetry] version = ... line")
-
-
-def oci_image_tag(version: str) -> str:
-    """Map a version string to a valid Docker/OCI image tag component."""
-    return version.replace("+", "-")
-
-
-def assert_addon_version_matches_poetry(processor_dir: Path, package_version: str) -> None:
-    """Ensure addon and processor Poetry versions are one release (PEP 440 + vs OCI -)."""
-    poetry_version = get_poetry_version(processor_dir)
-    if oci_image_tag(poetry_version) != package_version:
-        print(
-            "ERROR: package.py `version` must match processor pyproject.toml "
-            "[tool.poetry] version when `+` in Poetry is mapped to `-` for OCI.\n"
-            f"  package.py: {package_version!r}\n"
-            f"  pyproject.toml: {poetry_version!r} -> OCI {oci_image_tag(poetry_version)!r}",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-
-def load_env_file(env_path):
-    """Load environment variables from .env file."""
-    env_vars = {}
-    if env_path.exists():
-        with open(env_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                # Skip empty lines and comments
-                if not line or line.startswith("#"):
-                    continue
-                # Parse KEY=VALUE
-                if "=" in line:
-                    key, value = line.split("=", 1)
-                    key = key.strip()
-                    value = value.strip().strip('"').strip("'")
-                    env_vars[key] = value
-    return env_vars
-
-
-def build_image(image_name, dockerfile_dir):
-    """Build the Docker image."""
-    print(f"Building Docker image: {image_name}")
-    print(f"Using Dockerfile from: {dockerfile_dir}")
-
-    # Build context should be the parent directory (services) since Dockerfile expects to be built from there
-    build_context = dockerfile_dir.parent
-    print(f"Build context: {build_context}")
-
-    # Use the Dockerfile from the parent directory (processor), not from tests
-    dockerfile_path = build_context / "Dockerfile"
-    print(f"Using Dockerfile: {dockerfile_path}")
-
-    cmd = [
-        "docker",
-        "build",
-        "-t",
-        image_name,
-        "-f",
-        str(dockerfile_path),
-        str(build_context),  # Build context is the parent directory (services)
-    ]
-
-    print(f"Running: {' '.join(cmd)}")
-    result = subprocess.run(cmd)
-
-    if result.returncode != 0:
-        print(f"ERROR: Docker build failed with exit code {result.returncode}")
-        sys.exit(1)
-
-    print(f"Successfully built image: {image_name}")
-
-
-def run_container(image_name, env_vars):
-    """Run the Docker container with environment variables."""
-    print(f"\nRunning container from image: {image_name}")
-
-    cmd = [
-        "docker",
-        "run",
-        "--rm",
-        "-it",
-        "--hostname",
-        "kitsu-dev-worker",
-    ]
-
-    # Add environment variables
-    for key, value in env_vars.items():
-        cmd.extend(["--env", f"{key}={value}"])
-
-    # Add image and command
-    cmd.append(image_name)
-    cmd.extend(["python", "-m", "processor"])
-
-    print(f"Running: {' '.join(cmd[:10])}... (truncated)")
-    print("\nStarting processor service...\n")
-
-    # Run the container
-    result = subprocess.run(cmd)
-
-    if result.returncode != 0:
-        print(f"\nContainer exited with code {result.returncode}")
-        sys.exit(result.returncode)
-
-
-def main():
-    """Main function."""
-    script_dir = Path(__file__).parent
-    processor_dir = script_dir.parent
-    repo_root = processor_dir.parent.parent
-    env_paths = (repo_root / ".env", processor_dir / ".env")
-
-    print("=" * 60)
-    print("Kitsu Processor Docker Image Builder & Runner")
-    print("=" * 60)
-
-    # Get version
+def _parse_dotenv_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE parser (no python-dotenv dependency)."""
+    out: dict[str, str] = {}
+    if not path.is_file():
+        return out
     try:
-        version = get_version()
-        assert_addon_version_matches_poetry(processor_dir, version)
-        poetry_version = get_poetry_version(processor_dir)
-        print(f"\nAddon version: {version}")
-        print(f"Poetry version: {poetry_version} (aligned for OCI tag)")
-    except Exception as e:
-        print(f"ERROR: Failed to get version: {e}")
-        sys.exit(1)
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return out
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        out[key] = value
+    return out
 
-    # Load environment variables (repo root first, then processor-local overlay)
-    env_vars = {}
-    loaded_from: list[Path] = []
-    for path in env_paths:
-        if path.is_file():
-            env_vars.update(load_env_file(path))
-            loaded_from.append(path)
-    if loaded_from:
-        print(
-            f"\nLoaded {len(env_vars)} environment variables from:\n  "
-            + "\n  ".join(str(p) for p in loaded_from)
-        )
-    else:
-        print(
-            f"\nWARNING: No .env file found at:\n  {env_paths[0]}\n  {env_paths[1]}"
-        )
-        print("You may need to set AYON_API_KEY, AYON_SERVER_URL, KITSU_SERVER, …")
 
-    # Check for required environment variables
-    required = ["AYON_API_KEY", "AYON_SERVER_URL"]
-    missing = [
-        var
-        for var in required
-        if var not in env_vars and var not in os.environ
-    ]
-    if missing:
-        print(
-            f"\nWARNING: Missing required environment variables: {', '.join(missing)}"
-        )
-        print("These should be set in .env file or your environment")
-        response = input("\nContinue anyway? (y/N): ")
-        if response.lower() != "y":
-            print("Aborted.")
-            sys.exit(1)
+def _merge_dotenv_repo_then_cwd(
+    repo: dict[str, str], cwd: dict[str, str]
+) -> dict[str, str]:
+    """Merge two dotenv maps: cwd overrides repo only when cwd's value is non-empty."""
+    keys = set(repo) | set(cwd)
+    merged: dict[str, str] = {}
+    for key in keys:
+        cv = cwd.get(key, "")
+        rv = repo.get(key, "")
+        if str(cv).strip():
+            merged[key] = cv
+        elif str(rv).strip():
+            merged[key] = rv
+        else:
+            merged[key] = cv or rv
+    return merged
 
-    # Merge with system environment (system env takes precedence)
-    for key in required:
-        if key in os.environ:
-            env_vars[key] = os.environ[key]
 
-    optional_from_shell = (
-        "KITSU_SERVER",
-        "KITSU_URL",
-        "KITSU_LOGIN",
-        "KITSU_EMAIL",
-        "KITSU_PWD",
+def _load_dotenv_for_local_sync() -> None:
+    """Populate env from repo and cwd ``.env``.
+
+    Non-Kitsu keys: only fill ``os.environ`` when the variable is unset or blank
+    (do not override a value already exported in the shell).
+
+    Kitsu login keys ``KITSU_LOGIN``, ``KITSU_EMAIL``, ``KITSU_PWD``: if the merged
+    ``.env`` has a non-empty value, it **always** wins over the shell. Otherwise a
+    half-set environment (e.g. IDE sets ``KITSU_EMAIL`` but not ``KITSU_PWD``, or a
+    stale ``KITSU_PWD``) blocks ``.env`` and forces AYON Studio secrets, which then
+    fails Kitsu auth for the same email.
+    """
+    here = Path(__file__).resolve()
+    # test_processor_image.py -> tests -> processor -> services -> ayon-kitsu root
+    repo_root = here.parents[3]
+    repo_env = _parse_dotenv_file(repo_root / ".env")
+    cwd_env = _parse_dotenv_file(Path.cwd() / ".env")
+    merged = _merge_dotenv_repo_then_cwd(repo_env, cwd_env)
+    for key, value in merged.items():
+        if key in ("KITSU_LOGIN", "KITSU_EMAIL", "KITSU_PWD", "KITSU_PASSWORD"):
+            continue
+        if (os.environ.get(key) or "").strip():
+            continue
+        if value is None or not str(value).strip():
+            continue
+        os.environ[key] = str(value)
+
+    # Processor reads KITSU_PWD only; accept KITSU_PASSWORD from .env as alias.
+    pwd_merged = (merged.get("KITSU_PWD") or merged.get("KITSU_PASSWORD") or "").strip()
+    if pwd_merged:
+        os.environ["KITSU_PWD"] = pwd_merged
+
+    # ``_kitsu_login_from_env`` uses ``KITSU_LOGIN`` before ``KITSU_EMAIL``. If the
+    # shell has a stale ``KITSU_LOGIN`` but ``.env`` only defines ``KITSU_EMAIL``,
+    # drop ``KITSU_LOGIN`` so the merged email is used (and vice versa).
+    login_m = (merged.get("KITSU_LOGIN") or "").strip()
+    email_m = (merged.get("KITSU_EMAIL") or "").strip()
+    if login_m:
+        os.environ["KITSU_LOGIN"] = login_m
+        if not email_m:
+            os.environ.pop("KITSU_EMAIL", None)
+    if email_m:
+        os.environ["KITSU_EMAIL"] = email_m
+        if not login_m:
+            os.environ.pop("KITSU_LOGIN", None)
+
+
+def _ensure_nxtools_shim() -> None:
+    """Register a minimal ``nxtools`` if the real package is not installed.
+
+    The processor stack normally ships with ``nxtools``; local shells often use
+    a Python that only has ``ayon_api`` / ``gazu``. This stub covers
+    ``logging``, ``log_traceback``, and ``slugify`` as used by the processor.
+    """
+    if importlib.util.find_spec("nxtools") is not None:
+        return
+    import logging as std_logging
+
+    def log_traceback(message: str = "") -> None:
+        if message:
+            print(message, file=sys.stderr, flush=True)
+        traceback.print_exc(file=sys.stderr)
+
+    def slugify(
+        value,
+        *,
+        separator: str = "-",
+        **_kwargs: object,
+    ) -> str:
+        text = str(value if value is not None else "").strip().lower()
+        text = unicodedata.normalize("NFKD", text)
+        text = text.encode("ascii", "ignore").decode("ascii")
+        text = re.sub(r"[^a-z0-9]+", separator, text)
+        out = text.strip(separator)
+        return out or "x"
+
+    mod = types.ModuleType("nxtools")
+    mod.logging = std_logging
+    mod.log_traceback = log_traceback
+    mod.slugify = slugify
+    sys.modules["nxtools"] = mod
+
+
+def _preflight_processor_env() -> None:
+    """Fail fast with setup hints if required service env is missing.
+
+    Avoids ``KitsuProcessor``'s long sleep when ``ayon_api.init_service`` cannot
+    run (e.g. shell has no ``AYON_SERVER_URL``).
+    """
+    required = (
+        "AYON_SERVER_URL",
+        "AYON_API_KEY",
+        "AYON_ADDON_NAME",
+        "AYON_ADDON_VERSION",
     )
-    for key in optional_from_shell:
-        if key in os.environ:
-            env_vars[key] = os.environ[key]
+    missing = [name for name in required if not (os.environ.get(name) or "").strip()]
+    if not missing:
+        return
+    lines = [
+        "Missing required environment variable(s) for the processor / ayon_api service:",
+        *(f"  - {name}" for name in missing),
+        "",
+        "Set them in this shell (PowerShell), then re-run:",
+        '  $env:AYON_SERVER_URL="https://..."',
+        '  $env:AYON_API_KEY="..."',
+        '  $env:AYON_ADDON_NAME="kitsu"',
+        '  $env:AYON_ADDON_VERSION="..."',
+        "",
+        "Bash:",
+        '  export AYON_SERVER_URL="https://..."',
+        '  export AYON_API_KEY="..."',
+        '  export AYON_ADDON_NAME="kitsu"',
+        '  export AYON_ADDON_VERSION="..."',
+        "",
+        "For Kitsu login when Studio secrets are not used, also set KITSU_LOGIN (or "
+        "KITSU_EMAIL) and KITSU_PWD. See processor addon docs.",
+        "",
+        "If you keep secrets in a .env file, put AYON_* in ayon-kitsu/.env (repo root) "
+        "or in .env in your current working directory; this script loads those before "
+        "this check (exported AYON_* vars still win; KITSU_* login vars from .env win).",
+    ]
+    print("\n".join(lines), file=sys.stderr, flush=True)
+    raise SystemExit(2)
 
-    # Set version in env vars
-    env_vars["AYON_ADDON_VERSION"] = version
 
-    # Build image (tag must be OCI-safe; package.py uses hyphen form)
-    image_tag = oci_image_tag(version)
-    image_name = f"ghcr.io/fuzzkingcool/ayon-kitsu-processor:{image_tag}"
-    build_image(image_name, script_dir)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Run a one-off Kitsu to AYON full sync for paired projects (local dev)."
+    )
+    parser.add_argument(
+        "-p",
+        "--project",
+        metavar="NAME",
+        help="AYON project name (pairing ayonProjectName). Omit to sync all paired projects.",
+    )
+    args = parser.parse_args()
+    project_filter = (args.project or "").strip() or None
 
-    # Run container
-    run_container(image_name, env_vars)
+    proc_pkg_root = Path(__file__).resolve().parents[1]
+    if str(proc_pkg_root) not in sys.path:
+        sys.path.insert(0, str(proc_pkg_root))
+
+    _load_dotenv_for_local_sync()
+    _ensure_nxtools_shim()
+    _preflight_processor_env()
+    from nxtools import log_traceback, logging
+    # Processor uses logging.info; without handlers only WARNING+ appears, so a
+    # slow settings / Kitsu / GET .../pairing phase looks like a hang after ayon_api
+    # prints "Logged in as user ...".
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+        force=True,
+    )
+    from processor.fullsync import project_full_sync
+    from processor.processor import (
+        KitsuProcessor,
+        KitsuServerError,
+        KitsuSettingsError,
+    )
+
+    print(
+        "Initializing KitsuProcessor (addon settings, Kitsu login, pairing list)...",
+        flush=True,
+    )
+    try:
+        processor = KitsuProcessor(start_listener_threads=False)
+    except (KitsuServerError, KitsuSettingsError) as e:
+        print(f"FATAL: {e}", file=sys.stderr, flush=True)
+        raise SystemExit(1) from e
+    except Exception:
+        log_traceback("KitsuProcessor initialization failed")
+        raise SystemExit(1)
+
+    print(
+        f"KitsuProcessor ready ({len(processor.pairing_list)} pairing row(s)).",
+        flush=True,
+    )
+    pairs = processor.pairing_list
+    if project_filter is not None:
+        pairs = [p for p in pairs if p.get("ayonProjectName") == project_filter]
+
+    if project_filter is not None and not pairs:
+        names = sorted(
+            n
+            for n in (
+                p.get("ayonProjectName") for p in processor.pairing_list
+            )
+            if n
+        )
+        print(
+            f"No pairing row for AYON project {project_filter!r}. "
+            f"Paired ayonProjectName values: {names}",
+            file=sys.stderr,
+            flush=True,
+        )
+        os._exit(1)
+
+    for pair in pairs:
+        project_id = pair.get("kitsuProjectId")
+        project_name = pair.get("ayonProjectName")
+        if not project_id or not project_name:
+            continue
+        logging.info(
+            f"Syncing project: {project_name} (Kitsu ID: {project_id})"
+        )
+        try:
+            project_full_sync(processor, project_id, project_name)
+        except Exception:
+            log_traceback(f"Full sync failed for {project_name}")
+            os._exit(1)
+
+    logging.info("One-off full sync finished for all selected projects.")
+    print("One-off full sync finished.", flush=True)
+    os._exit(0)
 
 
 if __name__ == "__main__":

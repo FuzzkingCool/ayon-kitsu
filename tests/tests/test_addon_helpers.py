@@ -8,7 +8,7 @@ from addon_helpers import (
 
 """ tests for formatting values to pass Ayon validation
 
-    $ poetry run pytest tests/test_addon_helpers.py 
+    $ poetry run pytest tests/tests/test_addon_helpers.py
 """
 
 

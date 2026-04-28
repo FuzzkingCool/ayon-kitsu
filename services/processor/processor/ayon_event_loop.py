@@ -48,10 +48,8 @@ AYON_EVENT_ENROLLMENTS = [
 def run_ayon_event_loop(processor) -> None:
     """Run AYON event enrollment in a loop. Intended for a dedicated thread."""
     sender = _get_sender()
-    logging.info(
-        "[ayon_event_loop] Started; enrolling for: %s",
-        [e[0] for e in AYON_EVENT_ENROLLMENTS],
-    )
+    topics = [e[0] for e in AYON_EVENT_ENROLLMENTS]
+    logging.info(f"[ayon_event_loop] Started; enrolling for: {topics}")
     while True:
         try:
             for (
@@ -71,8 +69,7 @@ def run_ayon_event_loop(processor) -> None:
                 if not job:
                     continue
                 logging.info(
-                    "[ayon_event_loop] Enrolled job for %s, processing...",
-                    source_topic,
+                    f"[ayon_event_loop] Enrolled job for {source_topic}, processing..."
                 )
                 src_ev = ayon_api.get_event(job["dependsOn"])
                 project_name = src_ev.get("project") or ""
@@ -106,6 +103,6 @@ def run_ayon_event_loop(processor) -> None:
             else:
                 time.sleep(2)
         except Exception as e:
-            logging.error("[ayon_event_loop] Loop error: %s", e)
+            logging.error(f"[ayon_event_loop] Loop error: {e}")
             log_traceback("ayon_event_loop")
             time.sleep(5)

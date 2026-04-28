@@ -51,10 +51,9 @@ def ordered_kitsu_member_ids_for_push(playlist: dict[str, Any]) -> list[str]:
     try:
         shots = gazu.playlist.all_shots_for_playlist(playlist)
     except Exception as exc:
+        pl_id = str(playlist.get("id", "?"))[:8]
         log.debug(
-            "playlist %s: all_shots_for_playlist fallback failed: %s",
-            str(playlist.get("id", "?"))[:8],
-            exc,
+            f"playlist {pl_id}: all_shots_for_playlist fallback failed: {exc}"
         )
         return []
     out: list[str] = []
@@ -80,17 +79,17 @@ def build_playlist_push_entity(
         if fid:
             ordered.append(fid)
         else:
+            pid = str(playlist.get("id", "?"))[:8]
+            kid8 = kid[:8] if kid else "?"
             log.debug(
-                "playlist %s: skip member %s (no AYON folder with data.kitsuId)",
-                playlist.get("id", "?")[:8],
-                kid[:8] if kid else "?",
+                f"playlist {pid}: skip member {kid8} "
+                f"(no AYON folder with data.kitsuId)"
             )
     if not ordered:
+        pl12 = str(playlist.get("id", "?"))[:12]
         log.warning(
-            "playlist %s (%r): zero AYON folder members resolved "
-            "(check Kitsu shots rows / sync and folder data.kitsuId)",
-            str(playlist.get("id", "?"))[:12],
-            label[:64],
+            f"playlist {pl12} ({label[:64]!r}): zero AYON folder members resolved "
+            f"(check Kitsu shots rows / sync and folder data.kitsuId)"
         )
     return {
         "type": "Playlist",
@@ -111,11 +110,9 @@ def _post_playlist_entities(
     )
     if not response.ok:
         body = (getattr(response, "text", None) or "")[:_HTTP_ERROR_BODY_MAX]
+        url = getattr(response, "url", "")
         log.error(
-            "playlist push HTTP %s %s body=%r",
-            response.status_code,
-            getattr(response, "url", ""),
-            body,
+            f"playlist push HTTP {response.status_code} {url} body={body!r}"
         )
     response.raise_for_status()
 
@@ -140,17 +137,23 @@ def sync_playlists_via_push_for_project(
     }
     if not playlist_sync_enabled(processor):
         log.info(
-            "[fullsync] playlist sync skipped project=%s (playlist_sync.enabled=false)",
-            project_name,
+            f"[fullsync] playlist sync skipped project={project_name} "
+            f"(playlist_sync.enabled=false)"
         )
         return stats
 
     base = ayon_api.get_base_url()
-    for pl in iter_playlists_for_kitsu_project(kitsu_project_id):
+    for idx, pl in enumerate(iter_playlists_for_kitsu_project(kitsu_project_id), start=1):
+        if idx == 1 or idx % 25 == 0:
+            log.info(
+                "[fullsync] playlist sync progress project=%s playlists_seen=%d",
+                project_name,
+                idx,
+            )
         try:
             full = gazu.playlist.get_playlist(pl["id"])
         except Exception as exc:
-            log.warning("playlist fetch %s: %s", pl.get("id"), exc)
+            log.warning(f"playlist fetch {pl.get('id')}: {exc}")
             stats["fetch_failed"] += 1
             continue
         stats["fetched"] += 1
@@ -159,27 +162,31 @@ def sync_playlists_via_push_for_project(
         )
         if not entity.get("ordered_ayon_folder_ids"):
             stats["zero_members"] += 1
+            if not _playlist_settings(processor).get("push_when_zero_members"):
+                pl12 = str(full.get("id", "?"))[:12]
+                log.info(
+                    "playlist %s (%r): skipped push (no resolvable AYON folder members); "
+                    "set sync_settings.playlist_sync.push_when_zero_members=true "
+                    "to force POST anyway",
+                    pl12,
+                    (entity.get("name") or "")[:64],
+                )
+                continue
         try:
             _post_playlist_entities(processor, project_name, [entity])
         except Exception as exc:
             log.error(
-                "playlist push failed for %s (%s): %s",
-                entity.get("id"),
-                entity.get("name"),
-                exc,
+                f"playlist push failed for {entity.get('id')} "
+                f"({entity.get('name')}): {exc}"
             )
             stats["push_failed"] += 1
             continue
         stats["pushed"] += 1
 
     log.info(
-        "[fullsync] playlist sync project=%s fetched=%s pushed=%s "
-        "fetch_failed=%s push_failed=%s zero_member_playlists=%s",
-        project_name,
-        stats["fetched"],
-        stats["pushed"],
-        stats["fetch_failed"],
-        stats["push_failed"],
-        stats["zero_members"],
+        f"[fullsync] playlist sync project={project_name} "
+        f"fetched={stats['fetched']} pushed={stats['pushed']} "
+        f"fetch_failed={stats['fetch_failed']} push_failed={stats['push_failed']} "
+        f"zero_member_playlists={stats['zero_members']}"
     )
     return stats

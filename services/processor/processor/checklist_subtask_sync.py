@@ -112,6 +112,90 @@ def _slug_name(text: str, index: int) -> str:
     return safe[:120]
 
 
+def _find_task_by_folder_name_and_parent(
+    project_name: str,
+    *,
+    folder_id: str,
+    name: str,
+    parent_ayon_task_id: str,
+) -> dict[str, Any] | None:
+    hits: list[dict[str, Any]] = []
+    for task in ayon_api.get_tasks(project_name):
+        if task.get("folderId") != folder_id or task.get("name") != name:
+            continue
+        if str(task.get("parentId") or "") != str(parent_ayon_task_id):
+            continue
+        hits.append(task)
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
+def _find_checklist_child_for_reuse(
+    project_name: str,
+    *,
+    folder_id: str,
+    name: str,
+    parent_ayon_task_id: str,
+    kitsu_comment_id: str,
+    kitsu_parent_task_id: str,
+) -> dict[str, Any] | None:
+    t = _find_task_by_folder_name_and_parent(
+        project_name,
+        folder_id=folder_id,
+        name=name,
+        parent_ayon_task_id=parent_ayon_task_id,
+    )
+    if not t:
+        return None
+    d = t.get("data") or {}
+    pin = d.get(DATA_KEY_PINNED_COMMENT)
+    pk = d.get(DATA_KEY_PARENT_KITSU_TASK)
+    if pin not in (None, "", kitsu_comment_id):
+        return None
+    if pk not in (None, "", kitsu_parent_task_id):
+        return None
+    return t
+
+
+def _upsert_checklist_child_fields(
+    project_name: str,
+    existing: dict[str, Any],
+    *,
+    name: str,
+    label: str,
+    target_status: str,
+    child_data: dict[str, Any],
+) -> None:
+    merged_data = {**(existing.get("data") or {}), **child_data}
+    kwargs: dict[str, Any] = {}
+    if _norm(existing.get("status")) != _norm(target_status):
+        kwargs["status"] = target_status
+    if existing.get("name") != name or existing.get("label") != label:
+        kwargs["name"] = name
+        kwargs["label"] = label
+    if merged_data != (existing.get("data") or {}):
+        kwargs["data"] = merged_data
+    if kwargs:
+        try:
+            ayon_api.update_task(
+                project_name, existing["id"], **kwargs,
+            )
+        except Exception as exc:
+            log.warning(
+                "update_task child %s: %s", existing["id"], exc,
+            )
+
+
+def _is_task_exists_collision(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "already exists" in msg
+        or "409" in msg
+        or "unique" in msg
+    )
+
+
 def _create_child_task_with_parent(
     project_name: str,
     *,
@@ -147,19 +231,54 @@ def _create_child_task_with_parent(
         ayon_api.send_batch_operations(project_name, [op], raise_on_fail=True)
         return new_id
     except Exception as exc:
+        hit = _find_task_by_folder_name_and_parent(
+            project_name,
+            folder_id=folder_id,
+            name=name,
+            parent_ayon_task_id=parent_ayon_task_id,
+        )
+        if hit and _is_task_exists_collision(exc):
+            _upsert_checklist_child_fields(
+                project_name,
+                hit,
+                name=name,
+                label=label,
+                target_status=status,
+                child_data=data,
+            )
+            return str(hit["id"])
         log.warning(
             "create task with parentId failed (%s), retry without parent then update",
             exc,
         )
-        tid = ayon_api.create_task(
-            project_name,
-            name=name,
-            task_type=task_type,
-            folder_id=folder_id,
-            label=label,
-            status=status,
-            data=data,
-        )
+        try:
+            tid = ayon_api.create_task(
+                project_name,
+                name=name,
+                task_type=task_type,
+                folder_id=folder_id,
+                label=label,
+                status=status,
+                data=data,
+            )
+        except Exception as exc_ct:
+            hit2 = _find_task_by_folder_name_and_parent(
+                project_name,
+                folder_id=folder_id,
+                name=name,
+                parent_ayon_task_id=parent_ayon_task_id,
+            )
+            if hit2 and _is_task_exists_collision(exc_ct):
+                _upsert_checklist_child_fields(
+                    project_name,
+                    hit2,
+                    name=name,
+                    label=label,
+                    target_status=status,
+                    child_data=data,
+                )
+                return str(hit2["id"])
+            raise
         try:
             ayon_api.send_batch_operations(
                 project_name,
@@ -319,26 +438,25 @@ def sync_pinned_checklist_subtasks(
 
         name = _slug_name(text, index)
         existing = by_key.get(key)
+        if not existing:
+            existing = _find_checklist_child_for_reuse(
+                project_name,
+                folder_id=str(folder_id),
+                name=name,
+                parent_ayon_task_id=str(parent_id),
+                kitsu_comment_id=kitsu_comment_id,
+                kitsu_parent_task_id=kitsu_task_id,
+            )
 
         if existing:
-            merged_data = {**(existing.get("data") or {}), **child_data}
-            kwargs: dict[str, Any] = {}
-            if _norm(existing.get("status")) != _norm(target_status):
-                kwargs["status"] = target_status
-            if existing.get("name") != name or existing.get("label") != text:
-                kwargs["name"] = name
-                kwargs["label"] = text
-            if merged_data != (existing.get("data") or {}):
-                kwargs["data"] = merged_data
-            if kwargs:
-                try:
-                    ayon_api.update_task(
-                        project_name, existing["id"], **kwargs,
-                    )
-                except Exception as exc:
-                    log.warning(
-                        "update_task child %s: %s", existing["id"], exc,
-                    )
+            _upsert_checklist_child_fields(
+                project_name,
+                existing,
+                name=name,
+                label=text[:500],
+                target_status=target_status,
+                child_data=child_data,
+            )
             continue
 
         try:

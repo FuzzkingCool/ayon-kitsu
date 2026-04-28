@@ -146,7 +146,7 @@ def test_try_relink_stale_kitsu_asset_folder_updates(
         {
             "id": "fold1",
             "parentId": "type_parent",
-            "name": "char_blueDudepowerdash",
+            "name": "char_bluedudepowerdash",
             "data": {"kitsuId": "old-asset-uuid"},
         }
     ]

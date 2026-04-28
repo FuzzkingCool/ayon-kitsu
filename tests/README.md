@@ -1,48 +1,28 @@
 # Testing
 
+This directory is **unit-only**: tests mock Kitsu / AYON and do **not** require a running AYON server or mounted Kitsu addon. Contract tests against a live stack were removed; add them elsewhere (e.g. studio CI) if you need that coverage again.
+
+See **[TEST_MAP.md](TEST_MAP.md)** for each module and the production code it exercises.
+
 ## Setup
 
-You can ether use an already existing AYON instance by duplicating the `example_env`, rename it to `.env` and fill out the needed variables inside.
-Or you can run AYON locally. You will need `ayon-docker`. You will need to mount your backend and addon code as volumes on the `server` service in `docker-compose.yml` for testing something like:
-
-```docker
-volumes:
-      - "./addons:/addons"
-      - "./storage:/storage"
-
-      # mount ayon-backend
-      - "../ayon-backend:/backend"
-
-      # mount ayon-kitsu
-      - "../ayon-kitsu:/addons/kitsu/1.0.2-dev1"
-
-```
-
-In the ayon backend you will need to create a new bundle with the kitsu version included.
-
-Set up poetry env
+Use the **Poetry** environment under `ayon-kitsu/tests` (declared in `pyproject.toml` there). The codebase targets **Python 3.10+** (e.g. `str | None` in server helpers); older interpreters will fail collection.
 
 ```shell
 cd ayon-kitsu/tests
 
-# install dependencies
 poetry install --no-root
-
 ```
 
-### Running Tests
+## Running tests
 
 ```shell
 cd ayon-kitsu/tests
 
-# run tests
 poetry run pytest
+
+# Single file
+poetry run pytest tests/tests/test_processor_task_relink.py
 ```
 
-For any addon updates you will need to reload ayon-backend:
-
-```shell
-cd ayon-docker
-
-docker compose exec server ./reload.sh
-```
+Processor-only tests also live under [`../services/processor/tests/`](../services/processor/tests/) (e.g. `test_processor_image.py`); run from that package or widen `pytest` paths if you include them in CI.
