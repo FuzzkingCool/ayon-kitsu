@@ -160,3 +160,49 @@ def test_sync_playlists_posts_when_push_when_zero_members_true(monkeypatch):
     assert stats["pushed"] == 1
     assert stats["zero_members"] == 1
     assert len(posted) == 1
+
+
+def test_retryable_playlist_post_error_500_when_response_suggests_transient():
+    from ayon_api.exceptions import HTTPRequestError
+
+    resp = MagicMock()
+    resp.status_code = 500
+    resp.text = '{"detail":"Bad Gateway from lists"}'
+    exc = HTTPRequestError("push failed", response=resp)
+    assert ppe._retryable_playlist_post_error(exc) is True
+
+
+def test_retryable_playlist_post_error_500_generic_not_retryable():
+    from ayon_api.exceptions import HTTPRequestError
+
+    resp = MagicMock()
+    resp.status_code = 500
+    resp.text = '{"detail":"Internal validation failed"}'
+    exc = HTTPRequestError("push failed", response=resp)
+    assert ppe._retryable_playlist_post_error(exc) is False
+
+
+def test_post_playlist_entities_retries_on_connection_error(monkeypatch):
+    posted: list[int] = []
+
+    class _Ok:
+        ok = True
+        status_code = 200
+        text = ""
+        url = ""
+
+        def raise_for_status(self):
+            return None
+
+    def fake_post(*_a, **_k):
+        posted.append(1)
+        if len(posted) < 2:
+            raise ConnectionError("reset")
+        return _Ok()
+
+    monkeypatch.setattr(ppe.ayon_api, "post", fake_post, raising=False)
+    monkeypatch.setattr(ppe.time, "sleep", lambda *_a, **_k: None)
+    proc = MagicMock()
+    proc.entrypoint = "https://ayon"
+    ppe._post_playlist_entities(proc, "ayon_proj", [{"type": "Playlist", "id": "pl1"}])
+    assert len(posted) == 2

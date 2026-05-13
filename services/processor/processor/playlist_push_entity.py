@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 import ayon_api
 import gazu
+from ayon_api.exceptions import HTTPRequestError
 
 from .playlist_order import ordered_kitsu_entity_ids_from_playlist
 from .task_relink import find_folder_id_for_kitsu_entity
@@ -17,6 +20,65 @@ if TYPE_CHECKING:
 log = logging.getLogger("playlist_push_entity")
 
 _HTTP_ERROR_BODY_MAX = 2000
+_PLAYLIST_PUSH_MAX_ATTEMPTS = 4
+_PLAYLIST_PUSH_BASE_SLEEP_SEC = 2.0
+
+
+def _push_error_response_text(exc: BaseException, max_len: int = _HTTP_ERROR_BODY_MAX) -> str:
+    """Best-effort HTTP response body from ``ayon_api`` / ``requests`` errors."""
+    resp = getattr(exc, "response", None)
+    if resp is None and isinstance(exc, HTTPRequestError):
+        resp = exc.response
+    if resp is None:
+        return ""
+    try:
+        return (getattr(resp, "text", None) or "")[:max_len]
+    except Exception:
+        return ""
+
+
+def _retryable_playlist_post_error(exc: BaseException) -> bool:
+    """Retry on transport failures and 502/503/504 without ``requests`` isinstance tuples."""
+    msg = str(exc).lower()
+    if "timeout" in msg or "timed out" in msg:
+        return True
+    n = type(exc).__name__
+    if n in (
+        "ConnectionError",
+        "ReadTimeoutError",
+        "ConnectTimeout",
+        "ConnectTimeoutError",
+        "TimeoutError",
+        "ChunkedEncodingError",
+        "ProtocolError",
+    ):
+        return True
+    if isinstance(exc, HTTPRequestError) and exc.response is not None:
+        code = getattr(exc.response, "status_code", None)
+        if code in (502, 503, 504):
+            return True
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        code = getattr(resp, "status_code", None)
+        if code in (502, 503, 504):
+            return True
+        if code == 500:
+            blob = (msg + " " + _push_error_response_text(exc).lower())
+            if any(
+                n in blob
+                for n in (
+                    "timeout",
+                    "timed out",
+                    "connection reset",
+                    "connection aborted",
+                    "temporarily unavailable",
+                    "bad gateway",
+                    "service unavailable",
+                    "gateway timeout",
+                )
+            ):
+                return True
+    return False
 
 
 def _playlist_settings(processor: "KitsuProcessor") -> dict[str, Any]:
@@ -103,18 +165,77 @@ def build_playlist_push_entity(
 def _post_playlist_entities(
     processor: "KitsuProcessor", project_name: str, entities: list[dict[str, Any]]
 ) -> None:
-    response = ayon_api.post(
-        f"{processor.entrypoint}/push",
-        project_name=project_name,
-        entities=entities,
+    last_exc: BaseException | None = None
+    for attempt in range(_PLAYLIST_PUSH_MAX_ATTEMPTS):
+        try:
+            response = ayon_api.post(
+                f"{processor.entrypoint}/push",
+                project_name=project_name,
+                entities=entities,
+            )
+            if not response.ok:
+                body = (getattr(response, "text", None) or "")[:_HTTP_ERROR_BODY_MAX]
+                url = getattr(response, "url", "")
+                log.error(
+                    f"playlist push HTTP {response.status_code} {url} body={body!r}"
+                )
+            response.raise_for_status()
+            return
+        except BaseException as exc:
+            last_exc = exc
+            if (
+                attempt + 1 >= _PLAYLIST_PUSH_MAX_ATTEMPTS
+                or not _retryable_playlist_post_error(exc)
+            ):
+                raise
+            delay = _PLAYLIST_PUSH_BASE_SLEEP_SEC * (2**attempt)
+            log.warning(
+                "playlist push retry project=%s attempt=%s/%s sleep=%.1fs err=%s",
+                project_name,
+                attempt + 1,
+                _PLAYLIST_PUSH_MAX_ATTEMPTS,
+                delay,
+                exc,
+            )
+            time.sleep(delay)
+    raise last_exc  # pragma: no cover
+
+
+def _log_playlist_push_failure_diagnostics(
+    project_name: str,
+    entity: dict[str, Any],
+    exc: BaseException,
+) -> None:
+    """Emit response body / JSON detail so operators can match AYON server logs."""
+    n_members = len(entity.get("ordered_ayon_folder_ids") or [])
+    body = _push_error_response_text(exc)
+    log.error(
+        "playlist push diagnostics project=%s kitsu_playlist_id=%s member_count=%s "
+        "(on AYON host correlate addon call to POST /api/projects/<name>/lists "
+        "or PATCH .../lists/<id>/items for this time window)",
+        project_name,
+        entity.get("id"),
+        n_members,
     )
-    if not response.ok:
-        body = (getattr(response, "text", None) or "")[:_HTTP_ERROR_BODY_MAX]
-        url = getattr(response, "url", "")
+    if not body:
+        return
+    log.error("playlist push HTTP response (truncated): %s", body[:1800])
+    try:
+        parsed = json.loads(body)
+        if isinstance(parsed, dict) and parsed.get("detail"):
+            log.error("playlist push detail field: %s", str(parsed["detail"])[:1200])
+    except Exception:
+        pass
+    blob = (body + " " + str(exc)).lower()
+    if "/lists" in blob and (
+        "500" in blob or "internal server error" in blob or "statuserror" in blob
+    ):
         log.error(
-            f"playlist push HTTP {response.status_code} {url} body={body!r}"
+            "playlist push hint: AYON core POST /api/projects/<name>/lists failed; "
+            "common causes are duplicate list label (project-wide unique) or an "
+            "existing list row without data.kitsuId. Kitsu addon reconciles "
+            "folder+label on sync; check AYON server logs for the real exception."
         )
-    response.raise_for_status()
 
 
 def sync_playlists_via_push_for_project(
@@ -179,6 +300,7 @@ def sync_playlists_via_push_for_project(
                 f"playlist push failed for {entity.get('id')} "
                 f"({entity.get('name')}): {exc}"
             )
+            _log_playlist_push_failure_diagnostics(project_name, entity, exc)
             stats["push_failed"] += 1
             continue
         stats["pushed"] += 1

@@ -14,10 +14,10 @@ PowerShell (session only), then run the script from any cwd:
     $env:AYON_ADDON_NAME="kitsu"
     $env:AYON_ADDON_VERSION="1.2.3"
 
-Optional: ``KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL=per_linked_entity`` matches the
-recommended studio setting for ``sync_settings.concept_sync.concept_entity_model``
-(one AYON Concept folder per linked Kitsu entity, avoiding slug collisions when
-many concept rows share one asset).
+Optional: ``KITSU_CONCEPT_ENTITY_MODEL`` or ``KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL``
+override ``concept_entity_model`` from JSON (e.g. ``per_kitsu_concept`` for legacy).
+Omitted or blank ``concept_entity_model`` defaults to ``per_linked_entity`` in the
+processor, matching the studio addon.
 
 Before checking env vars, the script loads ``.env`` from (1) the **ayon-kitsu**
 repo root, then (2) **``Path.cwd()``**. For each key, a **non-empty** value from
@@ -38,12 +38,48 @@ Not intended for CI. Uses ``KitsuProcessor(start_listener_threads=False)`` so
 Socket.IO / AYON event threads do not run during the one-shot fullsync (less
 AYON contention). Uses ``os._exit`` after sync so the process exits despite
 any remaining non-daemon state.
+
+Does not inspect or assert AYON activity feed behavior (for example whether each
+Version gets a "published a version" line, impersonation, or timestamps); see
+``processor.content_sync`` module docstring for how preview vs comment sync
+relates to activities.
+
+One-shot **comment body repair** (re-run Kitsu comment sync after processor
+logic changes; no structural fullsync)::
+
+    python services/processor/tests/test_processor_image.py --repair-kitsu-comment-bodies
+    python services/processor/tests/test_processor_image.py --repair-kitsu-comment-bodies -p MyAyonProject
+
+``--dry-run`` does **not** apply here: comment repair always mutates AYON (it may
+delete and recreate activities). Use ``--dry-run`` only with
+``--repair-version-authors``.
+
+After processor updates, this path re-hashes and re-posts Kitsu-sourced comment
+activities. When ``ContentSyncSettings.review_version_link_enabled`` is true and
+a review revision resolves to an AYON review version, the replicated body may gain
+a trailing GFM link ``[Version N](...)`` to the web Products view (``web_ui_base_url``
+or API host-derived origin). Idempotent re-runs skip duplicate links.
+
+One-shot **review version author repair** (PATCH placeholder ``author`` on review
+versions using Kitsu breadcrumbs from ``version.data``; optional dry-run)::
+
+    python services/processor/tests/test_processor_image.py --repair-version-authors --dry-run -p MyAyonProject
+    python services/processor/tests/test_processor_image.py --repair-version-authors -p MyAyonProject
+
+    Write JSON for versions skipped with no AYON user mapping (Kitsu email / name
+    not found on AYON)::
+
+        python .../test_processor_image.py --repair-version-authors \\
+            --repair-version-authors-skip-json skips.json
+        python .../test_processor_image.py --repair-version-authors \\
+            --repair-version-authors-skip-json -
 """
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import sys
@@ -234,7 +270,52 @@ def main() -> None:
         metavar="NAME",
         help="AYON project name (pairing ayonProjectName). Omit to sync all paired projects.",
     )
+    parser.add_argument(
+        "--repair-version-authors",
+        action="store_true",
+        help=(
+            "PATCH review version author away from kitsu-processor placeholder using "
+            "Kitsu uploader resolution (paired projects). Use --dry-run to log only."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Only with --repair-version-authors: log planned author PATCHes; do not mutate "
+            "AYON. Not valid with --repair-kitsu-comment-bodies or default fullsync (those "
+            "always write to AYON)."
+        ),
+    )
+    parser.add_argument(
+        "--repair-version-authors-skip-json",
+        metavar="PATH",
+        help=(
+            "Only with --repair-version-authors: after the run, write a JSON array of "
+            "review versions that had a Kitsu uploader but no matching AYON user login "
+            "(PATH, or - for stdout)."
+        ),
+    )
+    parser.add_argument(
+        "--repair-kitsu-comment-bodies",
+        action="store_true",
+        help=(
+            "Re-run Kitsu→AYON comment activity sync for all task comments (paired "
+            "projects only). No fullsync. Use after comment body / preview appendix fixes."
+        ),
+    )
     args = parser.parse_args()
+    if args.dry_run and not args.repair_version_authors:
+        parser.error(
+            "--dry-run is only supported with --repair-version-authors. "
+            "--repair-kitsu-comment-bodies and fullsync always perform live AYON writes; "
+            "large projects can run a long time with sparse logs (use INFO logging)."
+        )
+    skip_json = (args.repair_version_authors_skip_json or "").strip()
+    if skip_json and not args.repair_version_authors:
+        parser.error(
+            "--repair-version-authors-skip-json requires --repair-version-authors."
+        )
     project_filter = (args.project or "").strip() or None
 
     proc_pkg_root = Path(__file__).resolve().parents[1]
@@ -297,6 +378,45 @@ def main() -> None:
             flush=True,
         )
         os._exit(1)
+
+    if args.repair_version_authors:
+        from processor.content_sync import repair_review_version_authors_for_paired_projects
+
+        skip_rows: list[dict[str, object]] | None = [] if skip_json else None
+        stats = repair_review_version_authors_for_paired_projects(
+            processor,
+            ayon_project_name=project_filter,
+            dry_run=args.dry_run,
+            skip_no_ayon_login_rows=skip_rows,
+        )
+        logging.info("Review version author repair finished: %s", stats)
+        print(f"Review version author repair finished: {stats}", flush=True)
+        if skip_rows is not None:
+            payload = json.dumps(skip_rows, indent=2)
+            if skip_json == "-":
+                print(payload, flush=True)
+            else:
+                Path(skip_json).write_text(payload, encoding="utf-8")
+                print(
+                    f"Wrote {len(skip_rows)} no-AYON-login skip row(s) to {skip_json!r}.",
+                    flush=True,
+                )
+        os._exit(0)
+
+    if args.repair_kitsu_comment_bodies:
+        from processor.content_sync import repair_kitsu_comment_activities_for_paired_projects
+
+        print(
+            "Starting Kitsu comment body repair (live AYON mutations; progress on stderr)...",
+            flush=True,
+        )
+        stats = repair_kitsu_comment_activities_for_paired_projects(
+            processor,
+            ayon_project_name=project_filter,
+        )
+        logging.info("Kitsu comment repair finished: %s", stats)
+        print(f"Kitsu comment repair finished: {stats}", flush=True)
+        os._exit(0)
 
     for pair in pairs:
         project_id = pair.get("kitsuProjectId")

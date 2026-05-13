@@ -174,6 +174,7 @@ def test_expand_single_concept_delegates():
 
 def test_normalize_concept_sync_camel_case_enables_per_linked_expand(monkeypatch):
     """Processor JSON may send conceptEntityModel; normalize before expand."""
+    monkeypatch.delenv("KITSU_CONCEPT_ENTITY_MODEL", raising=False)
     monkeypatch.delenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", raising=False)
     pid = _pid()
     link = str(uuid.uuid4())
@@ -303,6 +304,7 @@ def test_should_not_attempt_relink_multi_link_without_meta():
 
 
 def test_normalize_concept_sync_env_override_fills_empty_json(monkeypatch):
+    monkeypatch.delenv("KITSU_CONCEPT_ENTITY_MODEL", raising=False)
     monkeypatch.setenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", "per_linked_entity")
     ns = concept_expand.normalize_concept_sync_dict(
         {"concept_entity_model": "", "prefer_linked_asset_names": True},
@@ -312,24 +314,37 @@ def test_normalize_concept_sync_env_override_fills_empty_json(monkeypatch):
     assert ns.get("prefer_linked_asset_names") is True
 
 
-def test_normalize_concept_sync_env_only_when_raw_none(monkeypatch):
-    monkeypatch.setenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", "per_linked_entity")
+def test_normalize_concept_sync_defaults_when_raw_none(monkeypatch):
+    monkeypatch.delenv("KITSU_CONCEPT_ENTITY_MODEL", raising=False)
+    monkeypatch.delenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", raising=False)
     ns = concept_expand.normalize_concept_sync_dict(None)
     assert ns == {"concept_entity_model": "per_linked_entity"}
 
 
-def test_normalize_concept_sync_env_only_when_raw_empty_dict(monkeypatch):
-    monkeypatch.setenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", "per_linked_entity")
+def test_normalize_concept_sync_defaults_when_raw_empty_dict(monkeypatch):
+    monkeypatch.delenv("KITSU_CONCEPT_ENTITY_MODEL", raising=False)
+    monkeypatch.delenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", raising=False)
     ns = concept_expand.normalize_concept_sync_dict({})
     assert ns == {"concept_entity_model": "per_linked_entity"}
 
 
-def test_normalize_concept_sync_strips_blank_model_no_env():
+def test_normalize_concept_sync_blank_model_defaults_per_linked_no_env(monkeypatch):
+    monkeypatch.delenv("KITSU_CONCEPT_ENTITY_MODEL", raising=False)
+    monkeypatch.delenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", raising=False)
     ns = concept_expand.normalize_concept_sync_dict({"concept_entity_model": "   "})
-    assert ns is None
+    assert ns is not None
+    assert ns.get("concept_entity_model") == "per_linked_entity"
+
+
+def test_normalize_concept_sync_env_short_key_override(monkeypatch):
+    monkeypatch.setenv("KITSU_CONCEPT_ENTITY_MODEL", "per_kitsu_concept")
+    monkeypatch.delenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", raising=False)
+    ns = concept_expand.normalize_concept_sync_dict(None)
+    assert ns == {"concept_entity_model": "per_kitsu_concept"}
 
 
 def test_normalize_concept_sync_json_wins_without_env(monkeypatch):
+    monkeypatch.delenv("KITSU_CONCEPT_ENTITY_MODEL", raising=False)
     monkeypatch.delenv("KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL", raising=False)
     ns = concept_expand.normalize_concept_sync_dict(
         {"concept_entity_model": "per_kitsu_concept"},

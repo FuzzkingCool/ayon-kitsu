@@ -3,19 +3,49 @@
 Used by the processor service for both Socket.IO-driven incremental sync
 and full-sync content pass.  All heavy lifting (download, upload) happens
 inline so the processor can run in a container with no local disk state.
+
+AYON activity feed (versions vs comments):
+
+- Kitsu preview sync creates or reuses **review** AYON versions. When
+  ``impersonate_comment_authors`` is on and the Kitsu uploader maps to an AYON
+  login, ``upload_reviewable``, preview-path ``upload_project_file``, and
+  post-upload ``update_version`` merges for preview metadata / file ids run
+  under ``as_username`` (same helper as comments). ``create_version`` /
+  ``update_version`` for **version ``author``** (and correcting a processor
+  placeholder author) use the same path when a Kitsu person resolves.
+
+- There is **no** guarantee of a distinct publish/version activity per Kitsu
+  preview or per every AYON Version in the project: one AYON version per
+  Kitsu ``revision`` per review product (reused when revision matches); many
+  early returns skip work entirely; duplicate ``preview_file_id`` skips
+  before upload. Whether each ``upload_reviewable`` emits its own activity
+  is defined by AYON server behavior, not this addon.
+
+- Comment activities may pass Kitsu ``created_at`` as ``timestamp`` to
+  ``create_activity``; the preview/version path does not set historical
+  timestamps here.
+
+- Kitsu ``previews`` on a comment are **not** AYON reviewables (those come from
+  preview sync). A short ``Revision`` / ``review files`` markdown appendix is
+  appended only when preview metadata is informative, unless
+  ``append_kitsu_preview_manifest`` forces legacy behavior. Thin id-only
+  previews do not create a misleading manifest; noise-only comments skip AYON
+  activities.
 """
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import logging
 import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable, Iterator
 
 import ayon_api
 import gazu
@@ -23,6 +53,8 @@ import requests
 from ayon_api.exceptions import HTTPRequestError
 from nxtools import logging as nxtools_logging, slugify
 
+from . import content_sync_browser_urls as browser_urls
+from . import content_sync_logging as cs_log
 from . import utils as processor_utils
 from .checklist_subtask_sync import (
     bulk_sync_pinned_checklists_after_fullsync_enabled,
@@ -40,6 +72,200 @@ _RETRY_SLEEP_SEC = 1.5
 _MAX_REVIEWABLE_LABEL_LEN = 120
 # Must match ayon_server.activities.utils.MAX_BODY_LENGTH (ynput/ayon-backend).
 _MAX_AYON_ACTIVITY_BODY_CHARS = 2000
+
+
+def _comment_body_preview(comment: dict, *, max_len: int = 96) -> str:
+    raw = comment.get("text")
+    if not isinstance(raw, str):
+        return ""
+    one = " ".join(raw.split())
+    if len(one) > max_len:
+        return one[: max_len - 1] + "…"
+    return one
+
+
+def _enrich_kitsu_task_type_name(
+    task: dict,
+    task_types: dict[str, str],
+) -> dict:
+    """Shallow copy + ``task_type_name`` from ``task_types`` (avoids full ``preprocess_task``)."""
+    tid = task.get("task_type_id")
+    if tid and str(tid) in task_types and not task.get("task_type_name"):
+        out = dict(task)
+        out["task_type_name"] = task_types[str(tid)]
+        return out
+    return task
+
+
+# Full-project content pass only: one get_folders / get_tasks per project per pass.
+# Module global (not ContextVar): pytest and other hosts can duplicate execution
+# contexts in ways that strand ContextVar values; a strict set/clear here matches
+# the single-threaded processor fullsync + sequential test expectations.
+_CONTENT_SYNC_AYON_LOOKUP_PASS: _AyonContentSyncLookupCache | None = None
+
+
+class _AyonContentSyncLookupCache:
+    """In-memory folder/task indexes for ``sync_all_content_for_project`` (pass-scoped)."""
+
+    __slots__ = ("project_name", "_folder_by_kitsu", "_task_list", "_task_by_kitsu")
+
+    def __init__(self, project_name: str) -> None:
+        self.project_name = project_name
+        self._folder_by_kitsu: dict[Any, dict] | None = None
+        self._task_list: list[dict] | None = None
+        self._task_by_kitsu: dict[Any, dict] | None = None
+
+    def _ensure_folders(self) -> None:
+        if self._folder_by_kitsu is not None:
+            return
+        kid_log = "cache-warm"
+        idx: dict[Any, dict] = {}
+        for attempt in range(2):
+            try:
+                for folder in ayon_api.get_folders(self.project_name):
+                    k = (folder.get("data") or {}).get("kitsuId")
+                    if k is None:
+                        continue
+                    if k not in idx:
+                        idx[k] = folder
+                self._folder_by_kitsu = idx
+                return
+            except (HTTPRequestError, requests.exceptions.RequestException) as exc:
+                status = _http_error_status(exc)
+                if (
+                    attempt == 0
+                    and status in _RETRYABLE_HTTP_STATUSES
+                ):
+                    log.warning(
+                        "[content_sync] get_folders failed project=%s kitsu_entity=%s "
+                        "http_status=%s; retrying once",
+                        self.project_name,
+                        kid_log,
+                        status,
+                    )
+                    time.sleep(_RETRY_SLEEP_SEC)
+                    continue
+                log.warning(
+                    "[content_sync] get_folders failed project=%s kitsu_entity=%s: %s",
+                    self.project_name,
+                    kid_log,
+                    exc,
+                )
+                self._folder_by_kitsu = {}
+                return
+        self._folder_by_kitsu = {}
+
+    def folder_by_kitsu_id(self, kitsu_id: str) -> dict | None:
+        self._ensure_folders()
+        assert self._folder_by_kitsu is not None
+        return self._folder_by_kitsu.get(kitsu_id)
+
+    def _ensure_tasks(self) -> None:
+        if self._task_list is not None:
+            return
+        kid_log = "cache-warm"
+        idx: dict[Any, dict] = {}
+        for attempt in range(2):
+            try:
+                tasks = list(ayon_api.get_tasks(self.project_name))
+                for task in tasks:
+                    k = (task.get("data") or {}).get("kitsuId")
+                    if k is None:
+                        continue
+                    if k not in idx:
+                        idx[k] = task
+                self._task_list = tasks
+                self._task_by_kitsu = idx
+                return
+            except (HTTPRequestError, requests.exceptions.RequestException) as exc:
+                status = _http_error_status(exc)
+                if (
+                    attempt == 0
+                    and status in _RETRYABLE_HTTP_STATUSES
+                ):
+                    log.warning(
+                        "[content_sync] get_tasks failed project=%s kitsu_task=%s "
+                        "http_status=%s; retrying once",
+                        self.project_name,
+                        kid_log,
+                        status,
+                    )
+                    time.sleep(_RETRY_SLEEP_SEC)
+                    continue
+                log.warning(
+                    "[content_sync] get_tasks failed project=%s kitsu_task=%s: %s",
+                    self.project_name,
+                    kid_log,
+                    exc,
+                )
+                self._task_list = []
+                self._task_by_kitsu = {}
+                return
+        self._task_list = []
+        self._task_by_kitsu = {}
+
+    def task_by_kitsu_id(self, kitsu_id: str) -> dict | None:
+        self._ensure_tasks()
+        assert self._task_by_kitsu is not None
+        return self._task_by_kitsu.get(kitsu_id)
+
+    def vizdev_surrogate_task(
+        self, folder_kitsu_id: str, surrogate_kitsu_id: str,
+    ) -> dict | None:
+        folder = self.folder_by_kitsu_id(folder_kitsu_id)
+        if not folder:
+            return None
+        fid = folder.get("id")
+        if not fid:
+            return None
+        self._ensure_tasks()
+        assert self._task_list is not None
+        for task in self._task_list:
+            if _task_folder_id(task) != str(fid):
+                continue
+            tdata = task.get("data") or {}
+            if tdata.get("kitsuId") == surrogate_kitsu_id:
+                return task
+            if (
+                tdata.get("kitsuConceptId") == folder_kitsu_id
+                and tdata.get("kitsuMirrorSlot") == "VizDev"
+            ):
+                return task
+            if (
+                tdata.get("kitsuLinkedEntityId") == folder_kitsu_id
+                and tdata.get("kitsuMirrorSlot") == "VizDev"
+            ):
+                return task
+        return None
+
+    def iter_tasks(self) -> Iterator[dict]:
+        self._ensure_tasks()
+        return iter(self._task_list or [])
+
+
+def _active_content_sync_ayon_cache(
+    project_name: str,
+) -> _AyonContentSyncLookupCache | None:
+    c = _CONTENT_SYNC_AYON_LOOKUP_PASS
+    if c is None or c.project_name != project_name:
+        return None
+    return c
+
+
+@contextmanager
+def _content_sync_ayon_lookup_cache_scope(project_name: str):
+    """Activate AYON folder/task lookup cache for one full-project content sync pass."""
+    global _CONTENT_SYNC_AYON_LOOKUP_PASS
+    if _CONTENT_SYNC_AYON_LOOKUP_PASS is not None:
+        log.warning(
+            "[content_sync] pass lookup cache was still set; clearing before new scope",
+        )
+        _CONTENT_SYNC_AYON_LOOKUP_PASS = None
+    _CONTENT_SYNC_AYON_LOOKUP_PASS = _AyonContentSyncLookupCache(project_name)
+    try:
+        yield
+    finally:
+        _CONTENT_SYNC_AYON_LOOKUP_PASS = None
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +321,9 @@ def _http_error_detail_contains(exc: BaseException, needle: str) -> bool:
 
 
 def _ayon_folder_by_kitsu_id(project_name: str, kitsu_id: str) -> dict | None:
+    cache = _active_content_sync_ayon_cache(project_name)
+    if cache is not None:
+        return cache.folder_by_kitsu_id(kitsu_id)
     kid = (kitsu_id or "")[:8]
     for attempt in range(2):
         try:
@@ -183,6 +412,9 @@ def _ayon_vizdev_task_by_surrogate(
     surrogate_kitsu_id: str,
 ) -> dict | None:
     """Resolve VizDev task under the Concept folder matching ``surrogate_kitsuId``."""
+    cache = _active_content_sync_ayon_cache(project_name)
+    if cache is not None:
+        return cache.vizdev_surrogate_task(folder_kitsu_id, surrogate_kitsu_id)
     folder = _ayon_folder_by_kitsu_id(project_name, folder_kitsu_id)
     if not folder:
         return None
@@ -249,6 +481,9 @@ def _kitsu_task_entity_looks_like_concept(task: dict) -> bool:
 
 
 def _ayon_task_by_kitsu_id(project_name: str, kitsu_id: str) -> dict | None:
+    cache = _active_content_sync_ayon_cache(project_name)
+    if cache is not None:
+        return cache.task_by_kitsu_id(kitsu_id)
     kid = (kitsu_id or "")[:8]
     for attempt in range(2):
         try:
@@ -493,18 +728,17 @@ def _merge_kitsu_preview_metadata_on_version(
 # Thumbnail sync
 # ---------------------------------------------------------------------------
 
-def _is_raster_image_extension(ext: str | None) -> bool:
-    if not ext:
-        return False
-    return ext.lower().lstrip(".") in (
-        "png", "jpg", "jpeg", "gif", "webp", "bmp", "tif", "tiff",
-    )
+def _kitsu_png_thumbnail_relative_url(preview_file_id: str) -> str:
+    """Kitsu-generated PNG tile URL (AYON ``create_thumbnail`` rejects some originals)."""
+    return f"pictures/thumbnails/preview-files/{preview_file_id}.png"
 
 
 def sync_thumbnail_to_ayon(
     processor: "KitsuProcessor",
     entity: dict,
     project_name: str,
+    *,
+    kitsu_project_id: str | None = None,
 ):
     """Download Kitsu entity preview (original image when possible) and set AYON folder thumbnail."""
     preview_file_id = entity.get("preview_file_id")
@@ -516,53 +750,92 @@ def sync_thumbnail_to_ayon(
     if not ayon_folder:
         return
 
-    existing_thumb_kid = (ayon_folder.get("data") or {}).get("kitsuThumbnailPreviewId")
-    if str(existing_thumb_kid) == str(preview_file_id):
-        log.debug(
-            "[content_sync] action=skip_duplicate "
-            "kitsu_thumbnail_preview_id=%s folder_id=%s reason=kitsuThumbnailPreviewId",
-            preview_file_id, ayon_folder.get("id"),
+    thumb_tok = None
+    if kitsu_project_id:
+        ft_hint = cs_log.entity_row_folder_type(entity)
+        sec = cs_log.build_entity_thumbnail_log_section(
+            kitsu_api_server_url=processor.kitsu_server_url,
+            kitsu_project_id=kitsu_project_id,
+            project_name=project_name,
+            entity=entity,
+            folder_type_hint=ft_hint,
+            ayon_folder=ayon_folder,
         )
-        return
+        thumb_tok = cs_log.section_set(sec)
 
+    tmp_path: str | None = None
     try:
-        pf = gazu.files.get_preview_file(preview_file_id)
-    except Exception as exc:
-        log.warning("get_preview_file failed for entity %s: %s", kitsu_id, exc)
-        return
+        existing_thumb_kid = (ayon_folder.get("data") or {}).get("kitsuThumbnailPreviewId")
+        if str(existing_thumb_kid) == str(preview_file_id):
+            log.debug(
+                "[content_sync] skip folder thumbnail: already set to this Kitsu preview "
+                "(folder_id=%s preview_file_id=%s)",
+                ayon_folder.get("id"),
+                preview_file_id,
+            )
+            return
 
-    if not pf:
-        return
+        try:
+            pf = gazu.files.get_preview_file(preview_file_id)
+        except Exception as exc:
+            cs_log.cs_log(
+                logging.WARNING,
+                "get_preview_file failed for entity %s: %s",
+                kitsu_id,
+                exc,
+            )
+            return
 
-    st = (pf.get("status") or "").lower()
-    if st and st != "ready":
-        log.debug("Entity preview %s not ready (%s), skipping thumbnail sync", preview_file_id, st)
-        return
+        if not pf:
+            return
 
-    ext = (pf.get("extension") or "png").lstrip(".")
-    if _is_raster_image_extension(ext):
-        url = gazu.files.get_preview_file_url(pf)
-        suffix = f".{ext}"
-    else:
-        url = f"pictures/thumbnails/preview-files/{preview_file_id}.png"
+        st = (pf.get("status") or "").lower()
+        if st and st != "ready":
+            log.debug(
+                "Entity preview %s not ready (%s), skipping thumbnail sync",
+                preview_file_id,
+                st,
+            )
+            return
+
+        # Always use Kitsu's PNG thumbnail derivative. Uploading WebP/HEIF/tiff or
+        # mis-tagged originals caused 415 Unsupported Media Type on AYON thumbnail API.
+        url = _kitsu_png_thumbnail_relative_url(str(preview_file_id))
         suffix = ".png"
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp_path = tmp.name
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            tmp_path = tmp.name
 
-    try:
-        gazu.client.download(url, tmp_path)
-        thumb_id = ayon_api.create_thumbnail(project_name, tmp_path)
-        ayon_api.update_folder(
-            project_name, ayon_folder["id"],
-            thumbnail_id=thumb_id,
-            data={**(ayon_folder.get("data") or {}), "kitsuThumbnailPreviewId": preview_file_id},
-        )
-        log.info("Thumbnail synced for entity %s -> folder %s", kitsu_id, ayon_folder["id"])
-    except Exception as exc:
-        log.warning("Thumbnail sync failed for %s: %s", kitsu_id, exc)
+        try:
+            gazu.client.download(url, tmp_path)
+            thumb_id = ayon_api.create_thumbnail(project_name, tmp_path)
+            ayon_api.update_folder(
+                project_name, ayon_folder["id"],
+                thumbnail_id=thumb_id,
+                data={
+                    **(ayon_folder.get("data") or {}),
+                    "kitsuThumbnailPreviewId": preview_file_id,
+                },
+            )
+            cs_log.cs_log(
+                logging.INFO,
+                "Thumbnail synced for entity %s -> folder %s",
+                kitsu_id,
+                ayon_folder["id"],
+            )
+        except Exception as exc:
+            cs_log.cs_log(
+                logging.WARNING,
+                "Thumbnail sync failed for %s: %s",
+                kitsu_id,
+                exc,
+            )
+        finally:
+            if tmp_path:
+                Path(tmp_path).unlink(missing_ok=True)
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
+        if thumb_tok is not None:
+            cs_log.section_reset(thumb_tok)
 
 
 # ---------------------------------------------------------------------------
@@ -627,25 +900,152 @@ def _find_or_create_review_product(
     )
 
 
-def _find_or_create_review_version(
+def _is_processor_placeholder_version_author(author: object) -> bool:
+    """True if AYON version author looks like the kitsu-processor service identity."""
+    if not author or not isinstance(author, str):
+        return False
+    a = author.strip().lower()
+    return a == "kitsu-processor" or a.startswith("kitsu-processor-")
+
+
+def _person_id_from_kitsu_preview(preview: dict) -> str | None:
+    pid = preview.get("person_id")
+    if isinstance(pid, dict):
+        pid = pid.get("id")
+    if pid:
+        s = str(pid).strip()
+        return s or None
+    person = preview.get("person")
+    if isinstance(person, dict) and person.get("id"):
+        s = str(person["id"]).strip()
+        return s or None
+    return None
+
+
+def _kitsu_person_dict_for_preview_uploader(
+    preview: dict, kitsu_comment_id: str,
+) -> dict[str, Any]:
+    """Kitsu person who uploaded the preview, or comment author when tied to a comment."""
+    pid = _person_id_from_kitsu_preview(preview)
+    cid = (kitsu_comment_id or "").strip()
+    if not pid and cid:
+        try:
+            c = gazu.task.get_comment(cid)
+            if isinstance(c, dict):
+                cp = c.get("person_id")
+                if isinstance(cp, dict):
+                    cp = cp.get("id")
+                if cp:
+                    pid = str(cp).strip() or None
+        except Exception as exc:
+            log.debug("get_comment for preview author %s: %s", cid[:8], exc)
+    if not pid:
+        return {}
+    try:
+        p = gazu.person.get_person(pid)
+        return p if isinstance(p, dict) else {}
+    except Exception as exc:
+        log.debug("get_person for preview author %s: %s", pid[:8], exc)
+        return {}
+
+
+def _find_review_version_id_for_revision(
     project_name: str, product_id: str, revision: int,
-    kitsu_task_id: str, kitsu_comment_id: str,
-    ayon_task_id: str | None,
-) -> str:
+) -> str | None:
     for ver in ayon_api.get_versions(project_name, product_ids=[product_id]):
         if ver.get("version") == revision:
-            return ver["id"]
-    return ayon_api.create_version(
-        project_name,
-        version=revision,
-        product_id=product_id,
-        task_id=ayon_task_id,
-        data={
-            "kitsuRevision": revision,
-            "kitsuCommentId": kitsu_comment_id,
-            "kitsuTaskId": kitsu_task_id,
-        },
+            return str(ver["id"])
+    return None
+
+
+def _create_review_version_entity(
+    project_name: str,
+    product_id: str,
+    revision: int,
+    kitsu_task_id: str,
+    kitsu_comment_id: str,
+    ayon_task_id: str | None,
+    author_login: str | None,
+) -> str:
+    data = {
+        "kitsuRevision": revision,
+        "kitsuCommentId": kitsu_comment_id,
+        "kitsuTaskId": kitsu_task_id,
+    }
+    kwargs: dict[str, Any] = {
+        "project_name": project_name,
+        "version": revision,
+        "product_id": product_id,
+        "task_id": ayon_task_id,
+        "data": data,
+    }
+    if author_login and "author" in inspect.signature(ayon_api.create_version).parameters:
+        kwargs["author"] = author_login
+    try:
+        return ayon_api.create_version(**kwargs)
+    except TypeError:
+        kwargs.pop("author", None)
+        return ayon_api.create_version(**kwargs)
+
+
+def ayon_update_version_supports_author_parameter() -> bool:
+    """True when ``ayon_api.update_version`` accepts ``author=`` (required for version author repair)."""
+    try:
+        return "author" in inspect.signature(ayon_api.update_version).parameters
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def log_ayon_version_author_update_capability() -> None:
+    """Log once at processor startup if author PATCH is unavailable (older ayon-python-api)."""
+    if ayon_update_version_supports_author_parameter():
+        return
+    log.warning(
+        "ayon_api.update_version has no 'author' parameter; review version author "
+        "repair and placeholder correction cannot PATCH author. Upgrade ayon-python-api."
     )
+
+
+def _update_version_author_if_supported(
+    project_name: str, version_id: str, author_login: str,
+) -> None:
+    if not ayon_update_version_supports_author_parameter():
+        return
+    try:
+        ayon_api.update_version(project_name, version_id, author=author_login)
+    except TypeError:
+        pass
+
+
+def _ensure_review_version_author_with_impersonation(
+    processor: "KitsuProcessor",
+    project_name: str,
+    version_id: str,
+    ver_snapshot: dict[str, Any] | None,
+    kitsu_person: dict[str, Any],
+    email_cache: dict[str, str],
+    ayon_login: str | None,
+) -> None:
+    """Patch version ``author`` when still on processor placeholder; prefer ``as_username``."""
+    if not ver_snapshot or not ayon_login:
+        return
+    if not _is_processor_placeholder_version_author(ver_snapshot.get("author")):
+        return
+
+    def _patch() -> None:
+        _update_version_author_if_supported(project_name, version_id, ayon_login)
+
+    if kitsu_person:
+        _run_ayon_as_kitsu_person_when_service(
+            processor,
+            project_name,
+            kitsu_person,
+            email_cache,
+            _patch,
+            acl_log_label="Review version author",
+        )
+    else:
+        _patch()
 
 
 def _preview_file_id_in_version_data(preview_file_id: str, version_dict: dict | None) -> bool:
@@ -774,21 +1174,33 @@ def _delete_all_activities_for_kitsu_comment(
     project_name: str,
     ayon_task_id: str,
     kitsu_comment_id: str,
+    *,
+    activities: list[dict] | None = None,
 ) -> None:
-    for act in ayon_api.get_activities(
-        project_name, entity_ids=[ayon_task_id], activity_types=["comment"],
-    ):
+    if activities is None:
+        src = list(
+            ayon_api.get_activities(
+                project_name,
+                entity_ids=[ayon_task_id],
+                activity_types=["comment"],
+            ),
+        )
+    else:
+        src = activities
+    for act in src:
         if _activity_kitsu_comment_id(act) != str(kitsu_comment_id):
             continue
         try:
             ayon_api.delete_activity(project_name, act["activityId"])
-            log.info(
+            cs_log.cs_log(
+                logging.INFO,
                 "Deleted activity %s for comment %s",
                 act.get("activityId"),
                 kitsu_comment_id[:8],
             )
         except Exception as exc:
-            log.error(
+            cs_log.cs_log(
+                logging.ERROR,
                 "Failed to delete activity for comment %s: %s",
                 kitsu_comment_id[:8],
                 exc,
@@ -833,346 +1245,465 @@ def sync_preview_to_ayon(
     pass ``source_kitsu_concept_id`` so each contributing Kitsu concept gets its
     own review product under the merged AYON folder; otherwise all previews share
     one product and collide on revision / kitsuPreviewFileIds.
+
+    See module docstring: ``upload_reviewable`` / preview ``upload_project_file``
+    and post-upload version metadata merges run under ``as_username`` when
+    impersonation is on and the Kitsu uploader maps to an AYON login.
     """
     project_name = processor.get_paired_ayon_project(project_id)
     if not project_name:
         return
 
-    processor_utils.set_kitsu_host(processor.kitsu_server_url)
+    _orphan_line_tok = None
+    _pe_cache: dict[str, dict | None] = {}
 
     try:
-        preview = gazu.files.get_preview_file(preview_file_id)
-    except Exception as exc:
-        log.error("Failed to get preview file %s: %s", preview_file_id, exc)
-        return
+        processor_utils.set_kitsu_host(processor.kitsu_server_url)
 
-    if not preview:
-        return
-
-    resolved_task_id = (task_id or "").strip()
-    if not resolved_task_id:
-        tid = preview.get("task_id")
-        if isinstance(tid, dict):
-            tid = tid.get("id")
-        if tid:
-            resolved_task_id = str(tid)
-
-    pool_surrogate = concept_vizdev_surrogate_unlinked_pool()
-    is_pool_surrogate = resolved_task_id == pool_surrogate
-
-    concept_from_surrogate = (
-        None
-        if is_pool_surrogate
-        else _concept_id_from_vizdev_surrogate_task_id(resolved_task_id)
-    )
-    link_from_surrogate = (
-        None
-        if is_pool_surrogate
-        else _linked_entity_id_from_vizdev_surrogate_task_id(resolved_task_id)
-    )
-    task: dict | None = None
-    entity_id = ""
-    task_type = "unknown"
-
-    if is_pool_surrogate:
-        _cz = (processor.settings.get("sync_settings") or {}).get("concept_sync")
-        cs = processor_utils.normalize_concept_sync_dict(
-            _cz if isinstance(_cz, dict) else None,
-        )
-        anchor = (cs or {}).get("unlinked_concepts_project_kitsu_id")
-        anchor = (
-            str(anchor).strip() if anchor else ""
-        ) or processor_utils.DEFAULT_UNLINKED_PROJECT_KITSU_ID
-        entity_id = anchor
-        task_type = "VizDev"
-    elif concept_from_surrogate:
-        entity_id = concept_from_surrogate
-        task_type = "VizDev"
-    elif link_from_surrogate:
-        entity_id = link_from_surrogate
-        task_type = "VizDev"
-    else:
-        if not resolved_task_id:
-            log.debug(
-                "[content_sync] preview %s missing task_id (and preview has none)",
-                preview_file_id,
-            )
-            return
         try:
-            task = gazu.task.get_task(resolved_task_id)
+            preview = gazu.files.get_preview_file(preview_file_id)
         except Exception as exc:
-            log.error("Failed to get Kitsu task %s: %s", resolved_task_id, exc)
+            log.error("Failed to get preview file %s: %s", preview_file_id, exc)
             return
-        entity_id = str(task.get("entity_id") or "")
-        task_type = str(
-            task.get("task_type_name")
-            or task.get("task_type_id")
-            or "unknown",
+
+        if not preview:
+            return
+
+        resolved_task_id = (task_id or "").strip()
+        if not resolved_task_id:
+            tid = preview.get("task_id")
+            if isinstance(tid, dict):
+                tid = tid.get("id")
+            if tid:
+                resolved_task_id = str(tid)
+
+        pool_surrogate = concept_vizdev_surrogate_unlinked_pool()
+        is_pool_surrogate = resolved_task_id == pool_surrogate
+
+        concept_from_surrogate = (
+            None
+            if is_pool_surrogate
+            else _concept_id_from_vizdev_surrogate_task_id(resolved_task_id)
         )
-
-    ayon_folder = _ayon_folder_by_kitsu_id(project_name, entity_id)
-    if not ayon_folder:
-        log.debug("No AYON folder for entity %s", (entity_id or "")[:8])
-        return
-
-    is_concept_media_path = (
-        bool(concept_from_surrogate)
-        or bool(link_from_surrogate)
-        or is_pool_surrogate
-        or (task is not None and _kitsu_task_entity_looks_like_concept(task))
-    )
-    if is_concept_media_path:
-        task_type = "VizDev"
-
-    ayon_task = _ayon_task_by_kitsu_id(project_name, resolved_task_id)
-    if ayon_task is None and entity_id and is_concept_media_path:
-        ayon_task = _ayon_vizdev_task_by_surrogate(
-            project_name, entity_id, resolved_task_id,
+        link_from_surrogate = (
+            None
+            if is_pool_surrogate
+            else _linked_entity_id_from_vizdev_surrogate_task_id(resolved_task_id)
         )
+        task: dict | None = None
+        entity_id = ""
+        task_type = "unknown"
 
-    if is_concept_media_path and ayon_task is None:
-        log.warning(
-            "[content_sync] no AYON VizDev task for concept %s; "
-            "skip preview %s (push concept first)",
-            (entity_id or "")[:8],
-            preview_file_id,
-        )
-        return
-
-    ayon_task_id = ayon_task["id"] if ayon_task else None
-
-    revision = preview.get("revision", 1)
-    comment_id = preview.get("comment_id", "")
-
-    product_name: str | None = None
-    product_extra: dict[str, Any] | None = None
-    if link_from_surrogate or is_pool_surrogate:
-        src_concept = (source_kitsu_concept_id or "").strip() or None
-        if not src_concept:
-            src_concept = _preview_source_concept_id_from_payload(preview)
-        product_name = _per_linked_concept_review_product_name(
-            task_type,
-            source_kitsu_concept_id=src_concept,
-            preview_file_id=str(preview_file_id),
-        )
-        product_extra = (
-            {"kitsuSourceConceptId": src_concept} if src_concept else None
-        )
-
-    product_id = _find_or_create_review_product(
-        project_name,
-        ayon_folder["id"],
-        task_type,
-        resolved_task_id,
-        product_name=product_name,
-        product_data_extra=product_extra,
-    )
-    version_id = _find_or_create_review_version(
-        project_name, product_id, revision, resolved_task_id, comment_id, ayon_task_id,
-    )
-
-    ver_snapshot = ayon_api.get_version_by_id(project_name, version_id)
-    if _preview_file_id_in_version_data(preview_file_id, ver_snapshot):
-        log.info(
-            "[content_sync] action=skip_duplicate "
-            "kitsu_preview_file_id=%s version_id=%s reason=kitsuPreviewFileIds",
-            preview_file_id, version_id,
-        )
-        return
-
-    ext = preview.get("extension", "png")
-    original_name = preview.get("original_name", f"{preview_file_id}.{ext}")
-    url = _preview_download_url(preview)
-
-    with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
-        tmp_path = tmp.name
-
-    main_ok = False
-    pdf_project_file_id: str | None = None
-    preview_kind_for_merge: str | None = None
-    try:
-        gazu.client.download(url, tmp_path)
-        try:
-            sz = os.path.getsize(tmp_path)
-        except OSError:
-            sz = -1
-        head_hex = ""
-        try:
-            with open(tmp_path, "rb") as rh:
-                head_hex = rh.read(16).hex()
-        except OSError:
-            pass
-        log.debug(
-            "[content_sync] reviewable_prepare preview_file_id=%s revision=%s position=%s "
-            "comment_id=%s original_name=%r kitsu_extension=%r download_path=%r "
-            "tmp_suffix=%r size=%s head16_hex=%s",
-            preview_file_id,
-            preview.get("revision"),
-            preview.get("position"),
-            preview.get("comment_id"),
-            original_name,
-            ext,
-            url,
-            Path(tmp_path).suffix,
-            sz,
-            head_hex or None,
-        )
-        upload_name, content_type = _infer_reviewable_basename_and_mime(
-            tmp_path,
-            preview,
-            original_name,
-            preview_file_id,
-            str(ext),
-        )
-        if upload_name and content_type:
-            log.debug(
-                "[content_sync] reviewable_upload preview_file_id=%s filename=%r "
-                "content_type=%s",
-                preview_file_id,
-                upload_name,
-                content_type,
+        if is_pool_surrogate:
+            _cz = (processor.settings.get("sync_settings") or {}).get("concept_sync")
+            cs = processor_utils.normalize_concept_sync_dict(
+                _cz if isinstance(_cz, dict) else None,
             )
+            anchor = (cs or {}).get("unlinked_concepts_project_kitsu_id")
+            anchor = (
+                str(anchor).strip() if anchor else ""
+            ) or processor_utils.DEFAULT_UNLINKED_PROJECT_KITSU_ID
+            entity_id = anchor
+            task_type = "VizDev"
+        elif concept_from_surrogate:
+            entity_id = concept_from_surrogate
+            task_type = "VizDev"
+        elif link_from_surrogate:
+            entity_id = link_from_surrogate
+            task_type = "VizDev"
+        else:
+            if not resolved_task_id:
+                log.debug(
+                    "[content_sync] preview %s missing task_id (and preview has none)",
+                    preview_file_id,
+                )
+                return
             try:
-                ayon_api.upload_reviewable(
+                task = gazu.task.get_task(resolved_task_id)
+            except Exception as exc:
+                cs_log.cs_log(
+                    logging.ERROR,
+                    "Failed to get Kitsu task %s: %s",
+                    resolved_task_id,
+                    exc,
+                )
+                return
+            entity_id = str(task.get("entity_id") or "")
+            task_type = str(
+                task.get("task_type_name")
+                or task.get("task_type_id")
+                or "unknown",
+            )
+
+        ayon_folder = _ayon_folder_by_kitsu_id(project_name, entity_id)
+        if not ayon_folder:
+            log.debug("No AYON folder for entity %s", (entity_id or "")[:8])
+            return
+
+        is_concept_media_path = (
+            bool(concept_from_surrogate)
+            or bool(link_from_surrogate)
+            or is_pool_surrogate
+            or (task is not None and _kitsu_task_entity_looks_like_concept(task))
+        )
+        if is_concept_media_path:
+            task_type = "VizDev"
+
+        ayon_task = _ayon_task_by_kitsu_id(project_name, resolved_task_id)
+        if ayon_task is None and entity_id and is_concept_media_path:
+            ayon_task = _ayon_vizdev_task_by_surrogate(
+                project_name, entity_id, resolved_task_id,
+            )
+
+        def _ensure_preview_orphan_ctx() -> None:
+            nonlocal _orphan_line_tok
+            if cs_log.section_get() is not None or _orphan_line_tok is not None:
+                return
+            sec = cs_log.build_preview_orphan_section(
+                kitsu_api_server_url=processor.kitsu_server_url,
+                kitsu_project_id=project_id,
+                project_name=project_name,
+                preview_file_id=str(preview_file_id),
+                resolved_kitsu_task_id=str(resolved_task_id),
+                entity_id=str(entity_id),
+                kitsu_task=task,
+                ayon_task=ayon_task,
+                entity_cache=_pe_cache,
+            )
+            cs_log.log_orphan_section_header(sec)
+            _orphan_line_tok = cs_log.line_prefix_set("    ")
+
+        if is_concept_media_path and ayon_task is None:
+            _ensure_preview_orphan_ctx()
+            cs_log.cs_log(
+                logging.WARNING,
+                "[content_sync] no AYON VizDev task for concept %s; "
+                "skip preview %s (push concept first)",
+                (entity_id or "")[:8],
+                preview_file_id,
+            )
+            return
+
+        ayon_task_id = ayon_task["id"] if ayon_task else None
+
+        revision = preview.get("revision", 1)
+        comment_id = preview.get("comment_id", "")
+        kitsu_comment_id_str = str(comment_id).strip() if comment_id else ""
+
+        email_cache: dict[str, str] = {}
+        kitsu_person = _kitsu_person_dict_for_preview_uploader(
+            preview, kitsu_comment_id_str,
+        )
+        raw_pe = kitsu_person.get("email") if isinstance(kitsu_person.get("email"), str) else None
+        pe = raw_pe.strip() if raw_pe and raw_pe.strip() else None
+        raw_kfn = kitsu_person.get("full_name") if isinstance(kitsu_person.get("full_name"), str) else None
+        kitsu_fn = raw_kfn.strip() if raw_kfn and raw_kfn.strip() else None
+        fn_index = _full_name_login_index_if_enabled(processor)
+        ayon_login = _resolve_ayon_login_for_comment_sync(
+            pe,
+            project_name,
+            email_cache,
+            kitsu_full_name=kitsu_fn,
+            full_name_index=fn_index,
+        )
+
+        product_name: str | None = None
+        product_extra: dict[str, Any] | None = None
+        if link_from_surrogate or is_pool_surrogate:
+            src_concept = (source_kitsu_concept_id or "").strip() or None
+            if not src_concept:
+                src_concept = _preview_source_concept_id_from_payload(preview)
+            product_name = _per_linked_concept_review_product_name(
+                task_type,
+                source_kitsu_concept_id=src_concept,
+                preview_file_id=str(preview_file_id),
+            )
+            product_extra = (
+                {"kitsuSourceConceptId": src_concept} if src_concept else None
+            )
+
+        product_id = _find_or_create_review_product(
+            project_name,
+            ayon_folder["id"],
+            task_type,
+            resolved_task_id,
+            product_name=product_name,
+            product_data_extra=product_extra,
+        )
+        existing_vid = _find_review_version_id_for_revision(
+            project_name, product_id, revision,
+        )
+        if existing_vid:
+            version_id = existing_vid
+        else:
+            created_wrap: dict[str, str] = {}
+
+            def _create_review_version_wrapped() -> None:
+                created_wrap["id"] = _create_review_version_entity(
                     project_name,
-                    version_id,
-                    tmp_path,
-                    label=None,
-                    filename=upload_name,
-                    content_type=content_type,
+                    product_id,
+                    revision,
+                    resolved_task_id,
+                    kitsu_comment_id_str,
+                    ayon_task_id,
+                    ayon_login,
                 )
-                main_ok = True
-                log.info(
-                    "Reviewable uploaded: %s -> version %s",
-                    original_name,
-                    version_id,
-                )
-            except (HTTPRequestError, requests.exceptions.HTTPError) as up_exc:
-                if (
-                    _http_error_status(up_exc) == 400
-                    and _http_error_detail_contains(
-                        up_exc,
-                        "Failed to extract media info",
-                    )
-                ):
-                    log.warning(
-                        "[content_sync] reviewable_extract_media_info_failed "
-                        "preview_file_id=%s filename=%r; storing_as_project_file",
-                        preview_file_id,
-                        upload_name,
-                    )
+
+            _run_ayon_as_kitsu_person_when_service(
+                processor,
+                project_name,
+                kitsu_person if isinstance(kitsu_person, dict) else {},
+                email_cache,
+                _create_review_version_wrapped,
+                acl_log_label="Review version",
+            )
+            version_id = created_wrap["id"]
+
+        ver_snapshot = ayon_api.get_version_by_id(project_name, version_id)
+        _ensure_review_version_author_with_impersonation(
+            processor,
+            project_name,
+            version_id,
+            ver_snapshot,
+            kitsu_person,
+            email_cache,
+            ayon_login,
+        )
+        ver_snapshot = ayon_api.get_version_by_id(project_name, version_id)
+        if _preview_file_id_in_version_data(preview_file_id, ver_snapshot):
+            _ensure_preview_orphan_ctx()
+            cs_log.cs_log(
+                logging.INFO,
+                "[content_sync] skip preview upload: version already lists this Kitsu "
+                "preview file id (version_id=%s preview_file_id=%s)",
+                version_id,
+                preview_file_id,
+            )
+            return
+
+        ext = preview.get("extension", "png")
+        original_name = preview.get("original_name", f"{preview_file_id}.{ext}")
+        url = _preview_download_url(preview)
+
+        with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as tmp:
+            tmp_path = tmp.name
+
+        main_ok = False
+        pdf_project_file_id: str | None = None
+        preview_kind_for_merge: str | None = None
+        try:
+            gazu.client.download(url, tmp_path)
+
+            def _preview_upload_and_merge() -> None:
+                nonlocal main_ok, pdf_project_file_id, preview_kind_for_merge
+                try:
                     try:
+                        sz = os.path.getsize(tmp_path)
+                    except OSError:
+                        sz = -1
+                    head_hex = ""
+                    try:
+                        with open(tmp_path, "rb") as rh:
+                            head_hex = rh.read(16).hex()
+                    except OSError:
+                        pass
+                    log.debug(
+                        "[content_sync] reviewable_prepare preview_file_id=%s revision=%s position=%s "
+                        "comment_id=%s original_name=%r kitsu_extension=%r download_path=%r "
+                        "tmp_suffix=%r size=%s head16_hex=%s",
+                        preview_file_id,
+                        preview.get("revision"),
+                        preview.get("position"),
+                        preview.get("comment_id"),
+                        original_name,
+                        ext,
+                        url,
+                        Path(tmp_path).suffix,
+                        sz,
+                        head_hex or None,
+                    )
+                    upload_name, content_type = _infer_reviewable_basename_and_mime(
+                        tmp_path,
+                        preview,
+                        original_name,
+                        preview_file_id,
+                        str(ext),
+                    )
+                    _ensure_preview_orphan_ctx()
+                    if upload_name and content_type:
+                        log.debug(
+                            "[content_sync] reviewable_upload preview_file_id=%s filename=%r "
+                            "content_type=%s",
+                            preview_file_id,
+                            upload_name,
+                            content_type,
+                        )
+                        try:
+                            ayon_api.upload_reviewable(
+                                project_name,
+                                version_id,
+                                tmp_path,
+                                label=None,
+                                filename=upload_name,
+                                content_type=content_type,
+                            )
+                            main_ok = True
+                            cs_log.cs_log(
+                                logging.INFO,
+                                "Reviewable uploaded: %s -> version %s",
+                                original_name,
+                                version_id,
+                            )
+                        except (HTTPRequestError, requests.exceptions.HTTPError) as up_exc:
+                            if (
+                                _http_error_status(up_exc) == 400
+                                and _http_error_detail_contains(
+                                    up_exc,
+                                    "Failed to extract media info",
+                                )
+                            ):
+                                cs_log.cs_log(
+                                    logging.WARNING,
+                                    "[content_sync] reviewable_extract_media_info_failed "
+                                    "preview_file_id=%s filename=%r; storing_as_project_file",
+                                    preview_file_id,
+                                    upload_name,
+                                )
+                                try:
+                                    resp = ayon_api.upload_project_file(
+                                        project_name,
+                                        tmp_path,
+                                        filename=upload_name,
+                                    )
+                                    resp_data = resp.json() if hasattr(resp, "json") else {}
+                                    fid = str(resp_data.get("id", "") or "")
+                                    if fid:
+                                        pdf_project_file_id = fid
+                                        preview_kind_for_merge = "extract_failed_sidecar"
+                                        main_ok = True
+                                        cs_log.cs_log(
+                                            logging.INFO,
+                                            "[content_sync] stored Kitsu preview as project file "
+                                            "(reviewable media extract failed; preview_file_id=%s "
+                                            "project_file_id=%s filename=%r)",
+                                            preview_file_id,
+                                            fid,
+                                            upload_name,
+                                        )
+                                    else:
+                                        cs_log.cs_log(
+                                            logging.WARNING,
+                                            "[content_sync] preview_extract_fallback_no_file_id "
+                                            "preview_file_id=%s",
+                                            preview_file_id,
+                                        )
+                                except Exception as pf_exc:
+                                    cs_log.cs_log(
+                                        logging.ERROR,
+                                        "[content_sync] preview_extract_fallback_upload_failed "
+                                        "preview_file_id=%s: %s%s",
+                                        preview_file_id,
+                                        pf_exc,
+                                        _http_error_body_snippet(pf_exc),
+                                    )
+                            else:
+                                raise
+                    elif _is_pdf_preview(tmp_path, str(ext)):
+                        pdf_filename = _reviewable_upload_basename(
+                            original_name, preview_file_id, "pdf",
+                        )
+                        log.debug(
+                            "[content_sync] preview_pdf_project_file preview_file_id=%s filename=%r",
+                            preview_file_id,
+                            pdf_filename,
+                        )
                         resp = ayon_api.upload_project_file(
                             project_name,
                             tmp_path,
-                            filename=upload_name,
+                            filename=pdf_filename,
                         )
                         resp_data = resp.json() if hasattr(resp, "json") else {}
                         fid = str(resp_data.get("id", "") or "")
                         if fid:
                             pdf_project_file_id = fid
-                            preview_kind_for_merge = "extract_failed_sidecar"
+                            preview_kind_for_merge = "pdf"
                             main_ok = True
-                            log.info(
-                                "[content_sync] preview_media_project_file "
-                                "preview_file_id=%s project_file_id=%s filename=%r "
-                                "reason=reviewable_extract_fallback",
+                            cs_log.cs_log(
+                                logging.INFO,
+                                "[content_sync] preview_pdf_uploaded preview_file_id=%s "
+                                "project_file_id=%s version_id=%s filename=%r",
                                 preview_file_id,
                                 fid,
-                                upload_name,
+                                version_id,
+                                pdf_filename,
                             )
                         else:
-                            log.warning(
-                                "[content_sync] preview_extract_fallback_no_file_id "
-                                "preview_file_id=%s",
+                            cs_log.cs_log(
+                                logging.WARNING,
+                                "[content_sync] preview_pdf_upload_no_file_id preview_file_id=%s",
                                 preview_file_id,
                             )
-                    except Exception as pf_exc:
-                        log.error(
-                            "[content_sync] preview_extract_fallback_upload_failed "
-                            "preview_file_id=%s: %s%s",
+                    else:
+                        cs_log.cs_log(
+                            logging.WARNING,
+                            "[content_sync] skip preview upload: unsupported or unknown media "
+                            "type for direct reviewable (preview_file_id=%s original_name=%r "
+                            "extension=%r size=%s head16_hex=%s)",
                             preview_file_id,
-                            pf_exc,
-                            _http_error_body_snippet(pf_exc),
+                            original_name,
+                            ext,
+                            sz,
+                            head_hex or None,
                         )
-                else:
-                    raise
-        elif _is_pdf_preview(tmp_path, str(ext)):
-            pdf_filename = _reviewable_upload_basename(
-                original_name, preview_file_id, "pdf",
-            )
-            log.debug(
-                "[content_sync] preview_pdf_project_file preview_file_id=%s filename=%r",
-                preview_file_id,
-                pdf_filename,
-            )
-            resp = ayon_api.upload_project_file(
-                project_name,
-                tmp_path,
-                filename=pdf_filename,
-            )
-            resp_data = resp.json() if hasattr(resp, "json") else {}
-            fid = str(resp_data.get("id", "") or "")
-            if fid:
-                pdf_project_file_id = fid
-                preview_kind_for_merge = "pdf"
-                main_ok = True
-                log.info(
-                    "[content_sync] preview_pdf_uploaded preview_file_id=%s "
-                    "project_file_id=%s version_id=%s filename=%r",
-                    preview_file_id,
-                    fid,
+                except Exception as exc:
+                    cs_log.cs_log(
+                        logging.ERROR,
+                        "Reviewable upload failed for %s: %s%s",
+                        preview_file_id,
+                        exc,
+                        _http_error_body_snippet(exc),
+                    )
+                    return
+                if not main_ok:
+                    return
+                ann_payload = (
+                    preview.get("annotations")
+                    if preview.get("annotations") is not None
+                    else []
+                )
+                _merge_kitsu_preview_metadata_on_version(
+                    project_name,
                     version_id,
-                    pdf_filename,
+                    str(preview_file_id),
+                    ann_payload,
+                    preview,
+                    project_file_id=pdf_project_file_id,
+                    preview_kind=preview_kind_for_merge,
                 )
-            else:
-                log.warning(
-                    "[content_sync] preview_pdf_upload_no_file_id preview_file_id=%s",
-                    preview_file_id,
+                _merge_kitsu_preview_file_ids_on_version(
+                    project_name, version_id, [preview_file_id],
                 )
-        else:
-            log.warning(
-                "[content_sync] skip preview upload preview_file_id=%s "
-                "original_name=%r kitsu_extension=%r size=%s head16_hex=%s "
-                "reason=unsupported_or_unknown_media_type",
-                preview_file_id,
-                original_name,
-                ext,
-                sz,
-                head_hex or None,
+
+            _run_ayon_as_kitsu_person_when_service(
+                processor,
+                project_name,
+                kitsu_person if isinstance(kitsu_person, dict) else {},
+                email_cache,
+                _preview_upload_and_merge,
+                acl_log_label="Review upload",
             )
-    except Exception as exc:
-        log.error(
-            "Reviewable upload failed for %s: %s%s",
-            preview_file_id,
-            exc,
-            _http_error_body_snippet(exc),
-        )
+        finally:
+            Path(tmp_path).unlink(missing_ok=True)
+
     finally:
-        Path(tmp_path).unlink(missing_ok=True)
-
-    if not main_ok:
-        return
-
-    ann_payload = (
-        preview.get("annotations") if preview.get("annotations") is not None else []
-    )
-    _merge_kitsu_preview_metadata_on_version(
-        project_name,
-        version_id,
-        str(preview_file_id),
-        ann_payload,
-        preview,
-        project_file_id=pdf_project_file_id,
-        preview_kind=preview_kind_for_merge,
-    )
-
-    _merge_kitsu_preview_file_ids_on_version(project_name, version_id, [preview_file_id])
+        if _orphan_line_tok is not None:
+            cs_log.line_prefix_reset(_orphan_line_tok)
 
 
 # ---------------------------------------------------------------------------
 # Comment sync
 # ---------------------------------------------------------------------------
+
 
 def _normalize_kitsu_preview_entries(raw_previews: Any) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
@@ -1187,17 +1718,468 @@ def _normalize_kitsu_preview_entries(raw_previews: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _build_comment_body(comment: dict, persons: dict[str, dict], statuses: dict[str, str]) -> str:
+def _kitsu_preview_rows_informative_for_comment_appendix(
+    rows: list[dict[str, Any]],
+) -> bool:
+    """True when Kitsu preview rows carry a real revision label and a non-id filename."""
+    if not rows:
+        return False
+    sorted_prev = sorted(rows, key=lambda row: row.get("position", 0))
+    lead = sorted_prev[0]
+    rev = lead.get("revision")
+    if rev is None or rev == "" or rev == "?":
+        return False
+    pid = str(lead.get("id") or "").strip()
+    oname = lead.get("original_name")
+    if not isinstance(oname, str) or not oname.strip():
+        return False
+    if oname.strip() == pid:
+        return False
+    return True
+
+
+def _should_append_kitsu_preview_manifest_to_comment_body(
+    processor: "KitsuProcessor",
+    preview_rows: list[dict[str, Any]],
+) -> bool:
+    """Append 'Revision / review files' block only for rich preview metadata, unless legacy setting forces it."""
+    if not preview_rows:
+        return False
+    block = _content_sync_settings_block(processor)
+    if block.get("append_kitsu_preview_manifest") is True:
+        return True
+    return _kitsu_preview_rows_informative_for_comment_appendix(preview_rows)
+
+
+def _comment_has_nonempty_checklist(comment: dict) -> bool:
+    cl = comment.get("checklist") or []
+    if not isinstance(cl, list):
+        return False
+    for item in cl:
+        if isinstance(item, dict) and str(item.get("text") or "").strip():
+            return True
+        if isinstance(item, str) and item.strip():
+            return True
+    return False
+
+
+def _content_sync_settings_block(processor: "KitsuProcessor") -> dict[str, Any]:
+    sync = (getattr(processor, "settings", None) or {}).get("sync_settings") or {}
+    block = sync.get("content_sync") if isinstance(sync, dict) else None
+    return block if isinstance(block, dict) else {}
+
+
+def attach_comment_preview_json_sidecars_enabled(processor: "KitsuProcessor") -> bool:
+    """Legacy: attach ``*_annotations.json`` / ``*_preview_file.json`` to comment activities (default off)."""
+    return bool(_content_sync_settings_block(processor).get("attach_comment_preview_json_sidecars", False))
+
+
+def resolve_author_login_by_full_name_enabled(processor: "KitsuProcessor") -> bool:
+    """When True, map Kitsu ``full_name`` to AYON login when email lookup fails (opt-in; collision-prone)."""
+    return _content_sync_settings_block(processor).get("resolve_author_login_by_full_name") is True
+
+
+def impersonate_comment_authors_enabled(processor: "KitsuProcessor") -> bool:
+    """When True (default), run matching AYON writes as the Kitsu author via ``as_username`` when possible.
+
+    Covers: comment ``create_activity``, comment attachment and preview-sidecar
+    ``upload_project_file``, review version author/create, Kitsu preview
+    ``upload_reviewable`` / preview ``upload_project_file`` plus preview metadata
+    merges on the version, and checklist subtask upserts (see
+    ``checklist_subtask_sync``). ``get_activities`` / ``delete_activity`` stay on
+    the service API identity.
+    """
+    return _content_sync_settings_block(processor).get("impersonate_comment_authors", True) is not False
+
+
+def _acl_forbidden_comment_sync(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return (
+        "403" in s
+        or "forbidden" in s
+        or "permission" in s
+        or "not allowed" in s
+        or "access denied" in s
+    )
+
+
+def _normalize_kitsu_full_name_key(full_name: str) -> str:
+    return " ".join(full_name.split()).strip().lower()
+
+
+def _build_ayon_users_by_normalized_full_name() -> dict[str, str]:
+    """Map normalized ``attrib.fullName`` / ``attrib.full_name`` to AYON login ``name``."""
+    out: dict[str, str] = {}
+    gu = getattr(ayon_api, "get_users", None)
+    if not callable(gu):
+        return out
+    try:
+        users = gu()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("get_users for full-name login index failed: %s", exc)
+        return out
+    for u in users or []:
+        if not isinstance(u, dict) or not u.get("name"):
+            continue
+        att = u.get("attrib")
+        if not isinstance(att, dict):
+            att = {}
+        fn = att.get("fullName") or att.get("full_name")
+        if not isinstance(fn, str) or not fn.strip():
+            continue
+        key = _normalize_kitsu_full_name_key(fn)
+        if key and key not in out:
+            out[key] = str(u["name"])
+    return out
+
+
+def _full_name_login_index_if_enabled(
+    processor: "KitsuProcessor",
+) -> dict[str, str] | None:
+    if not resolve_author_login_by_full_name_enabled(processor):
+        return None
+    return _build_ayon_users_by_normalized_full_name()
+
+
+def _resolve_ayon_login_for_comment_sync(
+    email_or_login: str | None,
+    project_name: str,
+    cache: dict[str, str],
+    *,
+    kitsu_full_name: str | None = None,
+    full_name_index: dict[str, str] | None = None,
+) -> str | None:
+    if email_or_login and str(email_or_login).strip():
+        c = str(email_or_login).strip()
+        if "@" not in c:
+            return c
+        key = c.lower()
+        if key in cache:
+            return cache[key]
+        gu = getattr(ayon_api, "get_users", None)
+        if not callable(gu):
+            return None
+        first: dict[str, Any] | None = None
+        it = None
+        try:
+            try:
+                it = gu(project_name=project_name, emails=[key], fields={"name"})  # type: ignore[call-arg]
+            except TypeError:
+                it = gu(project_name, emails=[key], fields={"name"})  # type: ignore[call-arg]
+        except (TypeError, ValueError) as exc:
+            log.debug("Impersonation email lookup failed: %s", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Impersonation get_users failed: %s", exc)
+            return None
+        for u in it or []:
+            if isinstance(u, dict) and u.get("name"):
+                first = u
+                break
+        if first:
+            name = str(first["name"])
+            cache[key] = name
+            return name
+    if full_name_index and kitsu_full_name and kitsu_full_name.strip():
+        nk = _normalize_kitsu_full_name_key(kitsu_full_name)
+        if nk:
+            hit = full_name_index.get(nk)
+            if hit:
+                return hit
+    return None
+
+
+def _run_ayon_as_kitsu_person_when_service(
+    processor: "KitsuProcessor",
+    project_name: str,
+    person: dict[str, Any],
+    email_cache: dict[str, str],
+    fn: Callable[[], None],
+    *,
+    acl_log_label: str = "Comment sync",
+) -> None:
+    """Run ``fn`` under ``as_username`` when service key + Kitsu person maps to an AYON login."""
+    if not impersonate_comment_authors_enabled(processor):
+        fn()
+        return
+    try:
+        con = ayon_api.get_server_api_connection()
+    except Exception as exc:
+        log.debug("No server connection for impersonation: %s", exc)
+        fn()
+        return
+    is_svc_fn = getattr(con, "is_service_user", None)
+    if not callable(is_svc_fn) or not is_svc_fn():
+        fn()
+        return
+    raw_email = person.get("email") if isinstance(person, dict) else None
+    email = raw_email.strip() if isinstance(raw_email, str) and raw_email.strip() else None
+    raw_fn = person.get("full_name") if isinstance(person, dict) else None
+    kitsu_fn = raw_fn.strip() if isinstance(raw_fn, str) and raw_fn.strip() else None
+    fn_index = _full_name_login_index_if_enabled(processor)
+    login = _resolve_ayon_login_for_comment_sync(
+        email,
+        project_name,
+        email_cache,
+        kitsu_full_name=kitsu_fn,
+        full_name_index=fn_index,
+    )
+    if not login:
+        fn()
+        return
+    as_u = getattr(con, "as_username", None)
+    if not callable(as_u):
+        fn()
+        return
+    try:
+        with as_u(login):
+            fn()
+    except Exception as exc:  # noqa: BLE001
+        if _acl_forbidden_comment_sync(exc):
+            log.warning(
+                "%s: impersonation ACL failure as %r, retrying as service user: %s",
+                acl_log_label,
+                login,
+                exc,
+            )
+            fn()
+        else:
+            raise
+
+
+def _run_comment_sync_mutations(
+    processor: "KitsuProcessor",
+    project_name: str,
+    person: dict[str, Any],
+    email_cache: dict[str, str],
+    fn: Callable[[], None],
+) -> None:
+    """Run ``fn`` as the Kitsu author when using a service API key.
+
+    ``sync_comment_to_ayon`` normally passes a callable that performs comment
+    ``upload_project_file`` and ``create_activity`` together. Deletes and
+    ``get_activities`` stay outside this wrapper (service identity).
+    """
+    _run_ayon_as_kitsu_person_when_service(
+        processor, project_name, person, email_cache, fn, acl_log_label="Comment sync",
+    )
+
+
+def _web_ui_base_url_for_review_version_link(processor: "KitsuProcessor") -> str:
+    block = _content_sync_settings_block(processor)
+    raw = block.get("web_ui_base_url")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip().rstrip("/")
+    try:
+        fn = getattr(ayon_api, "get_base_url", None)
+        base = (fn() or "").strip().rstrip("/") if callable(fn) else ""
+    except Exception:
+        base = ""
+    if base.endswith("/api"):
+        base = base[: -len("/api")].rstrip("/")
+    return base
+
+
+def _folder_path_for_ayon_products_uri(folder: dict) -> str:
+    if not isinstance(folder, dict):
+        return ""
+    p = folder.get("path")
+    if isinstance(p, str) and p.strip():
+        return p.strip().lstrip("/")
+    return ""
+
+
+def _kitsu_task_type_name_for_review_product(kitsu_task: dict) -> str:
+    tt = kitsu_task.get("task_type") if isinstance(kitsu_task, dict) else None
+    if isinstance(tt, dict):
+        n = (tt.get("name") or "").strip()
+        if n:
+            return n
+    raw = kitsu_task.get("task_type_name") if isinstance(kitsu_task, dict) else None
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return "unknown"
+
+
+def _revision_from_comment_for_review_link(comment: dict) -> int | None:
+    rows = _normalize_kitsu_preview_entries(comment.get("previews") or [])
+    if rows:
+        sorted_prev = sorted(rows, key=lambda row: int(row.get("position") or 0))
+        for row in sorted_prev:
+            rev_raw = row.get("revision")
+            if rev_raw is None or rev_raw == "" or rev_raw == "?":
+                continue
+            try:
+                r = int(rev_raw)
+            except (TypeError, ValueError):
+                continue
+            if r > 0:
+                return r
+    text = comment.get("text") or ""
+    if isinstance(text, str):
+        parsed = browser_urls.parse_kitsu_publish_comment_table_version(text)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _comment_body_has_version_markdown_link(body: str, version_num: int) -> bool:
+    return bool(re.search(rf"\[Version\s*{version_num}\]\(", body or ""))
+
+
+def _maybe_append_review_version_markdown_link(
+    processor: "KitsuProcessor",
+    project_name: str,
+    kitsu_task_id: str,
+    comment: dict,
+    body: str,
+) -> str:
+    block = _content_sync_settings_block(processor)
+    if block.get("review_version_link_enabled") is False:
+        return body
+    if not isinstance(body, str):
+        return body
+    rev = _revision_from_comment_for_review_link(comment)
+    if not rev or rev < 1:
+        return body
+
+    web_base = _web_ui_base_url_for_review_version_link(processor)
+    if not web_base:
+        log.debug(
+            "[content_sync] skip review version link: empty web UI base "
+            "(kitsu_comment_id=%s)",
+            str(comment.get("id", ""))[:8],
+        )
+        return body
+
+    if _comment_body_has_version_markdown_link(body, rev):
+        return body
+
+    try:
+        kitsu_task = gazu.task.get_task(kitsu_task_id)
+    except Exception as exc:
+        log.debug(
+            "[content_sync] get_task for review version link kitsu=%s: %s",
+            (kitsu_task_id or "")[:8],
+            exc,
+        )
+        return body
+    if not isinstance(kitsu_task, dict):
+        return body
+
+    ayon_task = _ayon_task_by_kitsu_id(project_name, kitsu_task_id)
+    if not ayon_task:
+        return body
+    folder_id = _task_folder_id(ayon_task)
+    if not folder_id:
+        return body
+
+    folder: dict | None = None
+    gfb = getattr(ayon_api, "get_folder_by_id", None)
+    if callable(gfb):
+        try:
+            folder = gfb(project_name, folder_id)
+        except Exception:
+            folder = None
+    if not folder or not isinstance(folder, dict):
+        return body
+
+    folder_path = _folder_path_for_ayon_products_uri(folder)
+    if not folder_path:
+        log.debug(
+            "[content_sync] skip review version link: folder has no path "
+            "(folder_id=%s)",
+            str(folder_id)[:8],
+        )
+        return body
+
+    tt_name = _kitsu_task_type_name_for_review_product(kitsu_task)
+    product_name = f"{tt_name.lower()}KitsuReview"
+
+    product_id: str | None = None
+    try:
+        for prod in ayon_api.get_products(project_name, folder_ids=[str(folder_id)]):
+            if not isinstance(prod, dict):
+                continue
+            pt = prod.get("productType") or prod.get("product_type")
+            if str(pt or "").lower() != "review":
+                continue
+            if prod.get("name") == product_name:
+                pid = prod.get("id")
+                if pid:
+                    product_id = str(pid)
+                break
+    except Exception as exc:
+        log.debug("[content_sync] get_products for review version link: %s", exc)
+        return body
+
+    if not product_id:
+        log.debug(
+            "[content_sync] skip review version link: no review product %r "
+            "(kitsu_task_id=%s revision=%s)",
+            product_name,
+            (kitsu_task_id or "")[:8],
+            rev,
+        )
+        return body
+
+    version_id = _find_review_version_id_for_revision(
+        project_name, product_id, rev,
+    )
+    if not version_id:
+        log.debug(
+            "[content_sync] skip review version link: no version entity "
+            "revision=%s product=%s",
+            rev,
+            product_name,
+        )
+        return body
+
+    entity_uri = browser_urls.ayon_entity_uri_product_version(
+        project_name,
+        folder_path,
+        product_name=product_name,
+        version=rev,
+    )
+    href = browser_urls.ayon_browser_url_products_with_uri(
+        web_base, project_name, entity_uri,
+    )
+    if not href:
+        return body
+    if href in body:
+        return body
+
+    suffix_line = f"[Version {rev}]({href})"
+    proposed = body.rstrip() + "\n\n" + suffix_line + "\n"
+    if len(proposed) > _MAX_AYON_ACTIVITY_BODY_CHARS * 4:
+        log.debug(
+            "[content_sync] skip review version link: body too large after append",
+        )
+        return body
+    return proposed
+
+
+def _build_comment_body(
+    comment: dict,
+    persons: dict[str, dict],
+    statuses: dict[str, str],
+    processor: "KitsuProcessor",
+    *,
+    suppress_attribution_header: bool = False,
+) -> str:
     person = persons.get(comment.get("person_id", ""), {})
     if not isinstance(person, dict):
         person = {}
     author = person.get("full_name", "Unknown")
     status_name = statuses.get(comment.get("task_status_id", ""), "")
 
-    parts = [f"**[{author}]**"]
-    if status_name:
-        parts[0] += f" -- _{status_name}_"
-    parts.append("")
+    parts: list[str] = []
+    if not suppress_attribution_header:
+        header = f"**[{author}]**"
+        if status_name:
+            header += f" -- _{status_name}_"
+        parts.append(header)
+        parts.append("")
 
     text = comment.get("text") or ""
     if text:
@@ -1214,7 +2196,7 @@ def _build_comment_body(comment: dict, persons: dict[str, dict], statuses: dict[
                 parts.append(f"- [ ] {item.strip()}")
 
     preview_rows = _normalize_kitsu_preview_entries(comment.get("previews") or [])
-    if preview_rows:
+    if _should_append_kitsu_preview_manifest_to_comment_body(processor, preview_rows):
         sorted_prev = sorted(
             preview_rows, key=lambda row: row.get("position", 0)
         )
@@ -1234,8 +2216,26 @@ def sync_comment_to_ayon(
     comment_id: str,
     task_id: str,
     project_id: str,
+    *,
+    persons_by_id: dict[str, dict] | None = None,
+    statuses_by_id: dict[str, str] | None = None,
+    log_progress: bool = False,
 ):
-    """Sync a single Kitsu comment to AYON as one or more comment activities (multipart)."""
+    """Sync a single Kitsu comment to AYON as one or more comment activities (multipart).
+
+    When ``persons_by_id`` / ``statuses_by_id`` are provided (e.g. fullsync task loop),
+    Kitsu roster calls are skipped for that invocation.
+
+    When ``log_progress`` is True (repair driver only), emit INFO lines around slow
+    steps (Kitsu attachment downloads, AYON uploads, activity delete/create).
+
+    Kitsu ``attachment_files`` become AYON activity file attachments (uploaded
+    under ``as_username`` when impersonation applies, same as ``create_activity``).
+    Kitsu ``previews`` do not imply AYON reviewables here (reviewables use preview sync).
+    A markdown preview manifest is omitted unless metadata is informative or
+    ``append_kitsu_preview_manifest`` is true; comments that would only carry
+    noise have their matching AYON activities removed and none created.
+    """
     project_name = processor.get_paired_ayon_project(project_id)
     if not project_name:
         return
@@ -1245,11 +2245,12 @@ def sync_comment_to_ayon(
     try:
         comment = gazu.task.get_comment(comment_id)
     except Exception as exc:
-        log.error("Failed to get comment %s: %s", comment_id, exc)
+        cs_log.cs_log(logging.ERROR, "Failed to get comment %s: %s", comment_id, exc)
         return
 
     if not isinstance(comment, dict):
-        log.warning(
+        cs_log.cs_log(
+            logging.WARNING,
             "get_comment returned %s for %s; expected dict",
             type(comment).__name__,
             comment_id[:8],
@@ -1262,107 +2263,264 @@ def sync_comment_to_ayon(
         return
     ayon_task_id = ayon_task["id"]
 
-    persons_raw = gazu.person.all_persons()
-    persons = {p["id"]: p for p in persons_raw}
-    statuses_raw = gazu.task.all_task_statuses()
-    statuses = {s["id"]: s.get("name", "") for s in statuses_raw}
+    if persons_by_id is None:
+        persons_raw = gazu.person.all_persons()
+        persons = {p["id"]: p for p in persons_raw}
+    else:
+        persons = persons_by_id
+    if statuses_by_id is None:
+        statuses_raw = gazu.task.all_task_statuses()
+        statuses = {s["id"]: s.get("name", "") for s in statuses_raw}
+    else:
+        statuses = statuses_by_id
 
-    body = _build_comment_body(comment, persons, statuses)
+    suppress_header = impersonate_comment_authors_enabled(processor)
     person = persons.get(comment.get("person_id", ""), {})
     if not isinstance(person, dict):
         person = {}
     author_name = person.get("full_name", "Unknown")
     status_name = statuses.get(comment.get("task_status_id", ""), "")
 
-    file_ids: list[str] = []
-    attachments = comment.get("attachment_files") or []
-    for att in attachments:
-        if not isinstance(att, dict):
-            log.debug("Skipping non-dict attachment on comment %s", comment_id[:8])
-            continue
+    email_cache: dict[str, str] = {}
+
+    body_local = _build_comment_body(
+        comment,
+        persons,
+        statuses,
+        processor,
+        suppress_attribution_header=suppress_header,
+    )
+
+    preview_rows_norm = _normalize_kitsu_preview_entries(comment.get("previews") or [])
+    would_append_manifest = _should_append_kitsu_preview_manifest_to_comment_body(
+        processor, preview_rows_norm,
+    )
+    attachment_dicts = [
+        a
+        for a in (comment.get("attachment_files") or [])
+        if isinstance(a, dict)
+    ]
+    will_try_sidecars = (
+        attach_comment_preview_json_sidecars_enabled(processor)
+        and bool(preview_rows_norm)
+    )
+    noise_only_skip_activity = (
+        not (comment.get("text") or "").strip()
+        and not _comment_has_nonempty_checklist(comment)
+        and not attachment_dicts
+        and not will_try_sidecars
+        and not would_append_manifest
+    )
+    if noise_only_skip_activity:
+        existing_noise = list(
+            ayon_api.get_activities(
+                project_name,
+                entity_ids=[ayon_task_id],
+                activity_types=["comment"],
+            ),
+        )
+        _delete_all_activities_for_kitsu_comment(
+            project_name,
+            ayon_task_id,
+            comment_id,
+            activities=existing_noise,
+        )
+        maybe_sync_checklist_subtasks_from_kitsu_comment(
+            processor, task_id, comment_id, project_id,
+        )
+        log.debug(
+            "[content_sync] skip comment activity: no text/checklist/attachments "
+            "and no informative Kitsu preview manifest (kitsu_comment_id=%s)",
+            comment_id[:8],
+        )
+        return
+
+    if log_progress:
+        log.info(
+            "[repair_comments] comment %s task=%s attachments=%s preview_rows=%s "
+            "sidecar_json=%s",
+            comment_id[:8],
+            (task_id or "")[:8],
+            len(attachment_dicts),
+            len(preview_rows_norm),
+            will_try_sidecars,
+        )
+
+    if log_progress:
+        log.info(
+            "[repair_comments] comment %s resolving optional review-version link …",
+            comment_id[:8],
+        )
+    body_local = _maybe_append_review_version_markdown_link(
+        processor, project_name, task_id, comment, body_local,
+    )
+
+    attachment_jobs: list[tuple[str, str, dict[str, Any]]] = []
+    for att in attachment_dicts:
         att_name = att.get("name", att["id"])
-        with tempfile.NamedTemporaryFile(suffix=f".{att.get('extension', 'bin')}", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            suffix=f".{att.get('extension', 'bin')}", delete=False,
+        ) as tmp:
             tmp_path = tmp.name
         try:
+            if log_progress:
+                log.info(
+                    "[repair_comments] comment %s downloading Kitsu attachment id=%s "
+                    "name=%r",
+                    comment_id[:8],
+                    att.get("id"),
+                    att_name,
+                )
             gazu.files.download_attachment_file(att, tmp_path)
-            resp = ayon_api.upload_project_file(
-                project_name, tmp_path, filename=att_name,
-            )
-            resp_data = resp.json() if hasattr(resp, "json") else {}
-            fid = resp_data.get("id", "")
-            if fid:
-                file_ids.append(fid)
+            attachment_jobs.append((tmp_path, str(att_name), att))
         except Exception as exc:
-            log.warning("Attachment upload failed %s: %s", att.get("id"), exc)
-        finally:
+            cs_log.cs_log(
+                logging.WARNING,
+                "Attachment download failed %s: %s",
+                att.get("id"),
+                exc,
+            )
             Path(tmp_path).unlink(missing_ok=True)
 
-    uploaded_preview_sidecars = False
-    preview_rows = _normalize_kitsu_preview_entries(comment.get("previews") or [])
-    for pv in sorted(
-        preview_rows,
-        key=lambda x: int(x.get("position") or 0),
-    ):
-        pid = pv["id"]
-        pos = int(pv.get("position") or 0)
-        base = f"{pos:02d}_{pid}"
-        try:
-            pfile = gazu.files.get_preview_file(pid)
-        except Exception as exc:
-            log.warning("get_preview_file %s for comment sidecar: %s", pid, exc)
-            continue
-        if not pfile:
-            continue
-        ann_payload = {
-            "preview_file_id": pid,
-            "annotations": pfile.get("annotations")
-            if pfile.get("annotations") is not None
-            else [],
-        }
-        for fname, payload in (
-            (f"{base}_annotations.json", ann_payload),
-            (f"{base}_preview_file.json", pfile),
+    sidecar_jobs: list[tuple[str, str]] = []
+    if will_try_sidecars:
+        if log_progress:
+            log.info(
+                "[repair_comments] comment %s staging %s preview JSON sidecar(s) …",
+                comment_id[:8],
+                len(preview_rows_norm),
+            )
+        for pv in sorted(
+            preview_rows_norm,
+            key=lambda x: int(x.get("position") or 0),
         ):
-            pj_tmp: str | None = None
+            pid = pv["id"]
+            pos = int(pv.get("position") or 0)
+            base = f"{pos:02d}_{pid}"
             try:
-                with tempfile.NamedTemporaryFile(
-                    mode="w", suffix=".json", delete=False, encoding="utf-8",
-                ) as pj_f:
-                    json.dump(payload, pj_f, default=str)
-                    pj_tmp = pj_f.name
+                pfile = gazu.files.get_preview_file(pid)
+            except Exception as exc:
+                cs_log.cs_log(
+                    logging.WARNING,
+                    "get_preview_file %s for comment sidecar: %s",
+                    pid,
+                    exc,
+                )
+                continue
+            if not pfile:
+                continue
+            ann_payload = {
+                "preview_file_id": pid,
+                "annotations": pfile.get("annotations")
+                if pfile.get("annotations") is not None
+                else [],
+            }
+            for fname, payload in (
+                (f"{base}_annotations.json", ann_payload),
+                (f"{base}_preview_file.json", pfile),
+            ):
+                pj_tmp: str | None = None
+                try:
+                    with tempfile.NamedTemporaryFile(
+                        mode="w", suffix=".json", delete=False, encoding="utf-8",
+                    ) as pj_f:
+                        json.dump(payload, pj_f, default=str)
+                        pj_tmp = pj_f.name
+                    sidecar_jobs.append((pj_tmp, fname))
+                except Exception as exc:
+                    cs_log.cs_log(
+                        logging.WARNING,
+                        "Comment preview sidecar staging failed %s: %s",
+                        fname,
+                        exc,
+                    )
+                    if pj_tmp:
+                        Path(pj_tmp).unlink(missing_ok=True)
+
+    upload_state: dict[str, Any] = {
+        "file_ids": [],
+        "body": body_local,
+        "uploaded_sidecars": False,
+    }
+
+    def _upload_comment_files_to_ayon() -> None:
+        fids: list[str] = list(upload_state["file_ids"])
+        for tmp_path, att_name, att in attachment_jobs:
+            try:
+                resp = ayon_api.upload_project_file(
+                    project_name, tmp_path, filename=att_name,
+                )
+                resp_data = resp.json() if hasattr(resp, "json") else {}
+                fid = resp_data.get("id", "")
+                if fid:
+                    fids.append(str(fid))
+            except Exception as exc:
+                cs_log.cs_log(
+                    logging.WARNING,
+                    "Attachment upload failed %s: %s",
+                    att.get("id"),
+                    exc,
+                )
+            finally:
+                Path(tmp_path).unlink(missing_ok=True)
+        for pj_tmp, fname in sidecar_jobs:
+            try:
                 resp = ayon_api.upload_project_file(
                     project_name, pj_tmp, filename=fname,
                 )
                 resp_data = resp.json() if hasattr(resp, "json") else {}
                 fid = resp_data.get("id", "")
                 if fid:
-                    file_ids.append(fid)
-                    uploaded_preview_sidecars = True
+                    fids.append(str(fid))
+                    upload_state["uploaded_sidecars"] = True
             except Exception as exc:
-                log.warning("Comment preview sidecar upload failed %s: %s", fname, exc)
+                cs_log.cs_log(
+                    logging.WARNING,
+                    "Comment preview sidecar upload failed %s: %s",
+                    fname,
+                    exc,
+                )
             finally:
-                if pj_tmp:
-                    Path(pj_tmp).unlink(missing_ok=True)
+                Path(pj_tmp).unlink(missing_ok=True)
+        upload_state["file_ids"] = fids
+        if upload_state["uploaded_sidecars"]:
+            upload_state["body"] = (
+                str(upload_state["body"]).rstrip()
+                + "\n\n_Kitsu annotation and preview metadata JSON files are attached._\n"
+            )
 
-    if uploaded_preview_sidecars:
-        body = (
-            body.rstrip()
-            + "\n\n_Kitsu annotation and preview metadata JSON files are attached._\n"
+    if log_progress and (attachment_jobs or sidecar_jobs):
+        log.info(
+            "[repair_comments] comment %s uploading to AYON: %s attachment(s) "
+            "+ %s sidecar(s) …",
+            comment_id[:8],
+            len(attachment_jobs),
+            len(sidecar_jobs),
         )
+    _run_comment_sync_mutations(
+        processor, project_name, person, email_cache, _upload_comment_files_to_ayon,
+    )
 
-    full_body = body
+    file_ids: list[str] = list(upload_state["file_ids"])
+    full_body = str(upload_state["body"])
     body_sha256 = _sha256_utf8(full_body)
     part_bodies = _split_comment_body_for_ayon_activities(full_body)
     part_count = len(part_bodies)
 
+    if log_progress:
+        log.info(
+            "[repair_comments] comment %s checking AYON activities (parts=%s) …",
+            comment_id[:8],
+            part_count,
+        )
     existing = list(ayon_api.get_activities(
         project_name, entity_ids=[ayon_task_id], activity_types=["comment"],
     ))
     matches = _activities_for_kitsu_comment_id(existing, comment_id)
     if _existing_comment_sync_uptodate(matches, part_count, body_sha256, full_body):
         log.debug(
-            "[content_sync] action=skip_duplicate "
-            "kitsu_comment_id=%s parts=%s reason=hash_and_parts",
+            "[content_sync] skip comment sync: AYON task activities already match "
+            "this Kitsu comment body and parts (kitsu_comment_id=%s part_count=%s)",
             comment_id,
             part_count,
         )
@@ -1371,8 +2529,19 @@ def sync_comment_to_ayon(
         )
         return
 
-    _delete_all_activities_for_kitsu_comment(project_name, ayon_task_id, comment_id)
+    _delete_all_activities_for_kitsu_comment(
+        project_name,
+        ayon_task_id,
+        comment_id,
+        activities=existing,
+    )
 
+    if log_progress:
+        log.info(
+            "[repair_comments] comment %s creating %s AYON activity part(s) …",
+            comment_id[:8],
+            part_count,
+        )
     base_data: dict[str, Any] = {
         "kitsuCommentId": comment_id,
         "kitsuAuthor": author_name,
@@ -1382,38 +2551,52 @@ def sync_comment_to_ayon(
         base_data["kitsuStatusChange"] = status_name
     if comment.get("pinned"):
         base_data["kitsuPinned"] = True
+    pe = person.get("email")
+    if isinstance(pe, str) and pe.strip():
+        base_data["kitsuAuthorEmail"] = pe.strip()
 
-    try:
-        for part_index, part_body in enumerate(part_bodies, start=1):
-            data = {
-                **base_data,
-                "kitsuCommentPart": part_index,
-                "kitsuCommentPartCount": part_count,
-            }
-            fids = file_ids if part_index == 1 else None
-            aid = ayon_api.create_activity(
-                project_name,
-                entity_id=ayon_task_id,
-                entity_type="task",
-                activity_type="comment",
-                body=part_body,
-                file_ids=fids if fids else None,
-                timestamp=comment.get("created_at"),
-                data=data,
-            )
-            log.info(
-                "Activity created %s for comment %s part %s/%s",
-                aid,
-                comment_id[:8],
-                part_index,
-                part_count,
-            )
-    except Exception as exc:
-        log.error("Activity creation failed for comment %s: %s", comment_id[:8], exc)
-    finally:
-        maybe_sync_checklist_subtasks_from_kitsu_comment(
-            processor, task_id, comment_id, project_id,
+    def _create_comment_activities() -> None:
+        # Idempotent for ACL retry: impersonation may create part 1 then fail; service
+        # retry must not duplicate parts (outer delete already ran once; this clears partial).
+        _delete_all_activities_for_kitsu_comment(
+            project_name, ayon_task_id, comment_id,
         )
+        try:
+            for part_index, part_body in enumerate(part_bodies, start=1):
+                data = {
+                    **base_data,
+                    "kitsuCommentPart": part_index,
+                    "kitsuCommentPartCount": part_count,
+                }
+                fids = file_ids if part_index == 1 else None
+                aid = ayon_api.create_activity(
+                    project_name,
+                    entity_id=ayon_task_id,
+                    entity_type="task",
+                    activity_type="comment",
+                    body=part_body,
+                    file_ids=fids if fids else None,
+                    timestamp=comment.get("created_at"),
+                    data=data,
+                )
+                prev = _comment_body_preview(comment)
+                cs_log.cs_log(
+                    logging.INFO,
+                    "Activity created %s for comment %s part %s/%s%s",
+                    aid,
+                    comment_id[:8],
+                    part_index,
+                    part_count,
+                    f" preview={prev!r}" if prev else "",
+                )
+        finally:
+            maybe_sync_checklist_subtasks_from_kitsu_comment(
+                processor, task_id, comment_id, project_id,
+            )
+
+    _run_comment_sync_mutations(
+        processor, project_name, person, email_cache, _create_comment_activities,
+    )
 
 
 def delete_comment_from_ayon(
@@ -1447,12 +2630,468 @@ def update_comment_on_ayon(
     project_id: str,
 ):
     """Replace AYON activities for an edited Kitsu comment (multipart-aware)."""
-    sync_comment_to_ayon(processor, comment_id, task_id, project_id)
+    sync_comment_to_ayon(
+        processor,
+        comment_id,
+        task_id,
+        project_id,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Full-project content sync (called from fullsync.py)
 # ---------------------------------------------------------------------------
+
+def _iter_review_products_for_project(project_name: str) -> Iterator[dict[str, Any]]:
+    """Yield review-type products for ``project_name`` (handles ayon_api signature variants)."""
+    gp = ayon_api.get_products
+    attempts = (
+        lambda: gp(project_name, product_types=["review"]),
+        lambda: gp(project_name, product_type="review"),
+    )
+    for attempt in attempts:
+        try:
+            for p in attempt():
+                if isinstance(p, dict):
+                    yield p
+            return
+        except TypeError:
+            continue
+    try:
+        folders = ayon_api.get_folders(project_name)
+    except Exception as exc:  # noqa: BLE001
+        log.error(
+            "[repair_version_authors] get_folders failed project=%s: %s",
+            project_name,
+            exc,
+        )
+        return
+    for folder in folders or []:
+        if not isinstance(folder, dict):
+            continue
+        fid = folder.get("id")
+        if not fid:
+            continue
+        try:
+            prods = gp(project_name, folder_ids=[str(fid)], product_types=["review"])
+        except TypeError:
+            try:
+                prods = gp(project_name, folder_ids=[str(fid)])
+            except Exception:
+                continue
+        for p in prods or []:
+            if not isinstance(p, dict):
+                continue
+            pt = p.get("productType") or p.get("product_type")
+            if str(pt).lower() == "review":
+                yield p
+
+
+def _pick_kitsu_preview_for_version_repair(
+    previews: list[dict[str, Any]],
+    revision: int,
+    kitsu_comment_id: str | None,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for pv in previews:
+        if not isinstance(pv, dict):
+            continue
+        try:
+            rev = int(pv.get("revision") or 0)
+        except (TypeError, ValueError):
+            continue
+        if rev == revision:
+            candidates.append(pv)
+    if not candidates:
+        return None
+    cid = (kitsu_comment_id or "").strip()
+    if cid:
+        for pv in candidates:
+            cc = pv.get("comment_id")
+            if cc is not None and str(cc).strip() == cid:
+                return pv
+    return candidates[0]
+
+
+def _kitsu_person_from_preview_or_comment(
+    kitsu_task_id: str,
+    revision: int,
+    kitsu_comment_id: str | None,
+) -> dict[str, Any]:
+    """Resolve Kitsu person dict for repair using previews for ``task_id`` + ``revision``."""
+    previews: list[dict[str, Any]] = []
+    try:
+        task = gazu.task.get_task(kitsu_task_id)
+    except Exception as exc:
+        log.debug("[repair_version_authors] get_task %s: %s", kitsu_task_id[:8], exc)
+        task = None
+    if isinstance(task, dict):
+        try:
+            raw = gazu.files.get_all_preview_files_for_task(task)
+        except Exception as exc:
+            log.debug(
+                "[repair_version_authors] get_all_preview_files_for_task %s: %s",
+                kitsu_task_id[:8],
+                exc,
+            )
+            raw = None
+        if raw is None:
+            try:
+                resp = gazu.client.get(f"data/tasks/{kitsu_task_id}/previews")
+                raw = resp.json() if hasattr(resp, "json") else resp
+            except Exception as exc:
+                log.debug(
+                    "[repair_version_authors] REST previews %s: %s",
+                    kitsu_task_id[:8],
+                    exc,
+                )
+                raw = []
+        if isinstance(raw, list):
+            previews = [x for x in raw if isinstance(x, dict)]
+    preview = _pick_kitsu_preview_for_version_repair(
+        previews, revision, kitsu_comment_id,
+    )
+    if preview:
+        cid_for_helper = (kitsu_comment_id or "").strip()
+        return _kitsu_person_dict_for_preview_uploader(preview, cid_for_helper)
+    cid = (kitsu_comment_id or "").strip()
+    if not cid:
+        return {}
+    try:
+        comment = gazu.task.get_comment(cid)
+    except Exception as exc:
+        log.debug("[repair_version_authors] get_comment %s: %s", cid[:8], exc)
+        return {}
+    if not isinstance(comment, dict):
+        return {}
+    pid = comment.get("person_id")
+    if isinstance(pid, dict):
+        pid = pid.get("id")
+    if not pid:
+        return {}
+    try:
+        p = gazu.person.get_person(str(pid))
+        return p if isinstance(p, dict) else {}
+    except Exception as exc:
+        log.debug("[repair_version_authors] get_person %s: %s", str(pid)[:8], exc)
+        return {}
+
+
+def repair_review_version_authors_for_paired_projects(
+    processor: "KitsuProcessor",
+    *,
+    ayon_project_name: str | None = None,
+    dry_run: bool = False,
+    skip_no_ayon_login_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, int]:
+    """PATCH review version ``author`` away from processor placeholder using Kitsu breadcrumbs.
+
+    Scans AYON ``review`` products per paired project. For each version whose ``author``
+    matches ``_is_processor_placeholder_version_author``, resolves the Kitsu uploader from
+    ``version.data`` (``kitsuTaskId``, ``kitsuRevision``, ``kitsuCommentId``) and calls
+    ``_ensure_review_version_author_with_impersonation`` (same path as live preview sync).
+
+    When ``dry_run`` is True, logs a structured diagnostic per candidate version and does
+    not mutate AYON.
+
+    If ``skip_no_ayon_login_rows`` is a list, each version skipped because the Kitsu
+    uploader could not be mapped to an AYON login (email lookup + optional full-name
+    index) is appended as a plain dict for reporting.
+    """
+    supports_author = ayon_update_version_supports_author_parameter()
+    stats: dict[str, int] = {
+        "projects": 0,
+        "versions_scanned": 0,
+        "placeholder_candidates": 0,
+        "versions_updated": 0,
+        "skipped_not_placeholder": 0,
+        "skipped_no_breadcrumbs": 0,
+        "skipped_no_kitsu_person": 0,
+        "skipped_no_ayon_login": 0,
+        "skipped_no_author_api": 0,
+        "dry_run_would_update": 0,
+        "errors": 0,
+    }
+    for pair in processor.pairing_list:
+        project_id = pair.get("kitsuProjectId")
+        project_name = pair.get("ayonProjectName")
+        if not project_id or not project_name:
+            continue
+        if ayon_project_name and project_name != ayon_project_name:
+            continue
+        paired = processor.get_paired_ayon_project(project_id)
+        if not paired or paired != project_name:
+            continue
+        stats["projects"] += 1
+        processor_utils.set_kitsu_host(processor.kitsu_server_url)
+        email_cache: dict[str, str] = {}
+        fn_index = _full_name_login_index_if_enabled(processor)
+        try:
+            products = list(_iter_review_products_for_project(project_name))
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "[repair_version_authors] list review products failed project=%s: %s",
+                project_name,
+                exc,
+            )
+            stats["errors"] += 1
+            continue
+        product_ids = [str(p["id"]) for p in products if p.get("id")]
+        if not product_ids:
+            log.info("[repair_version_authors] no review products project=%s", project_name)
+            continue
+        try:
+            versions = list(
+                ayon_api.get_versions(project_name, product_ids=product_ids)
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error(
+                "[repair_version_authors] get_versions failed project=%s: %s",
+                project_name,
+                exc,
+            )
+            stats["errors"] += 1
+            continue
+
+        for ver in versions:
+            if not isinstance(ver, dict) or not ver.get("id"):
+                continue
+            stats["versions_scanned"] += 1
+            version_id = str(ver["id"])
+            author_val = ver.get("author")
+            placeholder = _is_processor_placeholder_version_author(author_val)
+            if not placeholder:
+                stats["skipped_not_placeholder"] += 1
+                continue
+            stats["placeholder_candidates"] += 1
+            data = ver.get("data") if isinstance(ver.get("data"), dict) else {}
+            kitsu_task_id = str(data.get("kitsuTaskId") or "").strip()
+            kitsu_comment_id = data.get("kitsuCommentId")
+            kitsu_comment_str = (
+                str(kitsu_comment_id).strip()
+                if kitsu_comment_id not in (None, "")
+                else ""
+            )
+            rev_raw = data.get("kitsuRevision")
+            if rev_raw is None:
+                rev_raw = ver.get("version")
+            try:
+                revision = int(rev_raw) if rev_raw is not None else 0
+            except (TypeError, ValueError):
+                revision = 0
+            if not kitsu_task_id or revision <= 0:
+                stats["skipped_no_breadcrumbs"] += 1
+                log.info(
+                    "[repair_version_authors] diagnostic version_id=%s placeholder=%s "
+                    "kitsu_person=no breadcrumbs_missing task=%r revision=%s "
+                    "ayon_login=no author_api=%s",
+                    version_id[:8],
+                    placeholder,
+                    kitsu_task_id or None,
+                    revision,
+                    supports_author,
+                )
+                continue
+
+            kitsu_person = _kitsu_person_from_preview_or_comment(
+                kitsu_task_id,
+                revision,
+                kitsu_comment_str or None,
+            )
+            raw_pe = kitsu_person.get("email") if isinstance(kitsu_person.get("email"), str) else None
+            pe = raw_pe.strip() if raw_pe and raw_pe.strip() else None
+            raw_kfn = (
+                kitsu_person.get("full_name")
+                if isinstance(kitsu_person.get("full_name"), str)
+                else None
+            )
+            kitsu_fn = raw_kfn.strip() if raw_kfn and raw_kfn.strip() else None
+            ayon_login = _resolve_ayon_login_for_comment_sync(
+                pe,
+                project_name,
+                email_cache,
+                kitsu_full_name=kitsu_fn,
+                full_name_index=fn_index,
+            )
+            has_person = bool(kitsu_person)
+            log.info(
+                "[repair_version_authors] diagnostic version_id=%s placeholder=%s "
+                "kitsu_person=%s email=%s ayon_login=%s author_api=%s dry_run=%s",
+                version_id[:8],
+                placeholder,
+                has_person,
+                bool(pe),
+                bool(ayon_login),
+                supports_author,
+                dry_run,
+            )
+            if not kitsu_person:
+                stats["skipped_no_kitsu_person"] += 1
+                continue
+            if not ayon_login:
+                stats["skipped_no_ayon_login"] += 1
+                if skip_no_ayon_login_rows is not None:
+                    kpid = kitsu_person.get("id")
+                    skip_no_ayon_login_rows.append(
+                        {
+                            "ayon_project_name": project_name,
+                            "version_id": version_id,
+                            "version_subset": ver.get("subset"),
+                            "product_id": ver.get("productId")
+                            or ver.get("product_id"),
+                            "kitsu_task_id": kitsu_task_id,
+                            "kitsu_revision": revision,
+                            "kitsu_comment_id": kitsu_comment_str or None,
+                            "kitsu_person_id": str(kpid) if kpid else None,
+                            "kitsu_email": pe,
+                            "kitsu_full_name": kitsu_fn,
+                            "email_lookup_key": pe.lower() if pe else None,
+                            "full_name_lookup_key": (
+                                _normalize_kitsu_full_name_key(kitsu_fn)
+                                if kitsu_fn
+                                else None
+                            ),
+                            "full_name_index_enabled": fn_index is not None,
+                        }
+                    )
+                continue
+            if not supports_author:
+                stats["skipped_no_author_api"] += 1
+                continue
+            if dry_run:
+                stats["dry_run_would_update"] += 1
+                continue
+            ver_snapshot = ver
+            try:
+                _ensure_review_version_author_with_impersonation(
+                    processor,
+                    project_name,
+                    version_id,
+                    ver_snapshot,
+                    kitsu_person,
+                    email_cache,
+                    ayon_login,
+                )
+                updated = ayon_api.get_version_by_id(project_name, version_id)
+                if not _is_processor_placeholder_version_author(updated.get("author")):
+                    stats["versions_updated"] += 1
+                else:
+                    log.warning(
+                        "[repair_version_authors] author still placeholder after patch "
+                        "version_id=%s",
+                        version_id[:8],
+                    )
+            except Exception as exc:  # noqa: BLE001
+                log.warning(
+                    "[repair_version_authors] patch failed version_id=%s: %s",
+                    version_id[:8],
+                    exc,
+                )
+                stats["errors"] += 1
+        log.info("[repair_version_authors] finished project=%s", project_name)
+    log.info("[repair_version_authors] summary %s", stats)
+    return stats
+
+
+def repair_kitsu_comment_activities_for_paired_projects(
+    processor: "KitsuProcessor",
+    *,
+    ayon_project_name: str | None = None,
+) -> dict[str, int]:
+    """Re-run ``sync_comment_to_ayon`` for every Kitsu task comment on paired projects.
+
+    Use after changing comment body rules to refresh or remove noise-only activities.
+    Does not run structural fullsync or preview sync.
+    """
+    stats = {"projects": 0, "tasks_scanned": 0, "comments_synced": 0, "errors": 0}
+    for pair in processor.pairing_list:
+        project_id = pair.get("kitsuProjectId")
+        project_name = pair.get("ayonProjectName")
+        if not project_id or not project_name:
+            continue
+        if ayon_project_name and project_name != ayon_project_name:
+            continue
+        paired = processor.get_paired_ayon_project(project_id)
+        if not paired or paired != project_name:
+            continue
+        stats["projects"] += 1
+        processor_utils.set_kitsu_host(processor.kitsu_server_url)
+        try:
+            tasks = gazu.task.all_tasks_for_project(project_id)
+        except Exception as exc:
+            log.error(
+                "[repair_comments] list tasks failed project=%s: %s",
+                project_name,
+                exc,
+            )
+            stats["errors"] += 1
+            continue
+        if not isinstance(tasks, list):
+            tasks = list(tasks) if tasks else []
+        log.info(
+            "[repair_comments] scanning project=%s task_count=%s",
+            project_name,
+            len(tasks),
+        )
+
+        persons_raw = gazu.person.all_persons()
+        persons_by_id = {p["id"]: p for p in persons_raw}
+        statuses_raw = gazu.task.all_task_statuses()
+        statuses_by_id = {s["id"]: s.get("name", "") for s in statuses_raw}
+
+        with _content_sync_ayon_lookup_cache_scope(project_name):
+            for task in tasks:
+                if not isinstance(task, dict):
+                    continue
+                task_id = task.get("id")
+                if not task_id:
+                    continue
+                stats["tasks_scanned"] += 1
+                try:
+                    comments = gazu.task.all_comments_for_task(task)
+                    if not isinstance(comments, list):
+                        comments = list(comments) if comments else []
+                except Exception as exc:
+                    log.warning(
+                        "[repair_comments] comments for task %s: %s",
+                        task_id,
+                        exc,
+                    )
+                    stats["errors"] += 1
+                    continue
+                log.info(
+                    "[repair_comments] task %s/%s kitsu_task_id=%s comments=%s",
+                    stats["tasks_scanned"],
+                    len(tasks),
+                    str(task_id),
+                    len(comments),
+                )
+                for comment in comments:
+                    if not isinstance(comment, dict) or not comment.get("id"):
+                        continue
+                    cid = str(comment["id"])
+                    try:
+                        sync_comment_to_ayon(
+                            processor,
+                            cid,
+                            str(task_id),
+                            str(task.get("project_id") or project_id),
+                            persons_by_id=persons_by_id,
+                            statuses_by_id=statuses_by_id,
+                            log_progress=True,
+                        )
+                        stats["comments_synced"] += 1
+                    except Exception as exc:
+                        log.warning(
+                            "[repair_comments] sync comment %s: %s",
+                            cid[:8],
+                            exc,
+                        )
+                        stats["errors"] += 1
+        log.info("[repair_comments] finished project=%s", project_name)
+    log.info("[repair_comments] summary %s", stats)
+    return stats
+
 
 def sync_all_content_for_project(
     processor: "KitsuProcessor",
@@ -1479,20 +3118,28 @@ def sync_all_content_for_project(
     do_comments = settings.get("sync_comments", True)
     do_previews = settings.get("sync_previews", True)
 
-    if do_thumbnails:
-        log.info("[content_sync] Syncing entity thumbnails...")
-        _sync_all_thumbnails(processor, kitsu_project_id, project_name)
+    with _content_sync_ayon_lookup_cache_scope(project_name):
+        if do_thumbnails:
+            log.info("[content_sync] Syncing entity thumbnails...")
+            _sync_all_thumbnails(processor, kitsu_project_id, project_name)
 
-    if do_comments or do_previews:
-        log.info("[content_sync] Syncing task content...")
-        _sync_all_task_content(processor, kitsu_project_id, project_name,
-                               do_comments=do_comments, do_previews=do_previews)
+        if do_comments or do_previews:
+            log.info("[content_sync] Syncing task content...")
+            _sync_all_task_content(
+                processor,
+                kitsu_project_id,
+                project_name,
+                do_comments=do_comments,
+                do_previews=do_previews,
+            )
 
-    if do_previews:
-        log.info("[content_sync] Syncing concept main previews (VizDev reviewables)...")
-        _sync_concept_main_previews_for_project(
-            processor, kitsu_project_id, project_name,
-        )
+        if do_previews:
+            log.info(
+                "[content_sync] Syncing concept main previews (VizDev reviewables)...",
+            )
+            _sync_concept_main_previews_for_project(
+                processor, kitsu_project_id, project_name,
+            )
 
     log.info("[content_sync] Content sync complete for project %s", project_name)
 
@@ -1597,7 +3244,10 @@ def _sync_all_thumbnails(
             continue
         for entity in entities:
             try:
-                sync_thumbnail_to_ayon(processor, entity, project_name)
+                sync_thumbnail_to_ayon(
+                    processor, entity, project_name,
+                    kitsu_project_id=kitsu_project_id,
+                )
             except Exception as exc:
                 log.warning("Thumbnail sync error for %s: %s", entity.get("id"), exc)
 
@@ -1637,7 +3287,10 @@ def _sync_all_thumbnails(
                 row = dict(entity)
                 row["id"] = leid
                 try:
-                    sync_thumbnail_to_ayon(processor, row, project_name)
+                    sync_thumbnail_to_ayon(
+                        processor, row, project_name,
+                        kitsu_project_id=kitsu_project_id,
+                    )
                 except Exception as exc:
                     log.warning(
                         "Thumbnail sync error for concept link %s: %s",
@@ -1650,7 +3303,10 @@ def _sync_all_thumbnails(
             row = dict(entity)
             row["id"] = anchor_id
             try:
-                sync_thumbnail_to_ayon(processor, row, project_name)
+                sync_thumbnail_to_ayon(
+                    processor, row, project_name,
+                    kitsu_project_id=kitsu_project_id,
+                )
             except Exception as exc:
                 log.warning(
                     "Thumbnail sync error for unlinked concept -> project %s: %s",
@@ -1659,7 +3315,10 @@ def _sync_all_thumbnails(
                 )
         else:
             try:
-                sync_thumbnail_to_ayon(processor, entity, project_name)
+                sync_thumbnail_to_ayon(
+                    processor, entity, project_name,
+                    kitsu_project_id=kitsu_project_id,
+                )
             except Exception as exc:
                 log.warning(
                     "Thumbnail sync error for concept %s: %s",
@@ -1770,52 +3429,111 @@ def _sync_all_task_content(
         log.error("Failed to fetch tasks for content sync: %s", exc)
         return
 
-    persons_raw = gazu.person.all_persons()
-    persons = {p["id"]: p for p in persons_raw}
-    statuses_raw = gazu.task.all_task_statuses()
-    statuses = {s["id"]: s.get("name", "") for s in statuses_raw}
+    persons_by_id: dict[str, dict] | None = None
+    statuses_by_id: dict[str, str] | None = None
+    if do_comments:
+        persons_raw = gazu.person.all_persons()
+        persons_by_id = {p["id"]: p for p in persons_raw}
+        statuses_raw = gazu.task.all_task_statuses()
+        statuses_by_id = {s["id"]: s.get("name", "") for s in statuses_raw}
+
+    task_types = processor_utils.get_task_types(kitsu_project_id)
+    entity_cache: dict[str, dict | None] = {}
 
     for i, task in enumerate(tasks, 1):
         task_id = task["id"]
-        if i % 20 == 0:
-            log.info("[content_sync] Processing task %d/%d", i, len(tasks))
+        task_row = _enrich_kitsu_task_type_name(dict(task), task_types)
+        ayon_task_row = _ayon_task_by_kitsu_id(project_name, str(task_id))
+        sec = cs_log.build_task_log_section(
+            kitsu_api_server_url=processor.kitsu_server_url,
+            kitsu_project_id=kitsu_project_id,
+            project_name=project_name,
+            kitsu_task=task_row,
+            ayon_task=ayon_task_row,
+            entity_cache=entity_cache,
+        )
+        sec_tok = cs_log.section_set(sec)
+        try:
+            if i % 20 == 0:
+                cs_log.cs_log(
+                    logging.INFO,
+                    "[content_sync] Processing task %d/%d",
+                    i,
+                    len(tasks),
+                )
 
-        if do_comments:
-            try:
-                comments = gazu.task.all_comments_for_task(task)
-                if not isinstance(comments, list):
-                    comments = list(comments) if comments else []
-                comments.reverse()
-                for comment in comments:
-                    try:
-                        sync_comment_to_ayon(
-                            processor, comment["id"], task_id, task.get("project_id", ""),
-                        )
-                    except Exception as exc:
-                        cid = (
-                            comment.get("id", "?")
-                            if isinstance(comment, dict)
-                            else "?"
-                        )
-                        log.warning(
-                            "Comment sync error %s: %s",
-                            str(cid)[:8],
-                            exc,
-                        )
-            except Exception as exc:
-                log.warning("Failed to get comments for task %s: %s", task_id, exc)
+            if do_comments:
+                try:
+                    comments = gazu.task.all_comments_for_task(task_row)
+                    if not isinstance(comments, list):
+                        comments = list(comments) if comments else []
+                    comments.reverse()
+                    n_comments = len(comments)
+                    for j, comment in enumerate(comments, 1):
+                        if j == 1 or j % 25 == 0 or j == n_comments:
+                            cs_log.cs_log(
+                                logging.INFO,
+                                "[content_sync] comments progress %d/%d: %d/%d",
+                                i,
+                                len(tasks),
+                                j,
+                                n_comments,
+                            )
+                        try:
+                            sync_comment_to_ayon(
+                                processor,
+                                comment["id"],
+                                task_id,
+                                task_row.get("project_id", ""),
+                                persons_by_id=persons_by_id,
+                                statuses_by_id=statuses_by_id,
+                            )
+                        except Exception as exc:
+                            cid = (
+                                comment.get("id", "?")
+                                if isinstance(comment, dict)
+                                else "?"
+                            )
+                            cs_log.cs_log(
+                                logging.WARNING,
+                                "Comment sync error %s: %s",
+                                str(cid)[:8],
+                                exc,
+                            )
+                except Exception as exc:
+                    cs_log.cs_log(
+                        logging.WARNING,
+                        "Failed to get comments for task %s: %s",
+                        task_id,
+                        exc,
+                    )
 
-        if do_previews:
-            try:
-                previews = gazu.files.get_all_preview_files_for_task(task)
-                if not isinstance(previews, list):
-                    previews = list(previews) if previews else []
-                for preview in previews:
-                    try:
-                        sync_preview_to_ayon(
-                            processor, preview["id"], task_id, task.get("project_id", ""),
-                        )
-                    except Exception as exc:
-                        log.warning("Preview sync error %s: %s", preview.get("id", "?")[:8], exc)
-            except Exception as exc:
-                log.warning("Failed to get previews for task %s: %s", task_id, exc)
+            if do_previews:
+                try:
+                    previews = gazu.files.get_all_preview_files_for_task(task_row)
+                    if not isinstance(previews, list):
+                        previews = list(previews) if previews else []
+                    for preview in previews:
+                        try:
+                            sync_preview_to_ayon(
+                                processor,
+                                preview["id"],
+                                task_id,
+                                task_row.get("project_id", ""),
+                            )
+                        except Exception as exc:
+                            cs_log.cs_log(
+                                logging.WARNING,
+                                "Preview sync error %s: %s",
+                                preview.get("id", "?")[:8],
+                                exc,
+                            )
+                except Exception as exc:
+                    cs_log.cs_log(
+                        logging.WARNING,
+                        "Failed to get previews for task %s: %s",
+                        task_id,
+                        exc,
+                    )
+        finally:
+            cs_log.section_reset(sec_tok)

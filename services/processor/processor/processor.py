@@ -12,11 +12,13 @@ from . import utils as processor_utils
 from .ayon_event_loop import run_ayon_event_loop
 from .content_sync import (
     delete_comment_from_ayon,
+    log_ayon_version_author_update_capability,
     sync_comment_to_ayon,
     sync_preview_to_ayon,
     update_comment_on_ayon,
 )
 from .fullsync import project_full_sync
+from .kitsu_socket_dispatch import KitsuSocketLaneDispatcher, add_listener_laned
 from .pairing_fallback import (
     pairing_http_error_is_kitsu_login,
     pairing_list_from_processor_session,
@@ -125,6 +127,7 @@ class KitsuProcessor:
             ayon_api.init_service()
             connected = True
             logging.info("Successfully connected to AYON server")
+            log_ayon_version_author_update_capability()
         except Exception as e:
             logging.error(f"Failed to connect to AYON server: {e}")
             log_traceback()
@@ -308,6 +311,7 @@ class KitsuProcessor:
         self.start_listener_threads = start_listener_threads
         self.kitsu_events_url = None
         self.event_client = None
+        self.socket_lane_dispatcher = None
 
         if start_listener_threads:
             # init event client (Socket.IO); not needed for one-shot fullsync drivers.
@@ -328,6 +332,8 @@ class KitsuProcessor:
                     f"Cannot initialize Kitsu event client at {self.kitsu_events_url}. "
                     f"Error: {e}"
                 ) from e
+            self.socket_lane_dispatcher = KitsuSocketLaneDispatcher(self)
+            self.socket_lane_dispatcher.start()
         else:
             logging.info(
                 "Kitsu Socket.IO event client skipped (start_listener_threads=False)"
@@ -394,136 +400,188 @@ class KitsuProcessor:
         """
         try:
             logging.info("Setting up Kitsu event listeners...")
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "project:update",
                 lambda data: update_project(self, data),
+                lane="fast",
             )
 
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "project:delete",
                 lambda data: delete_project(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "asset:new",
                 lambda data: create_or_update_asset(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "asset:update",
                 lambda data: create_or_update_asset(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "asset:delete",
                 lambda data: delete_asset(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "episode:new",
                 lambda data: create_or_update_episode(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "episode:update",
                 lambda data: create_or_update_episode(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "episode:delete",
                 lambda data: delete_episode(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "sequence:new",
                 lambda data: create_or_update_sequence(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "sequence:update",
                 lambda data: create_or_update_sequence(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "sequence:delete",
                 lambda data: delete_sequence(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "shot:new",
                 lambda data: create_or_update_shot(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "shot:update",
                 lambda data: create_or_update_shot(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "shot:delete",
                 lambda data: delete_shot(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "task:new",
                 lambda data: create_or_update_task(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "task:update",
                 lambda data: create_or_update_task(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "task:delete",
                 lambda data: delete_task(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "playlist:new",
                 lambda data: create_or_update_playlist(self, data),
+                lane="slow",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "playlist:update",
                 lambda data: create_or_update_playlist(self, data),
+                lane="slow",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "playlist:delete",
                 lambda data: delete_playlist(self, data),
+                lane="slow",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "edit:new",
                 lambda data: create_or_update_edit(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "edit:update",
                 lambda data: create_or_update_edit(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "edit:delete",
                 lambda data: delete_edit(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "person:new",
                 lambda data: create_or_update_person(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "person:update",
                 lambda data: create_or_update_person(self, data),
+                lane="fast",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "person:delete",
                 lambda data: delete_person(self, data),
+                lane="fast",
             )
             # Concept events were fixed in Zou 0.19.0, so listen only if
             # the user is running Zou euqual or above 0.19.0
@@ -532,54 +590,68 @@ class KitsuProcessor:
                 "19",
                 "0",
             ):
-                gazu.events.add_listener(
+                add_listener_laned(
+                    self,
                     self.event_client,
                     "concept:new",
                     lambda data: create_or_update_concept(self, data),
+                    lane="fast",
                 )
-                gazu.events.add_listener(
+                add_listener_laned(
+                    self,
                     self.event_client,
                     "concept:update",
                     lambda data: create_or_update_concept(self, data),
+                    lane="fast",
                 )
-                gazu.events.add_listener(
+                add_listener_laned(
+                    self,
                     self.event_client,
                     "concept:delete",
                     lambda data: delete_concept(self, data),
+                    lane="fast",
                 )
 
-            # Content sync listeners: comments and preview files
-            gazu.events.add_listener(
+            # Content sync listeners: comments and preview files (slow lane)
+            add_listener_laned(
+                self,
                 self.event_client,
                 "comment:new",
                 lambda data: sync_comment_to_ayon(
                     self, data.get("comment_id", ""),
                     data.get("task_id", ""), data.get("project_id", ""),
                 ),
+                lane="slow",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "comment:update",
                 lambda data: update_comment_on_ayon(
                     self, data.get("comment_id", ""),
                     data.get("task_id", ""), data.get("project_id", ""),
                 ),
+                lane="slow",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "comment:delete",
                 lambda data: delete_comment_from_ayon(
                     self, data.get("comment_id", ""),
                     data.get("task_id", ""), data.get("project_id", ""),
                 ),
+                lane="slow",
             )
-            gazu.events.add_listener(
+            add_listener_laned(
+                self,
                 self.event_client,
                 "preview-file:add-file",
                 lambda data: sync_preview_to_ayon(
                     self, data.get("preview_file_id", ""),
                     data.get("task_id", ""), data.get("project_id", ""),
                 ),
+                lane="slow",
             )
 
             logging.info("All Kitsu event listeners registered")

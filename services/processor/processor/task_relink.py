@@ -2,15 +2,72 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import ayon_api
+from ayon_api.exceptions import HTTPRequestError
 from nxtools import logging, slugify
 
 from .concept_expand import (
     per_linked_effective_linked_id_for_relink,
     should_attempt_per_linked_concept_relink,
 )
+
+_FOLDER_SCAN_MAX_ATTEMPTS = 3
+_FOLDER_SCAN_RETRY_SLEEP_SEC = 1.5
+_RETRYABLE_FOLDER_SCAN_STATUSES = frozenset((502, 503, 504))
+
+
+def _http_status_from_folder_scan_error(exc: BaseException) -> int | None:
+    if isinstance(exc, HTTPRequestError) and exc.response is not None:
+        return getattr(exc.response, "status_code", None)
+    resp = getattr(exc, "response", None)
+    if resp is not None:
+        return getattr(resp, "status_code", None)
+    return None
+
+
+def _is_retryable_folder_scan_error(exc: BaseException) -> bool:
+    """Avoid importing ``requests.exceptions`` tuples (minimal stubs / import order)."""
+    if isinstance(exc, HTTPRequestError):
+        st = _http_status_from_folder_scan_error(exc)
+        return st is not None and st in _RETRYABLE_FOLDER_SCAN_STATUSES
+    n = type(exc).__name__
+    if n in (
+        "ConnectionError",
+        "ReadTimeoutError",
+        "ConnectTimeout",
+        "ConnectTimeoutError",
+        "TimeoutError",
+        "ChunkedEncodingError",
+        "ProtocolError",
+    ):
+        return True
+    st = _http_status_from_folder_scan_error(exc)
+    return st is not None and st in _RETRYABLE_FOLDER_SCAN_STATUSES
+
+
+def _list_active_folders(project_name: str) -> list[Any]:
+    """Materialize active folders with retries on transient GraphQL / gateway errors."""
+    for attempt in range(_FOLDER_SCAN_MAX_ATTEMPTS):
+        try:
+            return list(ayon_api.get_folders(project_name, active=True))
+        except BaseException as exc:
+            if (
+                attempt + 1 >= _FOLDER_SCAN_MAX_ATTEMPTS
+                or not _is_retryable_folder_scan_error(exc)
+            ):
+                raise
+            logging.warning(
+                "[task_relink] get_folders failed project=%s attempt=%s/%s: %s",
+                project_name,
+                attempt + 1,
+                _FOLDER_SCAN_MAX_ATTEMPTS,
+                exc,
+            )
+            time.sleep(_FOLDER_SCAN_RETRY_SLEEP_SEC * (attempt + 1))
+    assert False, "unreachable"
 
 
 def merge_push_response_folder_map(
@@ -27,7 +84,7 @@ def merge_push_response_folder_map(
 def kitsu_folder_map_from_ayon_project(project_name: str) -> dict[str, str]:
     """Build Kitsu id → AYON folder id from ``data.kitsuId`` on all active folders."""
     out: dict[str, str] = {}
-    for folder in ayon_api.get_folders(project_name, active=True):
+    for folder in _list_active_folders(project_name):
         data = folder.get("data") or {}
         kid = data.get("kitsuId")
         if kid:
@@ -45,7 +102,7 @@ def find_folder_id_for_kitsu_entity(
     mapped = folder_map.get(kitsu_entity_id)
     if mapped:
         return mapped
-    for folder in ayon_api.get_folders(project_name, active=True):
+    for folder in _list_active_folders(project_name):
         data = folder.get("data") or {}
         if data.get("kitsuId") == kitsu_entity_id:
             return folder.get("id")
@@ -148,7 +205,7 @@ def try_relink_per_linked_concept_folder_on_unique_violation(
     )
 
     candidate = None
-    for folder in ayon_api.get_folders(project_name, active=True):
+    for folder in _list_active_folders(project_name):
         if str(folder.get("parentId") or "") != str(parent_ayon):
             continue
         if folder.get("folderType") != "Concept":
@@ -228,7 +285,7 @@ def try_relink_stale_kitsu_asset_folder(
 
     expected_name = _ayon_asset_folder_name(kitsu_name)
     candidate = None
-    for folder in ayon_api.get_folders(project_name, active=True):
+    for folder in _list_active_folders(project_name):
         if folder.get("parentId") != parent_id:
             continue
         if folder.get("name") != expected_name:

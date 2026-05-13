@@ -1,6 +1,9 @@
 """Batch /push relink retry (fullsync) for per-linked Concept folder collisions."""
 
+from unittest.mock import MagicMock
+
 import pytest
+from ayon_api.exceptions import HTTPRequestError
 
 from processor import task_relink
 
@@ -155,3 +158,22 @@ def test_push_batch_with_relink_retries_single_link_legacy(monkeypatch):
     r.raise_for_status()
     assert len(calls) == 2
     assert touched["n"] >= 1
+
+
+def test_list_active_folders_retries_on_502_then_succeeds(monkeypatch):
+    folder = {"id": "f1", "data": {"kitsuId": "k1"}}
+    resp502 = MagicMock()
+    resp502.status_code = 502
+    err502 = HTTPRequestError("502", response=resp502)
+    seq = [err502, [folder]]
+
+    def fake_get_folders(_pn, active=True):
+        item = seq.pop(0)
+        if isinstance(item, Exception):
+            raise item
+        return iter(item)
+
+    monkeypatch.setattr(task_relink.ayon_api, "get_folders", fake_get_folders)
+    monkeypatch.setattr(task_relink.time, "sleep", lambda *_a, **_k: None)
+    out = task_relink._list_active_folders("Proj")
+    assert out == [folder]

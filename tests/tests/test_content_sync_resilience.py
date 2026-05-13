@@ -8,9 +8,21 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 sys.modules.setdefault("gazu", MagicMock())
-_nxt = MagicMock()
-_nxt.logging = MagicMock()
-sys.modules.setdefault("nxtools", _nxt)
+
+
+def _ensure_nxtools_stub() -> None:
+    """Do not replace a real ``nxtools`` install (checklist tests need ``slugify``)."""
+    try:
+        if importlib.util.find_spec("nxtools") is not None:
+            return
+    except ValueError:
+        pass
+    _nxt = MagicMock()
+    _nxt.logging = MagicMock()
+    sys.modules["nxtools"] = _nxt
+
+
+_ensure_nxtools_stub()
 
 
 def _ensure_ayon_api_stub() -> None:
@@ -53,8 +65,20 @@ def _ensure_requests_stub() -> None:
             super().__init__(*args, **kwargs)
             self.response = response
 
+    class ConnectionError(RequestException):
+        pass
+
+    class Timeout(RequestException):
+        pass
+
+    class ChunkedEncodingError(RequestException):
+        pass
+
     req_ex.RequestException = RequestException
     req_ex.HTTPError = HTTPError
+    req_ex.ConnectionError = ConnectionError
+    req_ex.Timeout = Timeout
+    req_ex.ChunkedEncodingError = ChunkedEncodingError
     sys.modules["requests.exceptions"] = req_ex
     req_mod = types.ModuleType("requests")
     req_mod.exceptions = req_ex
@@ -511,6 +535,8 @@ def test_sync_comment_to_ayon_uses_gazu_files_for_attachment_download():
 
 
 def test_build_comment_body_string_checklist_and_preview_rows():
+    from unittest.mock import MagicMock
+
     comment = {
         "person_id": "p1",
         "task_status_id": "s1",
@@ -520,11 +546,267 @@ def test_build_comment_body_string_checklist_and_preview_rows():
     }
     persons = {"p1": {"full_name": "Alice"}}
     statuses = {"s1": "WIP"}
-    body = content_sync._build_comment_body(comment, persons, statuses)
+    processor = MagicMock()
+    processor.settings = {"sync_settings": {"content_sync": {}}}
+    body = content_sync._build_comment_body(comment, persons, statuses, processor)
     assert "plain string item" in body
     assert "dict item" in body
-    assert "preview-id-str" in body
-    assert "b.exr" in body
+    assert "preview-id-str" not in body
+    assert "b.exr" not in body
+    assert "Revision" not in body
+
+
+def test_build_comment_body_informative_preview_manifest():
+    from unittest.mock import MagicMock
+
+    comment = {
+        "person_id": "p1",
+        "task_status_id": "s1",
+        "text": "Hi",
+        "checklist": [],
+        "previews": [
+            {
+                "id": "pv1",
+                "position": 0,
+                "revision": 3,
+                "original_name": "render.exr",
+            },
+        ],
+    }
+    persons = {"p1": {"full_name": "Alice"}}
+    statuses = {"s1": "WIP"}
+    processor = MagicMock()
+    processor.settings = {"sync_settings": {"content_sync": {}}}
+    body = content_sync._build_comment_body(comment, persons, statuses, processor)
+    assert "**Revision 3**" in body
+    assert "render.exr" in body
+
+
+def test_build_comment_body_legacy_append_manifest_lists_thin_previews():
+    from unittest.mock import MagicMock
+
+    comment = {
+        "person_id": "p1",
+        "task_status_id": "s1",
+        "text": "Hi",
+        "checklist": [],
+        "previews": ["only-id-string"],
+    }
+    persons = {"p1": {"full_name": "Alice"}}
+    statuses = {"s1": "WIP"}
+    processor = MagicMock()
+    processor.settings = {
+        "sync_settings": {
+            "content_sync": {"append_kitsu_preview_manifest": True},
+        },
+    }
+    body = content_sync._build_comment_body(comment, persons, statuses, processor)
+    assert "only-id-string" in body
+    assert "review files" in body
+
+
+def test_build_comment_body_suppress_attribution_header():
+    from unittest.mock import MagicMock
+
+    comment = {
+        "person_id": "p1",
+        "task_status_id": "s1",
+        "text": "Hi",
+        "checklist": [],
+        "previews": [],
+    }
+    persons = {"p1": {"full_name": "Alice"}}
+    statuses = {"s1": "WIP"}
+    processor = MagicMock()
+    processor.settings = {"sync_settings": {"content_sync": {}}}
+    body = content_sync._build_comment_body(
+        comment, persons, statuses, processor, suppress_attribution_header=True,
+    )
+    assert "**[Alice]**" not in body
+    assert "Hi" in body
+
+
+def test_attach_comment_preview_json_sidecars_disabled_skips_preview_fetch():
+    from unittest.mock import MagicMock
+
+    processor = MagicMock()
+    processor.get_paired_ayon_project.return_value = "Proj"
+    processor.kitsu_server_url = "http://kitsu"
+    processor.settings = {"sync_settings": {"content_sync": {}}}
+    comment = {
+        "id": "kc1",
+        "person_id": "p1",
+        "task_status_id": None,
+        "text": "hello",
+        "checklist": [],
+        "previews": [{"id": "pv1", "position": 0, "original_name": "x.png"}],
+        "attachment_files": [],
+        "created_at": None,
+    }
+    ayon_task = {"id": "at1", "data": {"kitsuId": "kt1"}}
+    stored: list[dict] = []
+
+    def fake_get_activities(project_name, entity_ids=None, activity_types=None):
+        return list(stored)
+
+    def fake_create_activity(_pn, **kwargs):
+        aid = f"act{len(stored)}"
+        stored.append({"activityId": aid, "body": kwargs.get("body"), "data": dict(kwargs.get("data") or {})})
+        return aid
+
+    with patch.object(content_sync.processor_utils, "set_kitsu_host"):
+        with patch.object(content_sync, "gazu") as m_gazu:
+            m_gazu.task.get_comment.return_value = comment
+            m_gazu.person.all_persons.return_value = [{"id": "p1", "full_name": "Bob", "email": "b@x.dev"}]
+            m_gazu.task.all_task_statuses.return_value = []
+            m_gpf = MagicMock()
+            m_gazu.files.get_preview_file = m_gpf
+            with patch.object(content_sync, "_ayon_task_by_kitsu_id", return_value=ayon_task):
+                with patch.object(
+                    content_sync.ayon_api,
+                    "get_activities",
+                    side_effect=fake_get_activities,
+                    create=True,
+                ):
+                    with patch.object(
+                        content_sync.ayon_api,
+                        "create_activity",
+                        side_effect=fake_create_activity,
+                        create=True,
+                    ):
+                        with patch.object(
+                            content_sync.ayon_api,
+                            "delete_activity",
+                            create=True,
+                        ):
+                            with patch.object(
+                                content_sync,
+                                "maybe_sync_checklist_subtasks_from_kitsu_comment",
+                            ):
+                                con = MagicMock()
+                                con.is_service_user.return_value = False
+                                with patch.object(
+                                    content_sync.ayon_api,
+                                    "get_server_api_connection",
+                                    return_value=con,
+                                    create=True,
+                                ):
+                                    content_sync.sync_comment_to_ayon(
+                                        processor, "kc1", "kt1", "pid",
+                                    )
+    m_gpf.assert_not_called()
+    assert stored, "expected one activity"
+    assert "JSON files are attached" not in (stored[0].get("body") or "")
+
+
+def test_comment_sync_impersonation_uses_as_username_when_service():
+    from unittest.mock import MagicMock
+
+    processor = MagicMock()
+    processor.get_paired_ayon_project.return_value = "Proj"
+    processor.kitsu_server_url = "http://kitsu"
+    processor.settings = {"sync_settings": {"content_sync": {}}}
+    comment = {
+        "id": "kc1",
+        "person_id": "p1",
+        "task_status_id": None,
+        "text": "hello",
+        "checklist": [],
+        "previews": [],
+        "attachment_files": [],
+        "created_at": None,
+    }
+    ayon_task = {"id": "at1", "data": {"kitsuId": "kt1"}}
+    # Stale row forces delete + recreate; body mismatch vs new "hello" sync so not uptodate.
+    stored: list[dict] = [
+        {
+            "activityId": "stale1",
+            "body": "old-body",
+            "data": {"kitsuCommentId": "kc1", "kitsuCommentBodySha256": "deadbeef"},
+        },
+    ]
+    call_order: list[str] = []
+
+    def fake_get_activities(project_name, entity_ids=None, activity_types=None):
+        return list(stored)
+
+    def fake_create_activity(_pn, **kwargs):
+        call_order.append("create_activity")
+        aid = f"act{len(stored)}"
+        stored.append({"activityId": aid, "body": kwargs.get("body"), "data": dict(kwargs.get("data") or {})})
+        return aid
+
+    def fake_delete_activity(project_name, activity_id):
+        call_order.append("delete_activity")
+        idx = next(i for i, x in enumerate(stored) if x.get("activityId") == activity_id)
+        stored.pop(idx)
+
+    ctx = MagicMock()
+    ctx.__exit__ = MagicMock(return_value=None)
+
+    def on_enter():
+        call_order.append("as_username_enter")
+        return None
+
+    ctx.__enter__ = MagicMock(side_effect=on_enter)
+    con = MagicMock()
+    con.is_service_user.return_value = True
+    con.as_username.return_value = ctx
+
+    with patch.object(content_sync.processor_utils, "set_kitsu_host"):
+        with patch.object(content_sync, "gazu") as m_gazu:
+            m_gazu.task.get_comment.return_value = comment
+            m_gazu.person.all_persons.return_value = [{"id": "p1", "full_name": "Bob", "email": "bob@studio.dev"}]
+            m_gazu.task.all_task_statuses.return_value = []
+            with patch.object(content_sync, "_ayon_task_by_kitsu_id", return_value=ayon_task):
+                with patch.object(
+                    content_sync.ayon_api,
+                    "get_activities",
+                    side_effect=fake_get_activities,
+                    create=True,
+                ):
+                    with patch.object(
+                        content_sync.ayon_api,
+                        "create_activity",
+                        side_effect=fake_create_activity,
+                        create=True,
+                    ):
+                        with patch.object(
+                            content_sync.ayon_api,
+                            "delete_activity",
+                            side_effect=fake_delete_activity,
+                            create=True,
+                        ):
+                            with patch.object(
+                                content_sync,
+                                "maybe_sync_checklist_subtasks_from_kitsu_comment",
+                            ):
+                                with patch.object(
+                                    content_sync.ayon_api,
+                                    "get_server_api_connection",
+                                    return_value=con,
+                                    create=True,
+                                ):
+                                    with patch.object(
+                                        content_sync,
+                                        "_resolve_ayon_login_for_comment_sync",
+                                        return_value="bob.login",
+                                    ):
+                                        content_sync.sync_comment_to_ayon(
+                                            processor, "kc1", "kt1", "pid",
+                                        )
+    # Upload pass + create pass each wrap mutations under as_username.
+    assert con.as_username.call_count == 2
+    assert all(c.args == ("bob.login",) for c in con.as_username.call_args_list)
+    assert ctx.__enter__.call_count == 2
+    assert "**[Bob]**" not in (stored[-1].get("body") or "")
+    assert "delete_activity" in call_order
+    assert "as_username_enter" in call_order
+    assert "create_activity" in call_order
+    enters = [i for i, x in enumerate(call_order) if x == "as_username_enter"]
+    assert len(enters) == 2  # upload mutations + create mutations
+    assert enters[0] < call_order.index("delete_activity") < enters[1]
+    assert enters[1] < call_order.index("create_activity")
 
 
 def test_ayon_task_by_kitsu_id_retries_once_on_502_then_succeeds():
@@ -545,3 +827,201 @@ def test_ayon_task_by_kitsu_id_retries_once_on_502_then_succeeds():
             r = content_sync._ayon_task_by_kitsu_id("P", "kid")
     assert r == task
     m_sleep.assert_called_once_with(content_sync._RETRY_SLEEP_SEC)
+
+
+def test_ayon_lookup_cache_tasks_fetched_once(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_get_tasks(pn):
+        calls["n"] += 1
+        assert pn == "ProjA"
+        return [
+            {"id": "a1", "data": {"kitsuId": "kitsu-a"}},
+            {"id": "a2", "data": {"kitsuId": "kitsu-b"}},
+        ]
+
+    monkeypatch.setattr(content_sync.ayon_api, "get_tasks", fake_get_tasks)
+    monkeypatch.setattr(content_sync.ayon_api, "get_folders", lambda _pn: [])
+    with content_sync._content_sync_ayon_lookup_cache_scope("ProjA"):
+        assert content_sync._ayon_task_by_kitsu_id("ProjA", "kitsu-a")["id"] == "a1"
+        assert content_sync._ayon_task_by_kitsu_id("ProjA", "kitsu-b")["id"] == "a2"
+        assert content_sync._ayon_task_by_kitsu_id("ProjA", "missing") is None
+    assert calls["n"] == 1
+
+
+def test_ayon_lookup_cache_folders_fetched_once(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_get_folders(pn):
+        calls["n"] += 1
+        assert pn == "ProjB"
+        return [{"id": "f1", "data": {"kitsuId": "entity-x"}}]
+
+    monkeypatch.setattr(content_sync.ayon_api, "get_folders", fake_get_folders)
+    monkeypatch.setattr(content_sync.ayon_api, "get_tasks", lambda _pn: [])
+    with content_sync._content_sync_ayon_lookup_cache_scope("ProjB"):
+        assert content_sync._ayon_folder_by_kitsu_id("ProjB", "entity-x")["id"] == "f1"
+        assert content_sync._ayon_folder_by_kitsu_id("ProjB", "nope") is None
+    assert calls["n"] == 1
+
+
+def test_ayon_lookup_cache_vizdev_surrogate_single_get_tasks(monkeypatch):
+    task_calls = {"n": 0}
+    folder_calls = {"n": 0}
+    concept_kitsu = "concept-uuid-1"
+    surrogate = content_sync.concept_vizdev_surrogate_kitsu_id(concept_kitsu)
+
+    def fake_get_folders(pn):
+        folder_calls["n"] += 1
+        return [{"id": "folder-ayon-id", "data": {"kitsuId": concept_kitsu}}]
+
+    def fake_get_tasks(pn):
+        task_calls["n"] += 1
+        return [
+            {
+                "id": "vizdev-task",
+                "folderId": "folder-ayon-id",
+                "data": {"kitsuId": surrogate},
+            },
+        ]
+
+    monkeypatch.setattr(content_sync.ayon_api, "get_folders", fake_get_folders)
+    monkeypatch.setattr(content_sync.ayon_api, "get_tasks", fake_get_tasks)
+    with content_sync._content_sync_ayon_lookup_cache_scope("ProjC"):
+        r1 = content_sync._ayon_vizdev_task_by_surrogate(
+            "ProjC", concept_kitsu, surrogate,
+        )
+        r2 = content_sync._ayon_vizdev_task_by_surrogate(
+            "ProjC", concept_kitsu, surrogate,
+        )
+    assert r1 is not None and r1["id"] == "vizdev-task"
+    assert r2 == r1
+    assert folder_calls["n"] == 1
+    assert task_calls["n"] == 1
+
+
+def test_kitsu_png_thumbnail_relative_url():
+    assert content_sync._kitsu_png_thumbnail_relative_url("pid-1") == (
+        "pictures/thumbnails/preview-files/pid-1.png"
+    )
+
+
+def test_parse_kitsu_publish_comment_table_version_full_table():
+    from processor import content_sync_browser_urls as bu
+
+    text = """Note here
+
+|  |  |
+|--|--|
+| version | `5` |
+| family | `render` |
+| name | `Main_ColorAnim` |
+| task | `Layout ( Layout )` |
+| uniqueSprites | `16` |
+"""
+    assert bu.parse_kitsu_publish_comment_table_version(text) == 5
+
+
+def test_parse_kitsu_publish_comment_table_version_missing_optional_rows():
+    from processor import content_sync_browser_urls as bu
+
+    text = """|  |  |
+|---|---|
+| version | `2` |
+| family | `review` |
+| name | `ShotA` |
+"""
+    assert bu.parse_kitsu_publish_comment_table_version(text) == 2
+
+
+def test_parse_kitsu_publish_comment_table_version_no_backticks():
+    from processor import content_sync_browser_urls as bu
+
+    text = "| version | 7 |\n"
+    assert bu.parse_kitsu_publish_comment_table_version(text) == 7
+
+
+def test_parse_kitsu_publish_comment_table_version_no_table():
+    from processor import content_sync_browser_urls as bu
+
+    assert bu.parse_kitsu_publish_comment_table_version("no version row") is None
+
+
+def test_ayon_products_browser_url_with_encoded_uri():
+    from processor import content_sync_browser_urls as bu
+
+    uri = bu.ayon_entity_uri_product_version(
+        "MyProject",
+        "assets/Character",
+        product_name="animationKitsuReview",
+        version=3,
+    )
+    assert uri.startswith("ayon+entity://MyProject/")
+    assert "product=animationKitsuReview" in uri
+    assert "version=3" in uri
+    href = bu.ayon_browser_url_products_with_uri(
+        "https://studio.test",
+        "MyProject",
+        uri,
+    )
+    assert href is not None
+    assert href.startswith("https://studio.test/projects/")
+    assert "/products?" in href
+    assert "uri=ayon" in href
+
+
+def test_maybe_append_review_version_markdown_link_idempotent(monkeypatch):
+    proc = MagicMock()
+    proc.settings = {
+        "sync_settings": {
+            "content_sync": {
+                "review_version_link_enabled": True,
+                "web_ui_base_url": "https://studio.test",
+            },
+        },
+    }
+    comment = {
+        "id": "c1",
+        "text": "| version | `3` |\n",
+        "previews": [],
+    }
+    monkeypatch.setattr(
+        content_sync.gazu.task,
+        "get_task",
+        lambda _tid: {"task_type": {"name": "Animation"}},
+    )
+    monkeypatch.setattr(
+        content_sync,
+        "_ayon_task_by_kitsu_id",
+        lambda _pn, _tid: {"id": "t1", "folderId": "f1"},
+    )
+    monkeypatch.setattr(
+        content_sync.ayon_api,
+        "get_folder_by_id",
+        lambda _pn, _fid: {"path": "/assets/Hero"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        content_sync.ayon_api,
+        "get_products",
+        lambda *_a, **_k: [
+            {"id": "p1", "name": "animationKitsuReview", "productType": "review"},
+        ],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        content_sync,
+        "_find_review_version_id_for_revision",
+        lambda *_a, **_k: "ver-uuid-1",
+    )
+    body = "hello\n"
+    out = content_sync._maybe_append_review_version_markdown_link(
+        proc, "Proj", "kitsu-task-1", comment, body,
+    )
+    assert "[Version 3](" in out
+    assert "https://studio.test/projects/" in out
+    assert "/products?" in out
+    out2 = content_sync._maybe_append_review_version_markdown_link(
+        proc, "Proj", "kitsu-task-1", comment, out,
+    )
+    assert out2 == out

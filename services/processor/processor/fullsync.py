@@ -293,9 +293,6 @@ def project_full_sync(
     #    throw an error.
     concepts = []
     _cs0 = (parent.settings.get("sync_settings") or {}).get("concept_sync")
-    _has_concept_entity_model_key = isinstance(_cs0, dict) and (
-        "concept_entity_model" in _cs0 or "conceptEntityModel" in _cs0
-    )
     concept_sync = normalize_concept_sync_dict(
         _cs0 if isinstance(_cs0, dict) else None,
     )
@@ -306,21 +303,11 @@ def project_full_sync(
             concept_sync=concept_sync,
         )
         raw_count = len(raw_concepts)
-        if raw_count > 0 and _has_concept_entity_model_key and not model:
-            logging.error(
-                "[fullsync] concept_sync defines concept_entity_model but it is empty "
-                "after normalize; per_linked expansion is disabled (duplicate folder "
-                "risk on multi-concept names). Set "
-                "sync_settings.concept_sync.concept_entity_model to per_linked_entity "
-                "in the **processor** service JSON, or set env "
-                "KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL=per_linked_entity."
-            )
         logging.info(
             f"[fullsync] concept_sync.concept_entity_model={model!r} "
             f"raw_kitsu_concepts={raw_count} "
-            "(set to per_linked_entity on the **processor** settings JSON, not only "
-            "the studio addon UI, or set env KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL, "
-            "or expansion/dedupe is skipped)"
+            "(omitted or blank in JSON defaults to per_linked_entity; "
+            "set per_kitsu_concept for legacy one-folder-per-Kitsu-concept)"
         )
         concepts = expand_concept_entities_for_push(
             raw_concepts,

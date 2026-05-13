@@ -165,6 +165,28 @@ class ContentSyncSettings(BaseSettingsModel):
     review_product_type: str = SettingsField(
         "review", title="Product type for synced reviews"
     )
+    review_version_link_enabled: bool = SettingsField(
+        True,
+        title="Append AYON Products link for Kitsu review revisions",
+        description=(
+            "When enabled, Kitsu→AYON comment sync appends a GFM markdown link "
+            "`[Version N](…)` pointing at the AYON web Products tab with a "
+            "`uri=` query (ynput/ayon-frontend), when the revision resolves to an "
+            "existing review version. Requires a usable web base URL (see "
+            "**Web UI base URL**). Disable if links are unwanted."
+        ),
+    )
+    web_ui_base_url: str = SettingsField(
+        "",
+        title="Web UI base URL (optional)",
+        description=(
+            "Origin where artists open AYON in the browser, e.g. "
+            "`https://studio.example.com` — no trailing slash. When empty, "
+            "the processor uses ``ayon_api.get_base_url()`` and strips a trailing "
+            "`/api` segment if present. Set explicitly when the API host differs "
+            "from the SPA (reverse proxy / split deployment)."
+        ),
+    )
 
 
 class PlaylistSyncSettings(BaseSettingsModel):
@@ -356,6 +378,8 @@ CONTENT_SYNC_DEFAULT_VALUES = {
     "sync_previews": True,
     "sync_attachments": True,
     "review_product_type": "review",
+    "review_version_link_enabled": True,
+    "web_ui_base_url": "",
 }
 
 CHECKLIST_SUBTASKS_DEFAULT_VALUES = {

@@ -25,20 +25,38 @@ _CONCEPT_SYNC_CAMEL_TO_SNAKE: Dict[str, str] = {
 
 DEFAULT_UNLINKED_PROJECT_KITSU_ID = "kitsu:concepts:unlinked_project"
 
-# Processor / Docker: overrides ``sync_settings.concept_sync.concept_entity_model`` when set.
-_ENV_CONCEPT_ENTITY_MODEL = "KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL"
+# Optional processor-only overrides (Docker / emergency) for ``concept_entity_model``.
+# Shorter name first so operators can set one variable without repeating "processor".
+_ENV_CONCEPT_ENTITY_MODEL_KEYS = (
+    "KITSU_CONCEPT_ENTITY_MODEL",
+    "KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL",
+)
+
+
+def _concept_entity_model_from_env() -> str:
+    for key in _ENV_CONCEPT_ENTITY_MODEL_KEYS:
+        v = os.environ.get(key, "").strip()
+        if v:
+            return v
+    return ""
 
 
 def normalize_concept_sync_dict(
     raw: Optional[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    """Copy ``concept_sync``, map camelCase keys, apply env override, drop blank model.
+    """Copy ``concept_sync``, map camelCase keys, apply env override, default model.
 
-    If ``raw`` is ``None`` or empty ``{}``, still returns a dict when
-    ``KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL`` is set (processor-only override without
-    nesting keys in service JSON).
+    ``concept_entity_model`` defaults to ``per_linked_entity`` whenever it is
+    missing or blank after normalization (same default as the studio addon). That
+    avoids duplicate AYON folder creates when many Kitsu concepts share one linked
+    entity. Set ``per_kitsu_concept`` explicitly in JSON to use legacy one-folder-per
+    Kitsu concept row.
+
+    Environment variables ``KITSU_CONCEPT_ENTITY_MODEL`` or
+    ``KITSU_PROCESSOR_CONCEPT_ENTITY_MODEL`` override JSON when non-empty (e.g. force
+    legacy mode in a container without editing bundled settings).
     """
-    env_cem = os.environ.get(_ENV_CONCEPT_ENTITY_MODEL, "").strip()
+    env_cem = _concept_entity_model_from_env()
 
     if raw is not None and not isinstance(raw, dict):
         return None
@@ -46,7 +64,7 @@ def normalize_concept_sync_dict(
     if not raw:
         if env_cem:
             return {"concept_entity_model": env_cem}
-        return None
+        return {"concept_entity_model": _CONCEPT_ENTITY_MODEL_PER_LINKED}
 
     out: Dict[str, Any] = dict(raw)
     for camel, snake in _CONCEPT_SYNC_CAMEL_TO_SNAKE.items():
@@ -60,7 +78,7 @@ def normalize_concept_sync_dict(
     if cem:
         out["concept_entity_model"] = cem
     else:
-        out.pop("concept_entity_model", None)
+        out["concept_entity_model"] = _CONCEPT_ENTITY_MODEL_PER_LINKED
 
     return out if out else None
 

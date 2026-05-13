@@ -129,7 +129,14 @@ def preprocess_task(
         ayon_users_by_email = {
             user["attrib"]["email"]: user["name"] for user in ayon_api.get_users()
         }
-    task_emails = {user["email"] for user in task["persons"]}
+    persons = task.get("persons")
+    if not isinstance(persons, list):
+        persons = []
+    task_emails = {
+        str(user["email"]).strip()
+        for user in persons
+        if isinstance(user, dict) and user.get("email")
+    }
     task["assignees"] = []
     task["assignees"].extend(
         ayon_users_by_email[email] for email in task_emails if email in ayon_users_by_email

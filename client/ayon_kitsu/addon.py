@@ -59,8 +59,13 @@ class KitsuAddon(AYONAddon, IPluginPaths, ITrayAction):
             self.show_dialog()
             return
 
-        # Check credentials, ask them if needed
-        if validate_credentials(login, password):
+        if not self.server_url:
+            self.show_dialog()
+            return
+
+        # Check credentials, ask them if needed (pass URL from settings; KITSU_SERVER
+        # is only written below after a successful validate).
+        if validate_credentials(login, password, kitsu_url=self.server_url):
             os.environ["KITSU_LOGIN"] = login
             os.environ["KITSU_PWD"] = password
             os.environ["KITSU_SERVER"] = self.server_url
