@@ -6,7 +6,13 @@ import os
 import ayon_api
 
 from ayon_core.pipeline import InventoryAction, get_current_project_name
-from ayon_core.addon import AddonsManager
+
+
+def _kitsu_addon():
+    from ayon_core.pipeline.context_tools import _get_addons_manager
+
+    return _get_addons_manager().get("kitsu")
+
 
 try:
     import gazu
@@ -43,7 +49,7 @@ class InventoryOpenInKitsu(InventoryAction):
                 return False
 
             # Check if Kitsu addon is available
-            kitsu_addon = AddonsManager().get("kitsu")
+            kitsu_addon = _kitsu_addon()
             if not kitsu_addon:
                 return False
 
@@ -71,7 +77,7 @@ class InventoryOpenInKitsu(InventoryAction):
             bool: True if successful
         """
         try:
-            kitsu_addon = AddonsManager().get("kitsu")
+            kitsu_addon = _kitsu_addon()
             if not kitsu_addon:
                 self.log.error("Kitsu addon not available")
                 return False
@@ -255,7 +261,7 @@ class InventoryOpenInKitsu(InventoryAction):
             return False
 
         # Build and open URL
-        kitsu_addon = AddonsManager().get("kitsu")
+        kitsu_addon = _kitsu_addon()
         kitsu_url = kitsu_addon.server_url.rstrip("/api")
         url = (
             f"{kitsu_url}/productions/{kitsu_project_id}/"

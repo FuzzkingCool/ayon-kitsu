@@ -3,7 +3,12 @@ import webbrowser
 import ayon_api
 
 from ayon_core.pipeline import LauncherAction
-from ayon_core.addon import AddonsManager
+
+
+def _kitsu_addon():
+    from ayon_core.pipeline.context_tools import _get_addons_manager
+
+    return _get_addons_manager().get("kitsu")
 
 
 class LauncherOpenInKitsu(LauncherAction):
@@ -23,7 +28,7 @@ class LauncherOpenInKitsu(LauncherAction):
 
     @staticmethod
     def get_kitsu_addon():
-        return AddonsManager().get("kitsu")
+        return _kitsu_addon()
 
     def is_compatible(self, selection):
         return selection.is_project_selected
