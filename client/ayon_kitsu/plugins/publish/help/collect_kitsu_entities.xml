@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root>
+<error id="project_not_in_kitsu">
+<title>Kitsu project not linked</title>
+<description>
+## AYON project is not linked to Kitsu
+
+Project **{project_name}** has no valid Kitsu project id, or that project no longer exists on the Kitsu server.
+
+### What to do
+
+Ask production support to verify the AYON project Kitsu link and that the Kitsu project still exists.
+</description>
+</error>
+
+<error id="no_kitsu_id_on_folder">
+<title>Folder not linked to Kitsu</title>
+<description>
+## **{folder_name}** is not linked to Kitsu
+
+AYON folder **{folder_path}** has no `kitsuId`. This publish is configured to push to Kitsu and needs a shot or asset link.
+
+### What to do
+
+Re-sync the folder from Kitsu in AYON, or pick a folder that is already linked.
+</description>
+</error>
+
+<error id="folder_not_on_kitsu">
+<title>Folder exists only in AYON</title>
+<description>
+## **{folder_name}** is on AYON but not on Kitsu
+
+The publish folder **{folder_path}** is in AYON, but Kitsu has no matching shot or asset (stored link `{kitsu_id}` is missing or stale).
+
+Task linkage cannot work until the **folder** exists on Kitsu and AYON is re-synced.
+
+### What to do
+
+Create or restore the shot or asset in Kitsu, then re-sync this folder in AYON before publishing again.
+</description>
+<detail>
+Technical: `gazu.entity.get_entity` returned no row for id `{kitsu_id}`.
+</detail>
+</error>
+
+<error id="task_not_on_kitsu_entity">
+<title>Task missing on Kitsu shot or asset</title>
+<description>
+## Task **{task_name}** is not on Kitsu for **{folder_name}**
+
+The folder **{folder_path}** is linked on Kitsu, but there is no matching Kitsu task for this publish (AYON task id: `{ayon_task_id}`).
+
+### What to do
+
+Add the task type on Kitsu for this shot or asset, or re-sync tasks in AYON and pick the correct task.
+</description>
+</error>
+
+<error id="task_status_missing">
+<title>Kitsu task data incomplete</title>
+<description>
+## Kitsu task is missing status information
+
+A Kitsu task was found (id `{kitsu_task_id}`) but the API response did not include `task_status`, which is required for notes and status updates.
+
+### What to do
+
+Retry the publish. If it persists, report to production support with the Kitsu task id above.
+</description>
+</error>
+</root>

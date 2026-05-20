@@ -2,6 +2,22 @@ import re
 from typing import Any, Dict, Mapping, MutableMapping, Optional
 
 import gazu
+from gazu import client as gazu_client
+from gazu.exception import RouteNotFoundException
+
+
+def instance_has_kitsu_family(instance: Any) -> bool:
+    """True when this publish instance participates in Kitsu integration."""
+    families = set(instance.data.get("families") or [])
+    family = instance.data.get("family")
+    if family:
+        families.add(family)
+    return "kitsu" in families
+
+
+def context_has_kitsu_family_instance(context: Any) -> bool:
+    """True when any instance in the publish context uses Kitsu integration."""
+    return any(instance_has_kitsu_family(instance) for instance in context)
 
 
 def is_kitsu_task_row(obj: Any) -> bool:
@@ -11,6 +27,43 @@ def is_kitsu_task_row(obj: Any) -> bool:
     ``gazu.entity.get_entity`` typically do not.
     """
     return isinstance(obj, dict) and obj.get("task_type_id") is not None
+
+
+def is_kitsu_entity_row(obj: Any) -> bool:
+    """True if ``obj`` looks like a Kitsu shot/asset/sequence entity row."""
+    return (
+        isinstance(obj, dict)
+        and bool(obj.get("id"))
+        and not is_kitsu_task_row(obj)
+    )
+
+
+def fetch_kitsu_entity_by_id(
+    entity_id: Optional[str],
+    *,
+    log: Optional[Any] = None,
+) -> Optional[Dict[str, Any]]:
+    """Return Kitsu shot/asset dict for ``entity_id``, or ``None`` if missing.
+
+    Uses an uncached API read so publish validation does not trust stale
+    ``gazu.entity.get_entity`` memoization from earlier loader/session calls.
+    """
+    if not entity_id:
+        return None
+    try:
+        row = gazu_client.fetch_one("entities", entity_id)
+    except RouteNotFoundException:
+        if log is not None and hasattr(log, "debug"):
+            log.debug("Kitsu entity id %r not found (404).", entity_id)
+        return None
+    if not is_kitsu_entity_row(row):
+        if log is not None and hasattr(log, "debug"):
+            log.debug(
+                "Kitsu id %r did not resolve to a live shot/asset entity.",
+                entity_id,
+            )
+        return None
+    return row
 
 
 def kitsu_task_type_lookup_name(task_entity: Mapping[str, Any]) -> str:
@@ -74,7 +127,12 @@ def resolve_canonical_kitsu_task(
         if cached is not None and not is_kitsu_task_row(cached):
             # Poisoned cache (e.g. folder entity id == task id) — fetch task by id.
             pass
-        row = gazu.task.get_task(task_id)
+        try:
+            row = gazu.task.get_task(task_id)
+        except RouteNotFoundException:
+            if log is not None and hasattr(log, "debug"):
+                log.debug("Kitsu task id %r not found (404).", task_id)
+            return None
         return row if isinstance(row, dict) and is_kitsu_task_row(row) else None
 
     kitsu_task_id = task_data.get("kitsuId")

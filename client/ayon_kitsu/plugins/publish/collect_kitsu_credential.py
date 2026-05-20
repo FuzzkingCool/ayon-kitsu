@@ -6,6 +6,7 @@ from ayon_core.pipeline import PublishError
 
 from ayon_kitsu.addon import is_kitsu_enabled_in_settings
 from ayon_kitsu.pipeline import KitsuPublishContextPlugin
+from ayon_kitsu.utils import context_has_kitsu_family_instance
 
 
 class KitsuLoginRepair(pyblish.api.Action):
@@ -35,7 +36,8 @@ class KitsuLoginRepair(pyblish.api.Action):
 class CollectKitsuLogin(KitsuPublishContextPlugin):
     """Collect Kitsu session using user credentials"""
 
-    order = pyblish.api.CollectorOrder
+    # After CollectKitsuFamily (0.4990) so we only log in when needed.
+    order = pyblish.api.CollectorOrder + 0.4995
     label = "Kitsu user session"
     actions = [KitsuLoginRepair]
     # families = ["kitsu"]
@@ -45,6 +47,12 @@ class CollectKitsuLogin(KitsuPublishContextPlugin):
         if not is_kitsu_enabled_in_settings(project_settings):
             self.log.info(
                 f"Project '{context.data['projectName']} has disabled Kitsu"
+            )
+            return
+
+        if not context_has_kitsu_family_instance(context):
+            self.log.debug(
+                "No instances with 'kitsu' family; skipping Kitsu login."
             )
             return
 
