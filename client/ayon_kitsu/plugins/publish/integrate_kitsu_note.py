@@ -409,17 +409,36 @@ class IntegrateKitsuNote(KitsuPublishContextPlugin):
                             instance.data["uniqueSprites"] = str(unique_sprites)
                     else:
                         product_type = instance.data.get("productType", "")
-                        version_data = instance.data.get("versionData", {})
-                        msg = (
-                            f"[{bundle_name}] [KitsuComment] No uniqueSprites found for {product_name} "
-                            f"(productType={product_type}). "
-                            f"Available versionData keys: {list(version_data.keys())}. "
-                            f"Check AggregateRenderlayerSprites and renderlayer uniqueSprites if expected."
+                        creator_attributes = (
+                            instance.data.get("creator_attributes") or {}
                         )
-                        if product_type in ("render", "renderlayer"):
-                            self.log.warning(msg)
+                        count_unique_sprites = creator_attributes.get(
+                            "count_unique_sprites", True
+                        )
+                        if unique_sprites is not None or not count_unique_sprites:
+                            self.log.debug(
+                                f"[{bundle_name}] [KitsuComment] Skipping uniqueSprites "
+                                f"annotation for {product_name} "
+                                f"(count_unique_sprites={count_unique_sprites}, "
+                                f"value={unique_sprites!r})"
+                            )
+                        elif product_type in ("render", "renderlayer"):
+                            version_data = instance.data.get("versionData", {})
+                            self.log.warning(
+                                f"[{bundle_name}] [KitsuComment] uniqueSprites is "
+                                f"missing for {product_name} (productType={product_type}). "
+                                f"To get a count: enable 'Count Unique Sprites' on the "
+                                f"render/renderlayer creator. If layered, also confirm "
+                                f"AggregateRenderlayerSprites ran. "
+                                f"versionData keys: {list(version_data.keys())}"
+                            )
                         else:
-                            self.log.debug(msg)
+                            version_data = instance.data.get("versionData", {})
+                            self.log.debug(
+                                f"[{bundle_name}] [KitsuComment] uniqueSprites missing "
+                                f"for {product_name} (productType={product_type}); "
+                                f"versionData keys: {list(version_data.keys())}"
+                            )
 
                     if self.custom_comment_template["enabled"]:
                         task_note = _kitsu_note_task_field(
